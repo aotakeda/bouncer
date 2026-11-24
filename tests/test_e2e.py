@@ -161,6 +161,16 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("// VULN", (self.app / "routes" / "login.ts").read_text())
         self.assertEqual((self.app / "build" / "login.mode").read_text(), "vuln")
 
+        call(self.door + "/rest/user/login", "8.8.4.4", "POST", {"email": "' or 1=1-- again", "password": "y"}, ua="sqlmap/1.8")
+        deadline = time.time() + 40
+        rows = []
+        while time.time() < deadline and not any(r["replay_verdict"] == "PR_EXISTS" for r in rows):
+            time.sleep(0.3)
+            rows = [r for r in self.decisions(1, fixes=True) if r["ip"] == "8.8.4.4" and r["decision"] == "fix"]
+        self.assertTrue(any(r["replay_verdict"] == "PR_EXISTS" and "pull/1" in r["evidence"] for r in rows), rows)
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.p['github']}/__calls") as r:
+            self.assertEqual(sum(1 for c in json.loads(r.read()) if c["method"] == "PUT"), 1)
+
     def test_union_leak_is_proven_by_canary(self):
         q = urllib.request.quote("x')) UNION SELECT email,password FROM Users--")
         call(self.door + f"/rest/products/search?q={q}", "6.6.6.6", ua="sqlmap/1.8")

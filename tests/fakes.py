@@ -155,6 +155,11 @@ def github_handler(app_dir: Path):
                 return self.out(200, {"sha": "blob-" + rel, "content": base64.b64encode(text.encode()).decode()})
             if path == "/repos/aotakeda/juice-shop/git/ref/heads/master":
                 return self.out(200, {"object": {"sha": "base-sha"}})
+            if path == "/repos/aotakeda/juice-shop/pulls":
+                return self.out(200, [
+                    {"html_url": "https://github.com/aotakeda/juice-shop/pull/1", "head": {"ref": c["body"]["head"], "repo": {"full_name": "aotakeda/juice-shop"}}}
+                    for c in calls if c["path"].endswith("/pulls")
+                ])
             return self.out(404, {})
 
         def do_POST(self):

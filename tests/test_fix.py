@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from agent.fix import apply_edits, locate_route, smoke_diff, Fixer
+from agent.fix import apply_edits, branch_prefix, locate_route, smoke_diff, Fixer
 
 SERVER = """import { login } from './routes/login'
 import { searchProducts } from './routes/search'
@@ -76,6 +76,63 @@ class Judge(unittest.TestCase):
         broken = {"login": {"status": 401, "count": None}, "search": {"status": 200, "count": 1}}
         self.assertIn("legitimate behaviour changed", self.judge(self.verify(after=broken)))
         self.assertEqual(smoke_diff(self.smoke, self.smoke), [])
+
+
+class StubGitHub:
+    def __init__(self, open_url=""):
+        self.open_url = open_url
+
+    def file(self, path):
+        text = SERVER if path == "server.ts" else "query(`x = '${x}'`)\n"
+        return {"path": path, "sha": "blob", "text": text}
+
+    def open_pr_url(self, prefix):
+        return self.open_url if prefix == branch_prefix("routes/login.ts") else ""
+
+
+class StubClaude:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls = 0
+
+    def patch(self, prompt):
+        self.calls += 1
+        if not self.ok:
+            return {"ok": False, "error": "down", "seconds": 0}
+        return {"ok": True, "seconds": 0, "patch": {"title": "t", "summary": "s", "edits": [{"search": "'${x}'", "replace": ":x"}]}}
+
+
+class Dedupe(unittest.TestCase):
+    login = {"ip": "1.2.3.4", "event": {}, "replay": {"request": {"method": "POST", "path": "/rest/user/login", "headers": {}, "body": "{}"}}}
+    search = {"ip": "1.2.3.4", "event": {}, "replay": {"request": {"method": "GET", "path": "/rest/products/search?q=x", "headers": {}}}}
+
+    def fixer(self, github, claude, per_hour=3):
+        f = Fixer("dry_run", claude, github, "http://runner", max_per_hour=per_hour)
+        f.runner_patch = lambda payload: Judge.verify(Judge(), control=None)
+        return f
+
+    def test_open_pr_on_github_is_reused_without_calling_claude(self):
+        claude = StubClaude()
+        f = self.fixer(StubGitHub("https://github.com/aotakeda/juice-shop/pull/1"), claude, per_hour=1)
+        out = f.fix(self.login, lambda *a: None)
+        self.assertEqual((out["status"], out["pr_url"], claude.calls), ("pr_exists", "https://github.com/aotakeda/juice-shop/pull/1", 0))
+        self.assertTrue(f.take_slot())
+
+    def test_repeat_returns_known_patch_without_using_a_slot(self):
+        claude = StubClaude()
+        f = self.fixer(StubGitHub(), claude, per_hour=1)
+        first = f.fix(self.login, lambda *a: None)
+        again = f.fix(self.login, lambda *a: None)
+        self.assertEqual((first["status"], again["status"], claude.calls), ("ready", "ready", 1))
+        self.assertEqual(again["diff"], first["diff"])
+        self.assertIn("already tested", again["line"])
+
+    def test_limit_counts_only_real_attempts(self):
+        f = self.fixer(StubGitHub(), StubClaude(ok=False), per_hour=1)
+        self.assertEqual(f.fix(self.login, lambda *a: None)["status"], "failed")
+        out = f.fix(self.search, lambda *a: None)
+        self.assertEqual((out["status"], out["file"]), ("rate_limited", "routes/search.ts"))
+        self.assertNotIn("routes/search.ts", f.files)
 
 
 if __name__ == "__main__":

@@ -121,6 +121,16 @@ class GitHub:
             return {}
         return {"path": path, "sha": body["sha"], "text": base64.b64decode(body["content"]).decode("utf-8")}
 
+    def open_pr_url(self, prefix: str) -> str:
+        status, body = self.call("GET", "/pulls?state=open&per_page=100")
+        if status != 200 or not isinstance(body, list):
+            return ""
+        for pr in body:
+            head = pr.get("head") or {}
+            if (head.get("ref") or "").startswith(prefix) and ((head.get("repo") or {}).get("full_name") or self.repo) == self.repo:
+                return pr.get("html_url") or ""
+        return ""
+
     def open_pr(self, branch: str, path: str, blob_sha: str, content: str, title: str, body: str) -> dict:
         status, ref = self.call("GET", f"/git/ref/heads/{quote(self.branch)}")
         if status != 200:
@@ -177,6 +187,10 @@ def describe_attack(req: dict, why: str) -> str:
     return "\n".join(lines) + f"\n\nReplay result: {why}"
 
 
+def branch_prefix(path: str) -> str:
+    return "bouncer/fix-" + re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-") + "-"
+
+
 def smoke_diff(before: dict, after: dict) -> list:
     return [f"{k}: {before.get(k)} -> {after.get(k)}" for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
 
@@ -193,17 +207,21 @@ class Fixer:
         self.jobs: queue.Queue = queue.Queue(maxsize=50)
         self.started: deque = deque()
         self.files: dict = {}
+        self.results: dict = {}
         self.lock = threading.Lock()
         threading.Thread(target=self._work, daemon=True).start()
 
-    def submit(self, incident: dict, report) -> str:
+    def take_slot(self) -> bool:
         now = time.time()
         with self.lock:
             while self.started and now - self.started[0] > 3600:
                 self.started.popleft()
             if len(self.started) >= self.max_per_hour:
-                return "rate_limited"
+                return False
             self.started.append(now)
+            return True
+
+    def submit(self, incident: dict, report) -> str:
         try:
             self.jobs.put_nowait((incident, report))
         except queue.Full:
@@ -240,13 +258,24 @@ class Fixer:
         if not path:
             return {"status": "failed", "line": f"No route file found for {req.get('method')} {req.get('path', '').split('?')[0]}."}
         with self.lock:
-            if self.files.get(path) in ("working", "ready", "pr_opened"):
-                return {"status": "skipped", "file": path, "line": f"Already handling {path}."}
+            known = self.files.get(path)
+            if known == "working":
+                return {"status": "skipped", "file": path, "line": f"Already working on {path}."}
+            if known in ("ready", "pr_opened"):
+                return self.known(path)
             self.files[path] = "working"
+        url = self.github.open_pr_url(branch_prefix(path))
+        if url:
+            self.files[path] = "pr_opened"
+            self.results[path] = {"status": "pr_opened", "file": path, "pr_url": url}
+            return self.known(path)
         original = self.github.file(path)
         if not original:
             self.files[path] = "failed"
             return {"status": "failed", "file": path, "line": f"Could not read {path} from the repo."}
+        if not self.take_slot():
+            self.files.pop(path, None)
+            return {"status": "rate_limited", "file": path, "line": f"Hit the limit of {self.max_per_hour} fix attempts an hour. {path} stays as it is for now."}
         progress("working", f"Calling the carpenter for {path}.")
         base_sha = hashlib.sha256(original["text"].encode()).hexdigest()
         prompt = f"Proven attack:\n{describe_attack(req, why)}\n\nFile `{path}`:\n```ts\n{original['text']}\n```"
@@ -285,6 +314,13 @@ class Fixer:
         last = attempts[-1]["problem"] if attempts else "no attempt"
         return {"status": "failed", "file": path, "attempts": attempts, "line": f"Couldn't fix {path} safely: {last}"[:400]}
 
+    def known(self, path: str) -> dict:
+        prev = self.results.get(path) or {}
+        keep = {k: prev[k] for k in ("file", "title", "summary", "diff", "pr_url") if prev.get(k)}
+        if prev.get("pr_url"):
+            return dict(keep, status="pr_exists", line=f"Same hole as before. {path} already has a pull request waiting for the owner.")
+        return dict(keep, status="ready", line=f"Same hole as before. The patch for {path} is already tested and waiting.")
+
     def judge(self, req: dict, verify: dict, control_status) -> str:
         if not verify.get("ok"):
             return f"replay box error at {verify.get('stage')}: {verify.get('error') or verify.get('reset')}"[:600]
@@ -311,13 +347,15 @@ class Fixer:
         result["pr_body"] = body
         if self.mode != "pr":
             self.files[path] = "ready"
+            self.results[path] = result
             result["line"] = f"Patch for {path} holds up on the stunt double. Dry run, so no pull request opened."
             return result
-        branch = "bouncer/fix-" + re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-") + time.strftime("-%Y%m%d-%H%M%S", time.gmtime())
+        branch = branch_prefix(path) + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         pr = self.github.open_pr(branch, path, original["sha"], new_text, result["title"], body)
         result["pr"] = pr
         if pr.get("ok"):
             self.files[path] = "pr_opened"
+            self.results[path] = result
             result["status"] = "pr_opened"
             result["pr_url"] = pr.get("url")
             result["line"] = f"Fixed the lock on {path}. Pull request is up for the owner to review."

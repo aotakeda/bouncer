@@ -332,7 +332,7 @@ main{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px;max-width:
 .ev{border-top:1px solid var(--line);padding:10px 0}.ev:first-child{border-top:0}
 .tag{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;margin-right:6px;background:var(--line)}
 .block{background:var(--red);color:#000}.tarpit{background:var(--amber);color:#000}.replay{background:var(--blue);color:#000}.ignore{background:#2a2a33}.watch{background:#3a3a46}.would_block,.would_tarpit{background:#3a3a46;outline:1px dashed var(--red)}
-.PROVEN{background:var(--red);color:#000}.fix,.READY,.PR_OPENED{background:var(--green);color:#000}.FAILED,.PR_FAILED{background:var(--amber);color:#000}
+.PROVEN{background:var(--red);color:#000}.fix,.READY,.PR_OPENED,.PR_EXISTS{background:var(--green);color:#000}.FAILED,.PR_FAILED,.RATE_LIMITED{background:var(--amber);color:#000}
 pre{font:12px/1.4 ui-monospace,monospace;background:#0b0b0f;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:360px}.add{color:var(--green)}.del{color:var(--red)}a{color:var(--blue)}.NOT_REPRODUCED{background:var(--green);color:#000}
 code{font:12px ui-monospace,monospace;color:var(--mute);word-break:break-all}.line{margin:4px 0 0}.meta{color:var(--mute);font-size:12px}
 </style></head><body><header><h1>Bouncer</h1><span class=meta>Personal security agent at the door of a deliberately vulnerable OWASP Juice Shop</span></header>
