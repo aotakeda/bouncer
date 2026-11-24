@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import time
 import unittest
 
 from agent.fix import VARIANTS_FAILED, GitHub, apply_edits, branch_prefix, clean_variants, describe_attack, locate_route, pr_body, smoke_diff, Fixer, FixJob
@@ -188,6 +191,25 @@ class Dedupe(unittest.TestCase):
 class CrashingClaude(StubClaude):
     def variants(self, prompt):
         raise RuntimeError("boom")
+
+
+class Worker(unittest.TestCase):
+    def test_failing_report_does_not_stop_the_worker(self):
+        fixer = Fixer("dry_run", None, None, "http://runner")
+        fixer._run_job = lambda incident, report: {"status": FixStatus.FAILED, "line": incident["name"]}
+        seen = []
+
+        def broken(incident, fix):
+            raise OSError("disk full")
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            fixer.submit({"name": "first"}, broken)
+            fixer.submit({"name": "second"}, lambda incident, fix: seen.append(fix["line"]))
+            deadline = time.time() + 5
+            while not seen and time.time() < deadline:
+                time.sleep(0.02)
+        self.assertEqual(seen, ["second"])
+        self.assertIn("disk full", err.getvalue())
 
 
 class PrBody(unittest.TestCase):

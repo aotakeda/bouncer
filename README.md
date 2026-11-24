@@ -1,4 +1,4 @@
-# Bouncer
+<h1><img src="assets/bouncer-mark.svg" alt="" width="28" height="28" align="absmiddle">&nbsp;Bouncer</h1>
 
 A personal night-shift security agent with a nightclub bouncer's manners, running on Fly Sprites. It stands at the door of a side project—here, a deliberately vulnerable shop ([OWASP Juice Shop fork](https://github.com/aotakeda/juice-shop))—watches every request while you sleep, proves real break-ins on an air-gapped stunt double before acting, and leaves a verified pull request waiting for you to review:
 
@@ -37,9 +37,9 @@ No Sprite holds a single raw secret: inbound tokens are stored only as SHA-256 h
 | Dashboard | https://bh-bouncer-ykmo.sprites.app (passphrase in the submission notes) |
 | Example Bouncer PR | https://github.com/aotakeda/juice-shop/pull/1 |
 
-Open the dashboard first, then run these in order from a terminal (if you get blocked, click **Unblock** in the dashboard's **On the list** panel to jump straight to the next test):
+Open the dashboard first, then run these in order from a terminal (if you get blocked, click **Unblock** in the dashboard's **Blocked right now** panel to jump straight to the next test):
 
-**1. Knock on a WordPress door (Wall of Shame, no block):**
+**1. Knock on a WordPress door (Most probed paths, no block):**
 
 ```bash
 curl -s -A 'zgrab/0.x' https://bh-app-ykmo.sprites.app/wp-login.php
@@ -68,7 +68,7 @@ curl -s -A 'sqlmap/1.8' -H 'Content-Type: application/json' -d '{"email":"'"'"' 
 ## What to expect
 
 - The dashboard shows the request, Jev's score, the replay verdict and the bouncer's line within a few seconds.
-- After a **proven** attack your IP is blocked from the shop for 5 minutes (`403`). The dashboard stays reachable and lets you unblock yourself in one click under **On the list** so you can try the other commands immediately.
+- After a **proven** attack your IP is blocked from the shop for 5 minutes (`403`). The dashboard stays reachable and lets you unblock yourself in one click under **Blocked right now** so you can try the other commands immediately.
 - The same request from the same IP within 10 minutes is counted once (change the text after `--` in the payload to re-trigger).
 - After taking the `/.env` bait, requests from that IP are held for 10 seconds each (up to five at a time), for 10 minutes. That is the tarpit, not an outage.
 - Blocks and tarpits are per IP, so people behind one shared address are blocked together. The owner can adjust the duration with `BLOCK_SECONDS`.

@@ -10,10 +10,15 @@ import urllib.request
 
 SPRITE_SOCK = "/.sprite/api.sock"
 JSON_HEADERS = {"Content-Type": "application/json"}
+ERROR_DETAIL_CHARS = 300
 
 
 def bare_path(path: str) -> str:
     return path.split("?", 1)[0]
+
+
+def clip(value, limit: int) -> str:
+    return str(value)[:limit]
 
 
 def bearer(token: str) -> dict | None:

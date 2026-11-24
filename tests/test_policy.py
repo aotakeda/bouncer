@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -152,17 +153,17 @@ class Restart(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Config({"AGENT_DATA_DIR": tmp})
             first = Brain(cfg)
-            first.stats.update({"events": 7, Decision.BLOCK: 2})
-            first.shame["/wp-login.php"] += 3
-            first.honeypot_visits["5.6.7.8"] = 1700000000.0
-            first.incidents.append({"ts": 1.0, "ip": "5.6.7.8", "event": {"path": "/p"}, "replay": {"why": "w"}, "fix": {"status": FixStatus.WORKING, "line": "Calling the carpenter."}})
-            first.incidents.append({"ts": 2.0, "ip": "5.6.7.8", "event": {"path": "/q"}, "replay": {"why": "w"}, "fix": {"status": FixStatus.READY, "line": "done"}})
-            first._save_counters()
-            first._save_incidents()
+            first.store.stats.update({"events": 7, Decision.BLOCK: 2})
+            first.store.shame["/wp-login.php"] += 3
+            first.store.honeypot_visits["5.6.7.8"] = 1700000000.0
+            first.store.incidents.append({"ts": 1.0, "ip": "5.6.7.8", "event": {"path": "/p"}, "replay": {"why": "w"}, "fix": {"status": FixStatus.WORKING, "line": "Calling the carpenter."}})
+            first.store.incidents.append({"ts": 2.0, "ip": "5.6.7.8", "event": {"path": "/q"}, "replay": {"why": "w"}, "fix": {"status": FixStatus.READY, "line": "done"}})
+            first.store.save_counters()
+            first.store.save_incidents()
             again = Brain(cfg)
             state = again.state()
             story = again._honeypot_story("5.6.7.8")
-            again.stats[Decision.BLOCK] += 1
+            again.store.stats[Decision.BLOCK] += 1
             blocks = again.state()["stats"]
         self.assertEqual((state["stats"]["events"], state["stats"]["block"]), (7, 2))
         self.assertEqual((state["shame"][0]["path"], state["shame"][0]["caption"][:2]), ("/wp-login.php", "3x"))
@@ -170,6 +171,86 @@ class Restart(unittest.TestCase):
         self.assertEqual([i["fix"]["status"] for i in state["incidents"]], ["interrupted", "ready"])
         self.assertIn("restart", state["incidents"][0]["fix"]["line"])
         self.assertEqual((blocks["block"], len([k for k in blocks if k == "block"])), (3, 1))
+
+
+class Dashboard(unittest.TestCase):
+    def proven(self, brain, path, ts):
+        event = {"method": "GET", "path": path, "ip": "1.2.3.4", "ts": ts}
+        record = {"ts": ts, "ip": "1.2.3.4", "method": "GET", "path": path, "kind": EventKind.REQUEST, "rid": f"x{ts}", "replay": {"verdict": Verdict.PROVEN, "why": "leaked 2 canary strings"}}
+        brain._on_proven(event, record, {"ok": True, "malicious": 0.96, "action": "block", "confidence": 0.7})
+
+    def test_repeat_attacks_on_one_route_are_one_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            self.proven(brain, "/rest/products/search?q=%27))%20UNION%20SELECT%20id%20FROM%20Users--", 1.0)
+            self.proven(brain, "/rest/products/search?q=other%27--", 2.0)
+            signals = brain.state()["signals"]
+        self.assertEqual(len(signals), 1)
+        sig = signals[0]
+        self.assertEqual((sig["severity"], sig["status"], sig["count"], sig["rids"]), ("critical", "open", 2, ["x1.0", "x2.0"]))
+        self.assertEqual(sig["title"], "SQL injection on GET /rest/products/search")
+        self.assertEqual([s["state"] for s in sig["steps"]][:2], ["done", "bad"])
+
+    def test_resolved_signal_reopens_on_new_hit_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config({"AGENT_DATA_DIR": tmp})
+            brain = Brain(cfg)
+            self.proven(brain, "/rest/user/login", 1.0)
+            key = brain.state()["signals"][0]["id"]
+            self.assertTrue(brain.store.set_signal_status(key, "resolved"))
+            self.assertFalse(brain.store.set_signal_status(key, "bogus"))
+            self.assertEqual(Brain(cfg).state()["signals"][0]["status"], "resolved")
+            brain.store.incidents[-1]["ts"] = brain.store.signal_states[key]["ts"] + 5
+            self.assertEqual(brain.state()["signals"][0]["status"], "open")
+
+    def test_traffic_counts_final_outcome_once_per_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config({"AGENT_DATA_DIR": tmp})
+            brain = Brain(cfg)
+            brain.handle({"kind": "refused", "ip": "9.9.9.9", "path": "/", "ts": 120.0})
+            brain.handle({"kind": "canary_reuse", "ip": "9.9.9.9", "method": "POST", "path": "/rest/user/login", "ts": 125.0})
+            brain.handle({"kind": "canary_reuse", "ip": "9.9.9.9", "method": "POST", "path": "/rest/user/login", "ts": 130.0})
+            brain.store.save_counters()
+            state = Brain(cfg).state()
+        self.assertEqual(state["traffic"], [[120, 0, 0, 3]])
+        caught = [s for s in state["signals"] if s["kind"] == "caught"]
+        self.assertEqual((len(caught), caught[0]["count"], caught[0]["severity"], caught[0]["status"]), (1, 2, "high", "resolved"))
+        self.assertEqual({r["severity"] for r in state["recent"]}, {"high"})
+
+    def test_unusable_event_time_falls_back_to_now(self):
+        bad_times = ("soon", float("nan"), float("inf"), 1e300, True, None, [1])
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            started = time.time()
+            for ts in bad_times:
+                brain.handle({"kind": "canary_reuse", "ip": "9.9.9.9", "method": "POST", "path": "/rest/user/login", "ts": ts})
+            brain.handle({"kind": "canary_reuse", "ip": "9.9.9.9", "method": "POST", "path": "/rest/user/login", "ts": 125})
+            state = brain.state()
+            rows = DecisionLog(Path(tmp) / "decisions.tsv").tail(20)
+        times = [r["ts"] for r in state["recent"]]
+        self.assertEqual(len(rows), len(bad_times) + 1)
+        self.assertTrue(all(started <= ts <= time.time() for ts in times[:-1]))
+        self.assertEqual(times[-1], 125)
+        self.assertEqual(sum(sum(bucket[1:]) for bucket in state["traffic"]), len(bad_times) + 1)
+
+    def test_malformed_events_do_not_stop_the_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            brain.submit([
+                7,
+                {"kind": "request", "ip": "1.1.1.1", "method": "GET", "path": 5},
+                {"kind": "request", "ip": ["x"], "method": "GET", "path": "/a"},
+                {"kind": "honeypot", "ip": "5.5.5.5", "method": "GET", "path": "/.env"},
+            ])
+            deadline = time.time() + 5
+            state = brain.state()
+            while time.time() < deadline and not any(r["kind"] == EventKind.HONEYPOT for r in state["recent"]):
+                time.sleep(0.02)
+                state = brain.state()
+        decisions = [r["decision"] for r in state["recent"]]
+        self.assertEqual(state["stats"]["malformed"], 1)
+        self.assertIn(Decision.ERROR, decisions)
+        self.assertEqual(decisions[-1], Decision.TARPIT)
 
 
 class Labels(unittest.TestCase):
@@ -233,7 +314,7 @@ class Hardening(unittest.TestCase):
             event = {"method": "POST", "path": "/rest/user/login", "ip": "1.2.3.4"}
             record = {"ts": 1.0, "ip": "1.2.3.4", "method": "POST", "path": "/rest/user/login", "kind": EventKind.REQUEST, "replay": {"verdict": Verdict.PROVEN, "why": "solved"}}
             brain._on_proven(event, record, {})
-            status = brain.incidents[-1]["fix"]["status"]
+            status = brain.store.incidents[-1]["fix"]["status"]
         self.assertEqual(status, FixStatus.PR_EXISTS)
 
     def test_jev_describe_strips_newlines(self):

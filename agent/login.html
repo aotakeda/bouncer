@@ -1,0 +1,44 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f5f8">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0d11">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%230b0d11'/%3E%3Crect x='.75' y='.75' width='62.5' height='62.5' rx='14.25' fill='none' stroke='%23fff' stroke-opacity='.14' stroke-width='1.5'/%3E%3Cg transform='translate(32 32) scale(.86) translate(-32 -32)'%3E%3Cpath d='M27 32.5 33.5 26 20.75 13.25 26 8H9v17l5.25-5.25Z' fill='%237aa2ff'/%3E%3Cpath d='M15.5 56 9 49.5l24-24 6.5 6.5Z' fill='%23edf0f5'/%3E%3Crect x='41.5' y='8' width='13.5' height='48' rx='3.5' fill='%23edf0f5'/%3E%3C/g%3E%3C/svg%3E">
+<title>Bouncer · Sign in</title>
+<style>
+:root{--bg:#f4f5f8;--panel:#ffffff;--panel-2:#f8f9fb;--fg:#111318;--mute:#5b616e;--line:rgba(15,23,42,.12);--line-strong:rgba(15,23,42,.20);--focus:#2457d6;--focus-ring:rgba(36,87,214,.24);--mark-bg:#111318;--mark-fg:#edf0f5;--mark-ring:none;--crit:#c92a2a;--crit-bg:#fde8e8;--crit-line:rgba(201,42,42,.28);--shadow:0 12px 32px rgba(15,23,42,.08),0 0 0 1px var(--line);--ease-out:cubic-bezier(0.23,1,0.32,1);--sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0d11;--panel:#13161c;--panel-2:#181c24;--fg:#edf0f5;--mute:#939aa8;--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--focus:#7aa2ff;--focus-ring:rgba(122,162,255,.28);--mark-bg:#0b0d11;--mark-fg:#edf0f5;--mark-ring:inset 0 0 0 1px var(--line-strong);--crit:#ff6b6b;--crit-bg:rgba(255,107,107,.13);--crit-line:rgba(255,107,107,.34);--shadow:0 16px 40px rgba(0,0,0,.5),0 1px 0 rgba(255,255,255,.05) inset,0 0 0 1px var(--line);color-scheme:dark}}
+*,*::before,*::after{box-sizing:border-box}
+html{margin:0;-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:100%;font-optical-sizing:auto}
+body{margin:0;min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:max(20px,env(safe-area-inset-top,0px)) max(16px,env(safe-area-inset-right,0px)) max(20px,env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px));background:var(--bg);color:var(--fg);font:0.9375rem/1.45 var(--sans);-webkit-font-smoothing:antialiased}
+.card{width:min(380px,100%);background:var(--panel);border-radius:14px;padding:24px;box-shadow:var(--shadow);opacity:1;transform:translateY(0) scale(1);transition:opacity 240ms var(--ease-out),transform 240ms var(--ease-out)}
+@starting-style{.card{opacity:0;transform:translateY(6px) scale(.97)}}
+.head{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.mark{width:28px;height:28px;border-radius:8px;background:var(--mark-bg);color:var(--mark-fg);box-shadow:var(--mark-ring);display:grid;place-items:center;flex-shrink:0}
+h1{margin:0;font-size:1.125rem;font-weight:700;letter-spacing:-.025em;line-height:1.2}
+.sub{margin:0 0 18px;color:var(--mute);font-size:0.84375rem}
+form{display:flex;flex-direction:column;gap:10px}
+label{font-size:0.75rem;font-weight:600;color:var(--mute);letter-spacing:.01em}
+input{width:100%;font:inherit;font-size:16px;padding:10px 12px;border-radius:9px;border:1px solid var(--line-strong);background:var(--panel-2);color:var(--fg);transition:border-color 150ms ease,box-shadow 150ms ease}
+input:focus{outline:none;border-color:var(--focus);box-shadow:0 0 0 3px var(--focus-ring)}
+input.bad{border-color:var(--crit)}
+button{width:100%;font:inherit;font-size:0.875rem;font-weight:620;padding:10px 14px;border-radius:9px;border:0;background:var(--focus);color:var(--panel);cursor:pointer;touch-action:manipulation;user-select:none;-webkit-user-select:none;transition:transform 140ms var(--ease-out),opacity 150ms ease}
+button:active{transform:scale(.97)}
+button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+@media (hover:hover) and (pointer:fine){button:hover{opacity:.92}}
+.err{display:flex;align-items:center;gap:7px;margin:2px 0 0;padding:8px 10px;border-radius:8px;background:var(--crit-bg);border:1px solid var(--crit-line);color:var(--crit);font-size:0.8125rem;font-weight:500}
+@media (prefers-reduced-motion:reduce){.card{transition:opacity 180ms ease;transform:none}@starting-style{.card{opacity:0;transform:none}}button:active{transform:none}}
+</style></head>
+<body><main class="card">
+  <div class="head">
+    <span class="mark" aria-hidden="true"><svg width="23" height="23" viewBox="0 0 64 64" fill="none" aria-hidden="true"><path d="M27 32.5 33.5 26 20.75 13.25 26 8H9v17l5.25-5.25Z" fill="#7aa2ff"/><path d="M15.5 56 9 49.5l24-24 6.5 6.5Z" fill="currentColor"/><rect x="41.5" y="8" width="13.5" height="48" rx="3.5" fill="currentColor"/></svg></span>
+    <h1>Bouncer</h1>
+  </div>
+  <p class="sub">OWASP Juice Shop · Enter the dashboard passphrase.</p>
+  <form method="post" action="login">
+    <label for="pw">Passphrase</label>
+    <input id="pw" type="password" name="passphrase" placeholder="What's the password?" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" required autofocus$err_attr>
+    $err_block
+    <button type="submit">Let me in</button>
+  </form>
+</main></body></html>
