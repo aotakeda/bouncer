@@ -290,6 +290,21 @@ class EndToEnd(unittest.TestCase):
             time.sleep(0.2)
         self.assertEqual(call(self.door + "/", "9.8.7.6")[0], 403)
 
+    def test_runner_refusal_does_not_parse_body_as_next_request(self):
+        smuggled = b"GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer runner-secret\r\n\r\n"
+        head = b"POST /reset HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(smuggled)
+        with socket.create_connection(("127.0.0.1", self.p["runner"]), timeout=5) as s:
+            s.sendall(head + smuggled)
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        self.assertIn(b"404 Not Found", data)
+        self.assertNotIn(b"200 OK", data)
+        self.assertNotIn(b"target_ready", data)
+
 
 if __name__ == "__main__":
     unittest.main()

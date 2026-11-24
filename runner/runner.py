@@ -402,6 +402,7 @@ def make_handler(runner: Runner):
             self.wfile.write(data)
 
         def not_found(self) -> None:
+            self.close_connection = True
             self.reply(404, {"error": "not found"})
 
         def authorized(self) -> bool:
