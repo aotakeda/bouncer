@@ -52,20 +52,35 @@ class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp())
-        p = {k: free_port() for k in ("juice", "jev", "runner", "agent", "door")}
+        p = {k: free_port() for k in ("juice", "replay", "jev", "github", "claude", "runner", "agent", "door")}
         cls.p = p
-        reset = f"{sys.executable} -c \"import urllib.request;urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{p['juice']}/__reset',method='POST'))\""
+        reset = f"{sys.executable} -c \"import urllib.request;urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{p['replay']}/__reset',method='POST'))\""
+        app = cls.tmp / "app"
+        cls.app = app
+        (app / "routes").mkdir(parents=True)
+        (app / "build").mkdir()
+        (app / "routes" / "login.ts").write_text("export function login () {\n  query(`SELECT * FROM Users WHERE email = '${email}'`) // VULN\n}\n")
+        (app / "routes" / "search.ts").write_text("export function searchProducts () {\n  query(`SELECT * FROM Products WHERE name LIKE '%${q}%'`) // VULN\n}\n")
+        for name in ("login", "search"):
+            (app / "build" / f"{name}.mode").write_text("vuln")
+        build = f"{sys.executable} -c \"import pathlib;[pathlib.Path('build/'+n+'.mode').write_text('fixed' if 'replacements' in pathlib.Path('routes/'+n+'.ts').read_text() else 'vuln') for n in ('login','search')]\""
         (cls.tmp / "door").mkdir()
         (cls.tmp / "door" / "canaries.json").write_text(json.dumps({"honeypot": {"admin_password": "CANARY-honey-77"}}))
         base = dict(os.environ, PYTHONPATH=str(ROOT))
         specs = [
             ([sys.executable, str(ROOT / "tests" / "fakes.py"), "juice", str(p["juice"])], {}),
+            ([sys.executable, str(ROOT / "tests" / "fakes.py"), "juice", str(p["replay"]), str(app)], {}),
             ([sys.executable, str(ROOT / "tests" / "fakes.py"), "jev", str(p["jev"])], {}),
-            ([sys.executable, str(ROOT / "runner" / "runner.py")], {"RUNNER_PORT": p["runner"], "RUNNER_SECRET_SHA256": sha("runner-secret"), "RUNNER_TARGET": f"http://127.0.0.1:{p['juice']}", "RUNNER_RESET_CMD": reset}),
+            ([sys.executable, str(ROOT / "tests" / "fakes.py"), "github", str(p["github"]), str(app)], {}),
+            ([sys.executable, str(ROOT / "tests" / "fakes.py"), "claude", str(p["claude"])], {}),
+            ([sys.executable, str(ROOT / "runner" / "runner.py")], {
+                "RUNNER_PORT": p["runner"], "RUNNER_SECRET_SHA256": sha("runner-secret"), "RUNNER_TARGET": f"http://127.0.0.1:{p['replay']}", "RUNNER_RESET_CMD": reset,
+                "RUNNER_SERVICE": "", "RUNNER_APP_DIR": app, "RUNNER_BUILD_CMD": build}),
             ([sys.executable, "-m", "agent.agent"], {
                 "AGENT_PORT": p["agent"], "AGENT_DATA_DIR": cls.tmp / "agent", "AGENT_EVENTS_SHA256": sha("events-secret"), "AGENT_DASH_SHA256": sha("let me in"),
                 "JEV_URL": f"http://127.0.0.1:{p['jev']}/v1/systemone", "RUNNER_URL": f"http://127.0.0.1:{p['runner']}", "RUNNER_TOKEN": "runner-secret",
-                "DOOR_URL": f"http://127.0.0.1:{p['door']}", "DOOR_TOKEN": "door-secret", "OWNER_IPS": OWNER}),
+                "DOOR_URL": f"http://127.0.0.1:{p['door']}", "DOOR_TOKEN": "door-secret", "OWNER_IPS": OWNER,
+                "FIX_MODE": "pr", "ANTHROPIC_URL": f"http://127.0.0.1:{p['claude']}", "GITHUB_URL": f"http://127.0.0.1:{p['github']}", "FIX_PER_HOUR": "20"}),
             ([sys.executable, str(ROOT / "door" / "door.py")], {
                 "DOOR_PORT": p["door"], "DOOR_UPSTREAM": f"http://127.0.0.1:{p['juice']}", "DOOR_DATA_DIR": cls.tmp / "door", "DOOR_ADMIN_SHA256": sha("door-secret"),
                 "DOOR_EVENTS_URL": f"http://127.0.0.1:{p['agent']}/events", "DOOR_EVENTS_TOKEN": "events-secret", "DOOR_ALLOWLIST": OWNER,
@@ -86,14 +101,14 @@ class EndToEnd(unittest.TestCase):
         for proc in cls.procs:
             proc.wait(timeout=5)
 
-    def decisions(self, expected: int, timeout: float = 20) -> list:
+    def decisions(self, expected: int, timeout: float = 20, fixes: bool = False) -> list:
         path = self.tmp / "agent" / "decisions.tsv"
         deadline = time.time() + timeout
         rows = []
         while time.time() < deadline:
             if path.exists():
                 with path.open() as f:
-                    rows = list(csv.DictReader(f, delimiter="\t"))
+                    rows = [r for r in csv.DictReader(f, delimiter="\t") if fixes or r["decision"] != "fix"]
                 if len(rows) >= expected:
                     return rows
             time.sleep(0.1)
@@ -125,6 +140,26 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(call(self.door + "/", "3.3.3.3")[0], 403)
         self.assertEqual(call(self.door + "/", "5.5.5.5")[0], 403)
         self.assertEqual(call(self.door + "/", OWNER)[0], 200)
+
+    def test_proven_login_gets_verified_pull_request(self):
+        call(self.door + "/rest/user/login", "7.7.7.7", "POST", {"email": "' or 1=1-- x7", "password": "y"}, ua="sqlmap/1.8")
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            rows = [r for r in self.decisions(1, fixes=True) if r["decision"] == "fix" and "routes/login.ts" in r["evidence"]]
+            if any(r["replay_verdict"] == "PR_OPENED" for r in rows):
+                break
+            time.sleep(0.3)
+        self.assertTrue(any(r["replay_verdict"] == "PR_OPENED" for r in rows), rows)
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.p['github']}/__calls") as r:
+            calls = json.loads(r.read())
+        puts = [c for c in calls if c["method"] == "PUT" and c["path"].endswith("/contents/routes/login.ts")]
+        self.assertEqual(len(puts), 1)
+        self.assertIn("replacements", puts[0]["body"]["text"])
+        self.assertTrue(puts[0]["body"]["branch"].startswith("bouncer/fix-routes-login-ts"))
+        prs = [c for c in calls if c["path"].endswith("/pulls")]
+        self.assertTrue(any("Attack after the patch: **NOT_REPRODUCED**" in c["body"]["body"] for c in prs))
+        self.assertIn("// VULN", (self.app / "routes" / "login.ts").read_text())
+        self.assertEqual((self.app / "build" / "login.mode").read_text(), "vuln")
 
     def test_union_leak_is_proven_by_canary(self):
         q = urllib.request.quote("x')) UNION SELECT email,password FROM Users--")

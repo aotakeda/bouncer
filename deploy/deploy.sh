@@ -9,6 +9,7 @@ AGENT=bh-bouncer
 FORK=https://github.com/aotakeda/juice-shop.git
 REMOTE=/home/sprite/bouncer
 STEP="${1:-all}"
+FIX_MODE="${FIX_MODE:-dry_run}"
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -37,10 +38,14 @@ policy() {
 }
 
 link() {
-  local name="$1" base="$2" token="$3" label="$4" endpoints="$5"
-  api /oauth/connections/custom_api -- -s -X POST -H 'Content-Type: application/json' -d @- <<JSON | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("connection") or d)["id"])'
-{"name":"$name","description":"bouncer link","base_api_url":"$base","access_token":"$token","auth_method":"header","access_policy":{"sprite_labels":["$label"],"allowed_endpoints":$endpoints}}
+  local name="$1" base="$2" token="$3" label="$4" endpoints="$5" policy id
+  policy="{\"sprite_labels\":[\"$label\"],\"allowed_endpoints\":$endpoints}"
+  id="$(api /oauth/connections/custom_api -- -s -X POST -H 'Content-Type: application/json' -d @- <<JSON | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("connection") or d)["id"])'
+{"name":"$name","description":"bouncer link","base_api_url":"$base","access_token":"$token","auth_method":"header","access_policy":$policy}
 JSON
+)"
+  api "/oauth/connections/$id" -- -s -X PATCH -H 'Content-Type: application/json' -d "{\"access_policy\":$policy}" >/dev/null
+  echo "$id"
 }
 
 connector_id() {
@@ -84,7 +89,7 @@ if [ "$STEP" = all ] || [ "$STEP" = links ]; then
   say "creating secret links"
   link bh-link-events "$AGENT_URL" "$EVENTS_SECRET" role:app '["/events"]' >/dev/null
   link bh-link-door "$APP_URL" "$DOOR_SECRET" role:bouncer '["/_bouncer/*"]' >/dev/null
-  link bh-link-replay "$REPLAY_URL" "$RUNNER_SECRET" role:bouncer '["/replay","/reset","/health"]' >/dev/null
+  link bh-link-replay "$REPLAY_URL" "$RUNNER_SECRET" role:bouncer '["/replay","/reset","/patch","/health"]' >/dev/null
 fi
 
 if [ "$STEP" = all ] || [ "$STEP" = services ]; then
@@ -96,7 +101,7 @@ d=json.load(sys.stdin)
 L=d if isinstance(d,list) else d.get('connections',d.get('data',[]))
 print(next((c['id'] for c in L if c.get('provider_account_name')==sys.argv[1]),''))" "$1"
   }
-  EVENTS_ID="$(id_of bh-link-events)"; DOOR_ID="$(id_of bh-link-door)"; REPLAY_ID="$(id_of bh-link-replay)"; JEV_ID="$(connector_id typesafe)"
+  EVENTS_ID="$(id_of bh-link-events)"; DOOR_ID="$(id_of bh-link-door)"; REPLAY_ID="$(id_of bh-link-replay)"; JEV_ID="$(connector_id typesafe)"; CLAUDE_ID="$(connector_id anthropic)"; GITHUB_ID="$(connector_id github)"
 
   say "deploying code"
   push_code "$APP" door
@@ -121,7 +126,7 @@ json.dump({'honeypot':{'admin_email':'ops-'+secrets.token_hex(3)+'@juice-sh.op',
 
   say "agent on $AGENT"
   service "$AGENT" agent --cmd python3 --args "-m,agent.agent" --dir "$REMOTE" --http-port 8080 \
-    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$JEV_ID/v1/systemone,RUNNER_URL=$GW/custom_api/$REPLAY_ID,DOOR_URL=$GW/custom_api/$DOOR_ID,OWNER_IPS=${OWNER_IP:-}"
+    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$JEV_ID/v1/systemone,RUNNER_URL=$GW/custom_api/$REPLAY_ID,DOOR_URL=$GW/custom_api/$DOOR_ID,OWNER_IPS=${OWNER_IP:-},FIX_MODE=$FIX_MODE,ANTHROPIC_URL=$GW/anthropic/$CLAUDE_ID,GITHUB_URL=$GW/github/$GITHUB_ID"
   sprite config update -s "$AGENT" --url-auth public >/dev/null
 fi
 

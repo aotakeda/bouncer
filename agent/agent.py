@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from . import net, persona
+from .fix import Claude, Fixer, GitHub
 from .jev import Jev
 from .replay import INCONCLUSIVE, MINOR, NOT_REPRODUCED, PROVEN, Replayer
 
@@ -44,6 +45,13 @@ class Config:
         self.tarpit_seconds = int(env.get("TARPIT_SECONDS", "600"))
         self.dedupe_seconds = int(env.get("DEDUPE_SECONDS", "600"))
         self.replay_threshold = float(env.get("REPLAY_THRESHOLD", "0.9"))
+        self.fix_mode = env.get("FIX_MODE", "off")
+        self.anthropic_url = env.get("ANTHROPIC_URL", "")
+        self.github_url = env.get("GITHUB_URL", "")
+        self.github_repo = env.get("GITHUB_REPO", "aotakeda/juice-shop")
+        self.github_branch = env.get("GITHUB_BRANCH", "master")
+        self.fix_model = env.get("FIX_MODEL", "claude-opus-5-5")
+        self.fix_per_hour = int(env.get("FIX_PER_HOUR", "3"))
         self.app_description = env.get(
             "APP_DESCRIPTION",
             "OWASP Juice Shop, an Angular + Express + SQLite online juice store with a REST API under /rest and /api. Not WordPress, no PHP.",
@@ -64,6 +72,16 @@ class Brain:
             self.tsv.write_text("\t".join(TSV_COLUMNS) + "\n")
         self.jev = Jev(cfg.jev_url, cfg.app_description) if cfg.jev_url else None
         self.replayer = Replayer(cfg.runner_url, cfg.runner_token) if cfg.runner_url else None
+        self.fixer = None
+        if cfg.fix_mode in ("dry_run", "pr") and cfg.anthropic_url and cfg.github_url and cfg.runner_url:
+            self.fixer = Fixer(
+                cfg.fix_mode,
+                Claude(cfg.anthropic_url, cfg.fix_model),
+                GitHub(cfg.github_url, cfg.github_repo, cfg.github_branch),
+                cfg.runner_url,
+                cfg.runner_token,
+                max_per_hour=cfg.fix_per_hour,
+            )
         self.inbox: queue.Queue = queue.Queue(maxsize=20000)
         self.recent: deque = deque(maxlen=300)
         self.seen: dict = {}
@@ -165,8 +183,13 @@ class Brain:
             verdict = result["verdict"]
             if verdict == PROVEN:
                 self.set_list("block", ip, self.cfg.block_seconds, "proven exploit: " + result["why"][:120])
-                self.incidents.append({"ts": time.time(), "ip": ip, "event": event, "replay": result})
-                return self.decide(record, "block", line=persona.line("proven", self.rng))
+                incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result}
+                self.incidents.append(incident)
+                self.decide(record, "block", line=persona.line("proven", self.rng))
+                if self.fixer:
+                    queued = self.fixer.submit(incident, self.fix_report)
+                    incident["fix"] = {"status": queued, "line": "Fix queued." if queued == "queued" else f"No fix attempt: {queued}."}
+                return
             if verdict == NOT_REPRODUCED:
                 if (triage.get("malicious") or 0) >= 0.7:
                     self.set_list("tarpit", ip, self.cfg.tarpit_seconds, "failed attack attempt")
@@ -186,6 +209,13 @@ class Brain:
         if action == "ignore":
             return self.decide(record, "ignore", line=persona.line("ignore_probe" if (probe or scanner) else "ignore", self.rng))
         return self.decide(record, "watch", line=persona.line("watch", self.rng))
+
+    def fix_report(self, incident: dict, fix: dict):
+        incident["fix"] = fix
+        event = incident["event"]
+        record = {"ts": time.time(), "ip": incident["ip"], "method": event.get("method"), "path": event.get("path", ""), "kind": "fix"}
+        record["replay"] = {"verdict": fix.get("status", "").upper(), "evidence": {k: fix[k] for k in ("file", "pr_url") if fix.get(k)}}
+        self.decide(record, "fix", line=fix.get("line", ""))
 
     def set_list(self, kind: str, ip: str, seconds: int, reason: str) -> bool:
         if ip in self.cfg.owner_ips or not self.cfg.door_url:
@@ -265,13 +295,28 @@ class Brain:
             except queue.Full:
                 pass
 
+    @staticmethod
+    def fix_view(fix: dict | None) -> dict | None:
+        if not fix:
+            return None
+        url = fix.get("pr_url") or ""
+        return {
+            "status": fix.get("status"),
+            "line": fix.get("line"),
+            "file": fix.get("file"),
+            "summary": fix.get("summary"),
+            "diff": (fix.get("diff") or "")[:6000],
+            "pr_url": url if url.startswith("https://github.com/") else "",
+        }
+
     def state(self) -> dict:
         return {
             "stats": dict(self.stats),
             "recent": list(self.recent)[-100:],
             "shame": [{"path": p, "count": c, "caption": persona.shame_caption(p, c)} for p, c in self.shame.most_common(10)],
             "incidents": [
-                {"ts": i["ts"], "ip": self.mask(i["ip"]), "path": i["event"].get("path"), "why": i["replay"].get("why")} for i in self.incidents[-20:]
+                {"ts": i["ts"], "ip": self.mask(i["ip"]), "path": i["event"].get("path"), "why": i["replay"].get("why"), "fix": self.fix_view(i.get("fix"))}
+                for i in self.incidents[-20:]
             ],
         }
 
@@ -287,7 +332,8 @@ main{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px;max-width:
 .ev{border-top:1px solid var(--line);padding:10px 0}.ev:first-child{border-top:0}
 .tag{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;margin-right:6px;background:var(--line)}
 .block{background:var(--red);color:#000}.tarpit{background:var(--amber);color:#000}.replay{background:var(--blue);color:#000}.ignore{background:#2a2a33}.watch{background:#3a3a46}.would_block,.would_tarpit{background:#3a3a46;outline:1px dashed var(--red)}
-.PROVEN{background:var(--red);color:#000}.NOT_REPRODUCED{background:var(--green);color:#000}
+.PROVEN{background:var(--red);color:#000}.fix,.READY,.PR_OPENED{background:var(--green);color:#000}.FAILED,.PR_FAILED{background:var(--amber);color:#000}
+pre{font:12px/1.4 ui-monospace,monospace;background:#0b0b0f;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:360px}.add{color:var(--green)}.del{color:var(--red)}a{color:var(--blue)}.NOT_REPRODUCED{background:var(--green);color:#000}
 code{font:12px ui-monospace,monospace;color:var(--mute);word-break:break-all}.line{margin:4px 0 0}.meta{color:var(--mute);font-size:12px}
 </style></head><body><header><h1>Bouncer</h1><span class=meta>Personal security agent at the door of a deliberately vulnerable OWASP Juice Shop</span></header>
 <main><section class=card><h2>Tonight at the door</h2><div class=stats id=stats></div><div id=feed></div></section>
@@ -296,10 +342,12 @@ code{font:12px ui-monospace,monospace;color:var(--mute);word-break:break-all}.li
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const t=ts=>new Date(ts*1000).toLocaleTimeString();
 function ev(e){const pct=v=>v==null?'':Math.round(v*100)+'%';return `<div class=ev><span class="tag ${esc(e.decision)}">${esc(e.decision)}</span>${e.verdict?`<span class="tag ${esc(e.verdict)}">${esc(e.verdict)}</span>`:''}<span class=meta>${t(e.ts)} · ${esc(e.ip)}${e.malicious!=null?` · Jev: attack ${pct(e.malicious)}, says ${esc(e.jev_action)} (${pct(e.confidence)} sure)`:''}</span><div><code>${esc(e.method)} ${esc(e.path)}</code></div><p class=line>${esc(e.line)}${e.why?` <span class=meta>(${esc(e.why)})</span>`:''}</p></div>`}
+const colour=d=>esc(d).split('\\n').map(l=>l.startsWith('+')&&!l.startsWith('+++')?`<span class=add>${l}</span>`:l.startsWith('-')&&!l.startsWith('---')?`<span class=del>${l}</span>`:l).join('\\n');
+function fx(f){if(!f)return '';return `<p class=line><span class="tag ${esc((f.status||'').toUpperCase())}">fix: ${esc(f.status)}</span>${esc(f.line)}${f.pr_url?` <a href="${esc(f.pr_url)}" target=_blank rel=noopener>pull request</a>`:''}</p>${f.summary?`<p class="line meta">${esc(f.summary)}</p>`:''}${f.diff?`<details><summary class=meta>patch for ${esc(f.file)}</summary><pre>${colour(f.diff)}</pre></details>`:''}`}
 const feed=document.getElementById('feed');
 function render(s){const st=s.stats||{};document.getElementById('stats').innerHTML=[['events','seen'],['prefiltered','waved through'],['replay','replayed'],['block','bounced'],['tarpit','slow-laned'],['refused','refused at door']].map(([k,l])=>`<div><b>${st[k]||0}</b>${l}</div>`).join('');
 document.getElementById('shame').innerHTML=(s.shame||[]).map(x=>`<div class=ev><code>${esc(x.path)}</code><p class=line>${esc(x.caption)}</p></div>`).join('')||'<p class=meta>Nobody embarrassing yet.</p>';
-document.getElementById('inc').innerHTML=(s.incidents||[]).map(x=>`<div class=ev><span class=meta>${t(x.ts)} · ${esc(x.ip)}</span><div><code>${esc(x.path)}</code></div><p class=line>${esc(x.why)}</p></div>`).join('')||'<p class=meta>No proven break-ins.</p>'}
+document.getElementById('inc').innerHTML=(s.incidents||[]).map(x=>`<div class=ev><span class=meta>${t(x.ts)} · ${esc(x.ip)}</span><div><code>${esc(x.path)}</code></div><p class=line>${esc(x.why)}</p>${fx(x.fix)}</div>`).join('')||'<p class=meta>No proven break-ins.</p>'}
 fetch('api/state').then(r=>r.json()).then(s=>{render(s);feed.innerHTML=(s.recent||[]).slice().reverse().map(ev).join('')});
 const es=new EventSource('stream');es.onmessage=m=>{feed.insertAdjacentHTML('afterbegin',ev(JSON.parse(m.data)));fetch('api/state').then(r=>r.json()).then(render)};
 </script></body></html>"""

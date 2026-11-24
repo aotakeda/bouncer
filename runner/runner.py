@@ -6,11 +6,13 @@ import http.client
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 
 DROP_HEADERS = {
@@ -27,6 +29,7 @@ DROP_HEADERS = {
 }
 DROP_PREFIXES = ("sprite-", "x-forwarded-", "fly-", "via")
 PREVIEW = 8192
+PATCH_PREFIXES = ("routes/", "lib/", "models/", "server.ts")
 
 
 class Config:
@@ -40,6 +43,9 @@ class Config:
         self.reset_cmd = env.get("RUNNER_RESET_CMD", f"sprite-env services restart {self.service}")
         self.ready_path = env.get("RUNNER_READY_PATH", "/rest/admin/application-version")
         self.ready_timeout = float(env.get("RUNNER_READY_TIMEOUT", "60"))
+        self.app_dir = Path(env.get("RUNNER_APP_DIR", "/home/sprite/juice-shop"))
+        self.build_cmd = env.get("RUNNER_BUILD_CMD", "./node_modules/.bin/tsc")
+        self.build_dir = env.get("RUNNER_BUILD_DIR", "build")
 
 
 class Target:
@@ -104,7 +110,7 @@ def plant_canary(target: Target) -> dict:
     body = json.dumps({"email": email, "password": password, "passwordRepeat": password, "securityQuestion": None, "securityAnswer": ""}).encode()
     r = target.call("POST", "/api/Users", {"Content-Type": "application/json"}, body)
     md5 = hashlib.md5(password.encode()).hexdigest()
-    return {"planted": r.get("status") in (200, 201), "strings": [email, md5]}
+    return {"planted": r.get("status") in (200, 201), "strings": [email, md5], "email": email, "password": password}
 
 
 def find_canaries(text: str, canaries: list) -> list:
@@ -170,24 +176,98 @@ class Runner:
 
     def replay(self, payload: dict) -> dict:
         with self.lock:
-            reset = None
-            if payload.get("reset", True) or not self.canary["planted"]:
-                reset = self.reset()
-                if not reset["ok"]:
-                    return {"ok": False, "stage": "reset", "reset": reset}
-            s0 = self.target.solved()
-            control = self.send(payload["control"]) if payload.get("control") else None
-            s1 = self.target.solved()
-            attack = self.send(payload["request"])
-            s2 = self.target.solved()
-            return {
-                "ok": True,
-                "reset": reset,
-                "control": control,
-                "control_solved": {k: v for k, v in s1.items() if k not in s0},
-                "attack": attack,
-                "attack_solved": {k: v for k, v in s2.items() if k not in s1},
-            }
+            return self._replay(payload)
+
+    def _replay(self, payload: dict) -> dict:
+        reset = None
+        if payload.get("reset", True) or not self.canary["planted"]:
+            reset = self.reset()
+            if not reset["ok"]:
+                return {"ok": False, "stage": "reset", "reset": reset}
+        s0 = self.target.solved()
+        control = self.send(payload["control"]) if payload.get("control") else None
+        s1 = self.target.solved()
+        attack = self.send(payload["request"])
+        s2 = self.target.solved()
+        return {
+            "ok": True,
+            "reset": reset,
+            "control": control,
+            "control_solved": {k: v for k, v in s1.items() if k not in s0},
+            "attack": attack,
+            "attack_solved": {k: v for k, v in s2.items() if k not in s1},
+        }
+
+
+    def smoke(self) -> dict:
+        login = json.dumps({"email": self.canary.get("email", ""), "password": self.canary.get("password", "")}).encode()
+        checks = [
+            ("version", "GET", self.cfg.ready_path, None),
+            ("search", "GET", "/rest/products/search?q=apple", None),
+            ("login", "POST", "/rest/user/login", login),
+        ]
+        out = {}
+        for name, method, path, body in checks:
+            r = self.target.call(method, path, {"Content-Type": "application/json"} if body else {}, body)
+            count = None
+            try:
+                data = json.loads(r["body"])
+                if isinstance(data.get("data"), list):
+                    count = len(data["data"])
+                elif "authentication" in data:
+                    count = 1
+            except (ValueError, AttributeError):
+                pass
+            out[name] = {"status": r.get("status"), "count": count}
+        return out
+
+    def check_files(self, files: dict) -> str:
+        if not files:
+            return "no files"
+        for rel, spec in files.items():
+            if rel.startswith("/") or ".." in Path(rel).parts or not rel.startswith(PATCH_PREFIXES):
+                return f"path not allowed: {rel}"
+            target = self.cfg.app_dir / rel
+            if not target.is_file():
+                return f"no such file: {rel}"
+            if hashlib.sha256(target.read_bytes()).hexdigest() != spec.get("base_sha256"):
+                return f"base mismatch: {rel}"
+            if not isinstance(spec.get("content"), str):
+                return f"missing content: {rel}"
+        return ""
+
+    def patch(self, payload: dict) -> dict:
+        files = payload.get("files") or {}
+        with self.lock:
+            problem = self.check_files(files)
+            if problem:
+                return {"ok": False, "stage": "validate", "error": problem}
+            first = self.reset()
+            if not first["ok"]:
+                return {"ok": False, "stage": "reset", "reset": first}
+            before = self.smoke()
+            build = self.cfg.app_dir / self.cfg.build_dir
+            backup = self.cfg.app_dir / (self.cfg.build_dir + ".bouncer-bak")
+            originals = {rel: (self.cfg.app_dir / rel).read_bytes() for rel in files}
+            shutil.rmtree(backup, ignore_errors=True)
+            shutil.copytree(build, backup, symlinks=True)
+            started = time.time()
+            try:
+                for rel, spec in files.items():
+                    (self.cfg.app_dir / rel).write_text(spec["content"])
+                proc = subprocess.run(self.cfg.build_cmd, shell=True, cwd=self.cfg.app_dir, capture_output=True, text=True, timeout=300)
+                build_info = {"ok": proc.returncode == 0, "ms": int((time.time() - started) * 1000), "log": (proc.stdout + proc.stderr)[-2000:]}
+                if not build_info["ok"]:
+                    return {"ok": True, "build": build_info, "smoke_before": before}
+                result = self._replay(dict(payload, reset=True))
+                after = self.smoke() if result.get("ok") else {}
+                return {"ok": True, "build": build_info, "replay": result, "smoke_before": before, "smoke_after": after}
+            finally:
+                for rel, data in originals.items():
+                    (self.cfg.app_dir / rel).write_bytes(data)
+                shutil.rmtree(build, ignore_errors=True)
+                backup.rename(build)
+                self.reset()
 
 
 def make_handler(runner: Runner):
@@ -237,6 +317,10 @@ def make_handler(runner: Runner):
                 if "request" not in payload:
                     return self.reply(400, {"error": "missing request"})
                 return self.reply(200, runner.replay(payload))
+            if self.path == "/patch":
+                if "request" not in payload or "files" not in payload:
+                    return self.reply(400, {"error": "missing request or files"})
+                return self.reply(200, runner.patch(payload))
             return self.reply(404, {"error": "not found"})
 
     return Handler
