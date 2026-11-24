@@ -25,7 +25,7 @@ if [ ! -f "$SECRETS" ]; then
     echo "DOOR_SECRET=$(rand)"
     echo "RUNNER_SECRET=$(rand)"
     echo "EVENTS_SECRET=$(rand)"
-    echo "DASH_PASSPHRASE=$(python3 -c 'import secrets;print("-".join(secrets.choice(["juice","velvet","rope","neon","door","list","bouncer","night","club","mango","kiwi","lemon"]) for _ in range(4)))')"
+    echo "DASH_PASSPHRASE=$(python3 -c 'import secrets;print("-".join(secrets.choice(["juice","velvet","rope","neon","door","list","bouncer","night","club","mango","kiwi","lemon"]) for _ in range(4))+"-"+secrets.token_hex(8))')"
   } > "$SECRETS"
 fi
 set -a; . "$SECRETS"; set +a
@@ -77,72 +77,92 @@ service() {
 }
 
 APP_URL="$(url_of $APP)"; REPLAY_URL="$(url_of $REPLAY)"; AGENT_URL="$(url_of $AGENT)"
+GW=https://api.sprites.dev/v1/gateway
+LOCKED_EGRESS='[{"domain":"api.sprites.dev","action":"allow"},{"domain":"*","action":"deny"}]'
 
-if [ "$STEP" = all ] || [ "$STEP" = install ]; then
-  say "installing Juice Shop on $APP and $REPLAY"
-  install_juice "$APP" &
-  install_juice "$REPLAY" &
-  wait
-fi
-
-if [ "$STEP" = all ] || [ "$STEP" = links ]; then
-  say "creating secret links"
-  link bh-link-events "$AGENT_URL" "$EVENTS_SECRET" role:app '["/events"]' >/dev/null
-  link bh-link-door "$APP_URL" "$DOOR_SECRET" role:bouncer '["/_bouncer/*"]' >/dev/null
-  link bh-link-replay "$REPLAY_URL" "$RUNNER_SECRET" role:bouncer '["/replay","/reset","/patch","/health"]' >/dev/null
-fi
-
-if [ "$STEP" = all ] || [ "$STEP" = services ]; then
-  GW=https://api.sprites.dev/v1/gateway
-  id_of() {
-    api /oauth/connections -- -s | python3 -c "
+link_id() {
+  api /oauth/connections -- -s | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 L=d if isinstance(d,list) else d.get('connections',d.get('data',[]))
 print(next((c['id'] for c in L if c.get('provider_account_name')==sys.argv[1]),''))" "$1"
-  }
-  EVENTS_ID="$(id_of bh-link-events)"; DOOR_ID="$(id_of bh-link-door)"; REPLAY_ID="$(id_of bh-link-replay)"; JEV_ID="$(connector_id typesafe)"; CLAUDE_ID="$(connector_id anthropic)"; GITHUB_ID="$(connector_id github)"
+}
+
+door_admin() {
+  curl -s -X "$1" -H "Authorization: Bearer $DOOR_SECRET" "$APP_URL/_bouncer/$2"
+}
+
+step_install() {
+  say "installing Juice Shop on $APP and $REPLAY"
+  install_juice "$APP" &
+  install_juice "$REPLAY" &
+  wait
+}
+
+step_links() {
+  say "creating secret links"
+  link bh-link-events "$AGENT_URL" "$EVENTS_SECRET" role:app '["/events"]' >/dev/null
+  link bh-link-door "$APP_URL" "$DOOR_SECRET" role:bouncer '["/_bouncer/*"]' >/dev/null
+  link bh-link-replay "$REPLAY_URL" "$RUNNER_SECRET" role:bouncer '["/replay","/reset","/patch","/health"]' >/dev/null
+}
+
+plant_canaries() {
+  sx "$APP" sh -c "mkdir -p $REMOTE/door-data && cd $REMOTE/door-data && test -f canaries.json || python3 -c \"
+import json,secrets
+t=lambda p,n: p+secrets.token_hex(n)
+json.dump({'honeypot':{'admin_email':'ops-'+secrets.token_hex(3)+'@juice-sh.op','admin_password':t('Velvet-Rope-',6),'aws_key_id':'AKIA'+secrets.token_hex(8).upper(),'aws_secret':t('',20),'stripe_key':t('sk_live_',12)}},open('canaries.json','w'),indent=2)\""
+}
+
+deploy_door() {
+  local events_id="$1"
+  say "door on $APP"
+  plant_canaries
+  service "$APP" juice --cmd node --args build/app --dir /home/sprite/juice-shop --env "PORT=3000,NODE_ENV=production"
+  service "$APP" door --cmd python3 --args "$REMOTE/door/door.py" --dir "$REMOTE" --http-port 8080 \
+    --env "DOOR_DATA_DIR=$REMOTE/door-data,DOOR_ADMIN_SHA256=$(sha "$DOOR_SECRET"),DOOR_EVENTS_URL=$GW/custom_api/$events_id/events,DOOR_ALLOWLIST=${OWNER_IP:-}"
+  sprite config update -s "$APP" --url-auth public >/dev/null
+}
+
+deploy_runner() {
+  say "runner on $REPLAY"
+  service "$REPLAY" juice --cmd node --args build/app --dir /home/sprite/juice-shop --env "PORT=3000,NODE_ENV=production"
+  service "$REPLAY" runner --cmd python3 --args "$REMOTE/runner/runner.py" --dir "$REMOTE" --http-port 8080 \
+    --env "RUNNER_SECRET_SHA256=$(sha "$RUNNER_SECRET")"
+  sprite config update -s "$REPLAY" --url-auth public >/dev/null
+}
+
+deploy_agent() {
+  local replay_id="$1" door_id="$2" jev_id="$3" claude_id="$4" github_id="$5"
+  say "agent on $AGENT"
+  service "$AGENT" agent --cmd python3 --args "-m,agent.agent" --dir "$REMOTE" --http-port 8080 \
+    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$jev_id/v1/systemone,RUNNER_URL=$GW/custom_api/$replay_id,DOOR_URL=$GW/custom_api/$door_id,OWNER_IPS=${OWNER_IP:-},BLOCK_SECONDS=${BLOCK_SECONDS:-900},FIX_MODE=$FIX_MODE,ANTHROPIC_URL=$GW/anthropic/$claude_id,GITHUB_URL=$GW/github/$github_id"
+  sprite config update -s "$AGENT" --url-auth public >/dev/null
+}
+
+step_services() {
+  local events_id door_id replay_id jev_id claude_id github_id
+  events_id="$(link_id bh-link-events)"; door_id="$(link_id bh-link-door)"; replay_id="$(link_id bh-link-replay)"
+  jev_id="$(connector_id typesafe)"; claude_id="$(connector_id anthropic)"; github_id="$(connector_id github)"
 
   say "deploying code"
   push_code "$APP" door
   push_code "$REPLAY" runner
   push_code "$AGENT" agent
 
-  say "door on $APP"
-  sx "$APP" sh -c "mkdir -p $REMOTE/door-data && cd $REMOTE/door-data && test -f canaries.json || python3 -c \"
-import json,secrets
-t=lambda p,n: p+secrets.token_hex(n)
-json.dump({'honeypot':{'admin_email':'ops-'+secrets.token_hex(3)+'@juice-sh.op','admin_password':t('Velvet-Rope-',6),'aws_key_id':'AKIA'+secrets.token_hex(8).upper(),'aws_secret':t('',20),'stripe_key':t('sk_live_',12)}},open('canaries.json','w'),indent=2)\""
-  service "$APP" juice --cmd node --args build/app --dir /home/sprite/juice-shop --env "PORT=3000,NODE_ENV=production"
-  service "$APP" door --cmd python3 --args "$REMOTE/door/door.py" --dir "$REMOTE" --http-port 8080 \
-    --env "DOOR_DATA_DIR=$REMOTE/door-data,DOOR_ADMIN_SHA256=$(sha "$DOOR_SECRET"),DOOR_EVENTS_URL=$GW/custom_api/$EVENTS_ID/events,DOOR_ALLOWLIST=${OWNER_IP:-}"
-  sprite config update -s "$APP" --url-auth public >/dev/null
-
-  say "runner on $REPLAY"
-  service "$REPLAY" juice --cmd node --args build/app --dir /home/sprite/juice-shop --env "PORT=3000,NODE_ENV=production"
-  service "$REPLAY" runner --cmd python3 --args "$REMOTE/runner/runner.py" --dir "$REMOTE" --http-port 8080 \
-    --env "RUNNER_SECRET_SHA256=$(sha "$RUNNER_SECRET")"
-  sprite config update -s "$REPLAY" --url-auth public >/dev/null
-
-  say "agent on $AGENT"
-  service "$AGENT" agent --cmd python3 --args "-m,agent.agent" --dir "$REMOTE" --http-port 8080 \
-    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$JEV_ID/v1/systemone,RUNNER_URL=$GW/custom_api/$REPLAY_ID,DOOR_URL=$GW/custom_api/$DOOR_ID,OWNER_IPS=${OWNER_IP:-},FIX_MODE=$FIX_MODE,ANTHROPIC_URL=$GW/anthropic/$CLAUDE_ID,GITHUB_URL=$GW/github/$GITHUB_ID"
-  sprite config update -s "$AGENT" --url-auth public >/dev/null
-fi
-
-if [ "$STEP" = all ] || [ "$STEP" = lock ]; then
-  say "locking down"
-  policy "$APP" '[{"domain":"api.sprites.dev","action":"allow"},{"domain":"*","action":"deny"}]'
-  policy "$AGENT" '[{"domain":"api.sprites.dev","action":"allow"},{"domain":"*","action":"deny"}]'
-  policy "$REPLAY" '[{"domain":"*","action":"deny"}]'
-  api -s "$REPLAY" /policy/privileges -- -s -X POST -H 'Content-Type: application/json' -d '{"profile":"minimal","noNewPrivileges":true}' >/dev/null
-fi
-
-door_admin() {
-  curl -s -X "$1" -H "Authorization: Bearer $DOOR_SECRET" "$APP_URL/_bouncer/$2"
+  deploy_door "$events_id"
+  deploy_runner
+  deploy_agent "$replay_id" "$door_id" "$jev_id" "$claude_id" "$github_id"
 }
 
-if [ "$STEP" = blocks ]; then
+step_lock() {
+  say "locking down"
+  policy "$APP" "$LOCKED_EGRESS"
+  policy "$AGENT" "$LOCKED_EGRESS"
+  policy "$REPLAY" '[{"domain":"*","action":"deny"}]'
+  api -s "$REPLAY" /policy/privileges -- -s -X POST -H 'Content-Type: application/json' -d '{"profile":"minimal","noNewPrivileges":true}' >/dev/null
+}
+
+step_blocks() {
   door_admin GET blocklist | python3 -c '
 import sys,json,time
 d=json.load(sys.stdin)
@@ -150,15 +170,23 @@ for kind,entries in d.items():
     for ip,e in (entries or {}).items():
         left=max(0,int(e.get("until",0)-time.time()))
         print("%-9s %-40s %5ds  %s" % (kind, ip, left, str(e.get("reason",""))[:80]))'
-  exit 0
-fi
+}
 
-if [ "$STEP" = unblock ]; then
-  IP="${2:?usage: deploy.sh unblock <ip>}"
-  for kind in blocklist tarpit; do printf '%s: ' "$kind"; door_admin DELETE "$kind/$IP"; echo; done
-  exit 0
-fi
+step_unblock() {
+  local ip="${1:?usage: deploy.sh unblock <ip>}" kind
+  for kind in blocklist tarpit; do printf '%s: ' "$kind"; door_admin DELETE "$kind/$ip"; echo; done
+}
 
-say "done"
-echo "app:       $APP_URL"
-echo "dashboard: $AGENT_URL  (passphrase in .secrets)"
+summary() {
+  say "done"
+  echo "app:       $APP_URL"
+  echo "dashboard: $AGENT_URL  (passphrase in .secrets)"
+}
+
+case "$STEP" in
+  all) step_install; step_links; step_services; step_lock; summary ;;
+  install|links|services|lock) "step_$STEP"; summary ;;
+  blocks) step_blocks ;;
+  unblock) step_unblock "${2:-}" ;;
+  *) echo "usage: deploy.sh [all|install|links|services|lock|blocks|unblock <ip>]" >&2; exit 1 ;;
+esac

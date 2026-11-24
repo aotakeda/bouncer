@@ -9,40 +9,58 @@ import urllib.error
 import urllib.request
 
 SPRITE_SOCK = "/.sprite/api.sock"
+JSON_HEADERS = {"Content-Type": "application/json"}
+
+
+def bare_path(path: str) -> str:
+    return path.split("?", 1)[0]
+
+
+def bearer(token: str) -> dict | None:
+    return {"Authorization": f"Bearer {token}"} if token else None
+
+
+def encode_json(payload) -> bytes | None:
+    return json.dumps(payload).encode() if payload is not None else None
 
 
 def post_json(url: str, payload, timeout: float = 30, headers: dict | None = None) -> tuple:
-    data = json.dumps(payload).encode()
-    hdrs = {"Content-Type": "application/json"}
-    hdrs.update(headers or {})
-    req = urllib.request.Request(url, data=data, method="POST", headers=hdrs)
-    return _send(req, timeout)
+    return _send(_build(url, "POST", json.dumps(payload).encode(), headers), timeout)
 
 
 def request(url: str, method: str = "GET", payload=None, timeout: float = 30, headers: dict | None = None) -> tuple:
-    data = json.dumps(payload).encode() if payload is not None else None
-    hdrs = {"Content-Type": "application/json"} if data is not None else {}
+    return _send(_build(url, method, encode_json(payload), headers), timeout)
+
+
+def _build(url: str, method: str, data: bytes | None, headers: dict | None) -> urllib.request.Request:
+    hdrs = dict(JSON_HEADERS) if data is not None else {}
     hdrs.update(headers or {})
-    req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
-    return _send(req, timeout)
+    return urllib.request.Request(url, data=data, method=method, headers=hdrs)
 
 
-def _send(req, timeout: float) -> tuple:
+def _send(req: urllib.request.Request, timeout: float) -> tuple:
     started = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            status = resp.status
+        status, body = _read(req, timeout)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        status = exc.code
+        status, body = exc.code, exc.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError) as exc:
         return 0, {"error": str(exc)[:300]}, time.time() - started
+    return status, _parse(body), time.time() - started
+
+
+def _read(req: urllib.request.Request, timeout: float) -> tuple[int, str]:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read().decode("utf-8", "replace")
+
+
+def _parse(body: str):
+    if not body:
+        return {}
     try:
-        parsed = json.loads(body) if body else {}
+        return json.loads(body)
     except ValueError:
-        parsed = {"raw": body[:2000]}
-    return status, parsed, time.time() - started
+        return {"raw": body[:2000]}
 
 
 class _UnixConnection(http.client.HTTPConnection):
@@ -62,8 +80,7 @@ def sprite_api(method: str, path: str, payload=None) -> int:
         return 0
     conn = _UnixConnection(SPRITE_SOCK)
     try:
-        body = json.dumps(payload).encode() if payload is not None else None
-        conn.request(method, path, body=body, headers={"Content-Type": "application/json"})
+        conn.request(method, path, body=encode_json(payload), headers=JSON_HEADERS)
         resp = conn.getresponse()
         resp.read()
         return resp.status

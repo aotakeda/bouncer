@@ -38,9 +38,10 @@ def wait_port(port: int, timeout: float = 10):
     raise RuntimeError(f"port {port} never opened")
 
 
-def call(url: str, ip: str, method: str = "GET", body: dict | None = None, ua: str = "Mozilla/5.0") -> tuple:
+def call(url: str, ip: str, method: str = "GET", body: dict | None = None, ua: str = "Mozilla/5.0", extra: dict | None = None) -> tuple:
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"Sprite-Client-Ip": ip, "User-Agent": ua, "Content-Type": "application/json"})
+    headers = {"Sprite-Client-Ip": ip, "User-Agent": ua, "Content-Type": "application/json", **(extra or {})}
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return r.status, r.read().decode()
@@ -174,6 +175,22 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any(r["replay_verdict"] == "PR_EXISTS" and "pull/1" in r["evidence"] for r in rows), rows)
         with urllib.request.urlopen(f"http://127.0.0.1:{self.p['github']}/__calls") as r:
             self.assertEqual(sum(1 for c in json.loads(r.read()) if c["method"] == "PUT"), 1)
+
+    def test_owner_can_ask_to_be_treated_as_a_stranger(self):
+        stranger = {"X-Bouncer-Stranger": "1"}
+        call(self.door + "/rest/user/login", OWNER, "POST", {"email": "' or 1=1-- demo", "password": "x"}, ua="sqlmap/1.8", extra=stranger)
+        deadline = time.time() + 20
+        rows = []
+        while time.time() < deadline and not any(r["decision"] == "block" for r in rows):
+            time.sleep(0.2)
+            rows = [r for r in self.decisions(1) if r["ip"] == "owner-as-stranger"]
+        self.assertEqual(rows[-1]["decision"], "block")
+        self.assertEqual(call(self.door + "/", OWNER, extra=stranger)[0], 403)
+        self.assertEqual(call(self.door + "/", OWNER)[0], 200)
+        self.assertEqual(call(self.door + "/", "1.2.3.5", extra=stranger)[0], 200)
+        req = urllib.request.Request(self.door + "/_bouncer/blocklist/owner-as-stranger", method="DELETE", headers={"Authorization": "Bearer door-secret"})
+        urllib.request.urlopen(req).close()
+        self.assertEqual(call(self.door + "/", OWNER, extra=stranger)[0], 200)
 
     def test_union_leak_is_proven_by_canary(self):
         q = urllib.request.quote("x')) UNION SELECT email,password FROM Users--")

@@ -13,6 +13,8 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from enum import Enum
+from typing import Callable, NamedTuple
 from urllib.parse import urlsplit
 
 HOP_BY_HOP = {
@@ -33,10 +35,59 @@ STATIC_PATH = re.compile(
 )
 
 QUIET_PATHS = {"/", "/socket.io/", "/rest/admin/application-version", "/rest/admin/application-configuration", "/rest/languages"}
-
-BODY_PREVIEW = 4096
-
+SOCKET_IO_PATH = "/socket.io/"
 REPLAY_HEADERS = {"authorization", "cookie", "accept", "x-user-email"}
+MAX_STORED_BODY = 65536
+MAX_BATCH_BODY = 1048576
+
+STRANGER = "owner-as-stranger"
+ADMIN_PREFIX = "/_bouncer/"
+BEARER = "Bearer "
+LIST_KINDS = {"blocklist": "block", "tarpit": "tarpit"}
+TEXT_TYPE = "text/plain; charset=utf-8"
+JSON_TYPE = "application/json"
+
+
+class EventKind(str, Enum):
+    REQUEST = "request"
+    REFUSED = "refused"
+    HONEYPOT = "honeypot"
+    CANARY_REUSE = "canary_reuse"
+    TARPITTED = "tarpitted"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class Outcome(NamedTuple):
+    kind: EventKind
+    status: int
+    size: int
+
+
+class AdminRequest(NamedTuple):
+    kind: str
+    target: str
+    body: bytes
+
+
+LogFn = Callable[[dict], None]
+
+
+def bare_path(path: str) -> str:
+    return path.split("?", 1)[0]
+
+
+def json_bytes(obj) -> bytes:
+    return json.dumps(obj).encode()
+
+
+def body_size(event: dict) -> int:
+    return len(event.get("body", ""))
+
+
+def retry_after(entry: dict) -> str:
+    return str(max(1, int(entry.get("until", 0) - time.time())))
 
 
 class Config:
@@ -55,19 +106,27 @@ class Config:
         self.canaries_file = Path(env.get("DOOR_CANARIES", str(self.data_dir / "canaries.json")))
         self.flush_seconds = float(env.get("DOOR_FLUSH_SECONDS", "2"))
 
+    @property
+    def upstream(self) -> str:
+        return f"{self.upstream_host}:{self.upstream_port}"
+
 
 class Lists:
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.Lock()
         self.data = {"block": {}, "tarpit": {}}
-        if path.exists():
-            try:
-                self.data.update(json.loads(path.read_text()))
-            except ValueError:
-                pass
+        self._load()
 
-    def _save(self):
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            self.data.update(json.loads(self.path.read_text()))
+        except ValueError:
+            pass
+
+    def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2))
         tmp.replace(self.path)
@@ -85,12 +144,10 @@ class Lists:
 
     def put(self, kind: str, entries: dict, allowlist: set) -> dict:
         with self.lock:
-            skipped = []
+            skipped = [ip for ip in entries if ip in allowlist]
             for ip, entry in entries.items():
-                if ip in allowlist:
-                    skipped.append(ip)
-                    continue
-                self.data[kind][ip] = entry
+                if ip not in allowlist:
+                    self.data[kind][ip] = entry
             self._save()
             return {"ok": True, "skipped_allowlisted": skipped}
 
@@ -107,7 +164,7 @@ class Lists:
 
 
 class Pusher:
-    def __init__(self, url: str, flush_seconds: float, log, token: str = ""):
+    def __init__(self, url: str, flush_seconds: float, log: LogFn, token: str = ""):
         self.url = url
         self.token = token
         self.flush_seconds = flush_seconds
@@ -116,7 +173,7 @@ class Pusher:
         if url:
             threading.Thread(target=self._run, daemon=True).start()
 
-    def push(self, event: dict):
+    def push(self, event: dict) -> None:
         if not self.url:
             return
         try:
@@ -124,27 +181,38 @@ class Pusher:
         except queue.Full:
             pass
 
-    def _run(self):
+    def _run(self) -> None:
         while True:
-            batch = [self.q.get()]
-            deadline = time.time() + self.flush_seconds
-            while len(batch) < 200:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                try:
-                    batch.append(self.q.get(timeout=remaining))
-                except queue.Empty:
-                    break
-            body = json.dumps({"events": batch}).encode()
-            headers = {"Content-Type": "application/json"}
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-            req = urllib.request.Request(self.url, data=body, method="POST", headers=headers)
+            self._send(self._collect_batch())
+
+    def _collect_batch(self) -> list:
+        batch = [self.q.get()]
+        size = body_size(batch[0])
+        deadline = time.time() + self.flush_seconds
+        while len(batch) < 200 and size < MAX_BATCH_BODY:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
             try:
-                urllib.request.urlopen(req, timeout=15).read()
-            except Exception as exc:
-                self.log({"kind": "push_failed", "error": str(exc)[:200], "events": len(batch)})
+                batch.append(self.q.get(timeout=remaining))
+            except queue.Empty:
+                break
+            size += body_size(batch[-1])
+        return batch
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": JSON_TYPE}
+        if self.token:
+            headers["Authorization"] = f"{BEARER}{self.token}"
+        return headers
+
+    def _send(self, batch: list) -> None:
+        body = json_bytes({"events": batch})
+        req = urllib.request.Request(self.url, data=body, method="POST", headers=self._headers())
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception as exc:
+            self.log({"kind": "push_failed", "error": str(exc)[:200], "events": len(batch)})
 
 
 class Door:
@@ -159,12 +227,16 @@ class Door:
         self.pusher = Pusher(cfg.events_url, cfg.flush_seconds, self.write_log, cfg.events_token)
 
     def _load_canaries(self) -> dict:
-        if self.cfg.canaries_file.exists():
-            return json.loads(self.cfg.canaries_file.read_text())
-        return {}
+        if not self.cfg.canaries_file.exists():
+            return {}
+        return json.loads(self.cfg.canaries_file.read_text())
+
+    @property
+    def honeypot(self) -> dict:
+        return self.canaries.get("honeypot", {})
 
     def honeypot_env(self) -> str:
-        c = self.canaries.get("honeypot", {})
+        c = self.honeypot
         return (
             "NODE_ENV=production\n"
             f"ADMIN_EMAIL={c.get('admin_email', 'ops@juice-sh.op')}\n"
@@ -176,34 +248,51 @@ class Door:
         )
 
     def canary_hits(self, text: str) -> list:
-        hits = []
-        for value in self.canaries.get("honeypot", {}).values():
-            if value and value in text:
-                hits.append(value)
-        return hits
+        return [value for value in self.honeypot.values() if value and value in text]
 
-    def write_log(self, record: dict):
+    def write_log(self, record: dict) -> None:
         line = json.dumps(record, separators=(",", ":"))
         with self.log_lock:
             with self.log_path.open("a") as f:
                 f.write(line + "\n")
 
     def admin_ok(self, header: str | None) -> bool:
-        if not self.cfg.admin_sha256 or not header or not header.startswith("Bearer "):
+        if not self.cfg.admin_sha256 or not header or not header.startswith(BEARER):
             return False
-        digest = hashlib.sha256(header[7:].encode()).hexdigest()
+        digest = hashlib.sha256(header[len(BEARER):].encode()).hexdigest()
         return hmac.compare_digest(digest, self.cfg.admin_sha256)
+
+    def listed_entry(self, kind: str, ip: str) -> dict | None:
+        entry = self.lists.active(kind, ip)
+        return entry if entry and ip not in self.cfg.allowlist else None
+
+    def is_listed(self, kind: str, ip: str) -> bool:
+        return bool(self.listed_entry(kind, ip))
+
+    def tarpit(self, ip: str) -> bool:
+        if not self.is_listed("tarpit", ip):
+            return False
+        if not self.tarpit_slots.acquire(blocking=False):
+            return False
+        try:
+            time.sleep(self.cfg.tarpit_seconds)
+        finally:
+            self.tarpit_slots.release()
+        return True
 
     @staticmethod
     def is_quiet(method: str, path: str) -> bool:
-        bare = path.split("?", 1)[0]
-        if bare == "/socket.io/" and method in ("GET", "POST"):
+        bare = bare_path(path)
+        if bare == SOCKET_IO_PATH and method in ("GET", "POST"):
             return True
         if method not in ("GET", "HEAD"):
             return False
-        if "?" in path and not bare.startswith("/socket.io/"):
+        if "?" in path and not bare.startswith(SOCKET_IO_PATH):
             return False
-        return bare in QUIET_PATHS or bool(STATIC_PATH.match(bare)) or bare.startswith("/socket.io/")
+        return bare in QUIET_PATHS or bool(STATIC_PATH.match(bare)) or bare.startswith(SOCKET_IO_PATH)
+
+    def should_push(self, kind: EventKind, method: str, path: str) -> bool:
+        return kind != EventKind.REQUEST or not self.is_quiet(method, path)
 
 
 def make_handler(door: Door):
@@ -218,125 +307,159 @@ def make_handler(door: Door):
             pass
 
         def client_ip(self) -> str:
-            return self.headers.get("Sprite-Client-Ip") or self.client_address[0]
+            ip = self.headers.get("Sprite-Client-Ip") or self.client_address[0]
+            if ip in cfg.allowlist and self.headers.get("X-Bouncer-Stranger"):
+                return STRANGER
+            return ip
 
         def read_body(self) -> bytes:
             length = int(self.headers.get("Content-Length") or 0)
             return self.rfile.read(length) if length > 0 else b""
 
-        def send(self, status: int, body: bytes, ctype: str = "text/plain; charset=utf-8", extra: dict | None = None):
+        def write_body(self, body: bytes) -> None:
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def send(self, status: int, body: bytes, ctype: str = TEXT_TYPE, extra: dict | None = None) -> int:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
+            self.write_body(body)
             return len(body)
+
+        def send_json(self, obj) -> int:
+            return self.send(200, json_bytes(obj), JSON_TYPE)
+
+        def not_found(self) -> int:
+            return self.send(404, b"Not Found")
+
+        def method_not_allowed(self) -> int:
+            return self.send(405, b"Method Not Allowed")
 
         def handle_admin(self, body: bytes) -> int:
             if not door.admin_ok(self.headers.get("Authorization")):
-                return self.send(404, b"Not Found")
-            parts = self.path.split("?", 1)[0].strip("/").split("/")
-            if len(parts) == 2 and parts[1] == "whoami":
-                return self.send(200, json.dumps({"ip": self.client_ip()}).encode(), "application/json")
-            if len(parts) < 2 or parts[1] not in ("blocklist", "tarpit"):
-                return self.send(404, b"Not Found")
-            kind = "block" if parts[1] == "blocklist" else "tarpit"
-            if self.command == "GET":
-                return self.send(200, json.dumps(door.lists.snapshot()).encode(), "application/json")
-            if self.command == "PUT":
-                try:
-                    entries = json.loads(body or b"{}")
-                except ValueError:
-                    return self.send(400, b"bad json")
-                result = door.lists.put(kind, entries, cfg.allowlist)
-                return self.send(200, json.dumps(result).encode(), "application/json")
-            if self.command == "DELETE" and len(parts) == 3:
-                existed = door.lists.delete(kind, parts[2])
-                return self.send(200, json.dumps({"ok": True, "existed": existed}).encode(), "application/json")
-            return self.send(405, b"Method Not Allowed")
+                return self.not_found()
+            parts = bare_path(self.path).strip("/").split("/")
+            if parts[1:] == ["whoami"]:
+                return self.send_json({"ip": self.client_ip()})
+            if len(parts) < 2 or parts[1] not in LIST_KINDS:
+                return self.not_found()
+            action = self.ADMIN_ACTIONS.get(self.command)
+            if action is None:
+                return self.method_not_allowed()
+            target = parts[2] if len(parts) == 3 else ""
+            return action(self, AdminRequest(LIST_KINDS[parts[1]], target, body))
 
-        def proxy(self, body: bytes) -> tuple:
-            conn = http.client.HTTPConnection(cfg.upstream_host, cfg.upstream_port, timeout=60)
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
-            headers["Host"] = f"{cfg.upstream_host}:{cfg.upstream_port}"
-            headers["X-Forwarded-For"] = self.client_ip()
+        def admin_snapshot(self, req: AdminRequest) -> int:
+            return self.send_json(door.lists.snapshot())
+
+        def admin_put(self, req: AdminRequest) -> int:
             try:
-                conn.request(self.command, self.path, body=body or None, headers=headers)
+                entries = json.loads(req.body or b"{}")
+            except ValueError:
+                return self.send(400, b"bad json")
+            return self.send_json(door.lists.put(req.kind, entries, cfg.allowlist))
+
+        def admin_delete(self, req: AdminRequest) -> int:
+            if not req.target:
+                return self.method_not_allowed()
+            existed = door.lists.delete(req.kind, req.target)
+            return self.send_json({"ok": True, "existed": existed})
+
+        ADMIN_ACTIONS = {
+            "GET": admin_snapshot,
+            "PUT": admin_put,
+            "DELETE": admin_delete,
+        }
+
+        def upstream_headers(self) -> dict:
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+            headers["Host"] = cfg.upstream
+            headers["X-Forwarded-For"] = self.client_ip()
+            return headers
+
+        def proxy(self, body: bytes) -> tuple[int, int]:
+            conn = http.client.HTTPConnection(cfg.upstream_host, cfg.upstream_port, timeout=60)
+            try:
+                conn.request(self.command, self.path, body=body or None, headers=self.upstream_headers())
                 resp = conn.getresponse()
                 data = resp.read()
             except (OSError, http.client.HTTPException):
                 conn.close()
                 return 502, self.send(502, b"Bad Gateway")
+            self.relay(resp, data)
+            conn.close()
+            return resp.status, len(data)
+
+        def relay(self, resp: http.client.HTTPResponse, data: bytes) -> None:
             self.send_response(resp.status, resp.reason)
             for k, v in resp.getheaders():
                 if k.lower() not in HOP_BY_HOP:
                     self.send_header(k, v)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(data)
-            conn.close()
-            return resp.status, len(data)
+            self.write_body(data)
 
-        def handle_any(self):
-            started = time.time()
-            ip = self.client_ip()
-            body = self.read_body()
-            kind = "request"
-            if self.path.startswith("/_bouncer/"):
-                self.handle_admin(body)
-                return
+        def canary_haystack(self, body: bytes) -> str:
+            return self.path + " " + body.decode("utf-8", "replace") + " " + " ".join(self.headers.values())
+
+        def forward(self, ip: str, body: bytes) -> Outcome:
+            kind = EventKind.CANARY_REUSE if door.canary_hits(self.canary_haystack(body)) else EventKind.REQUEST
+            tarpitted = door.tarpit(ip)
+            status, size = self.proxy(body)
+            if tarpitted and kind == EventKind.REQUEST:
+                kind = EventKind.TARPITTED
+            return Outcome(kind, status, size)
+
+        def respond(self, ip: str, body: bytes) -> Outcome:
             if self.headers.get("Upgrade", "").lower() == "websocket":
-                status, size = 400, self.send(400, b"websocket not supported, use polling")
-            elif door.lists.active("block", ip) and ip not in cfg.allowlist:
-                kind = "refused"
-                status, size = 403, self.send(
-                    403,
-                    b"You're not on the list. The bouncer remembers faces. Come back later.\n",
-                    extra={"Retry-After": "900"},
-                )
-            elif self.path.split("?", 1)[0] == "/.env":
-                kind = "honeypot"
-                status, size = 200, self.send(200, door.honeypot_env().encode())
-            else:
-                haystack = self.path + " " + body.decode("utf-8", "replace") + " " + " ".join(self.headers.values())
-                hits = door.canary_hits(haystack)
-                if hits:
-                    kind = "canary_reuse"
-                tarpitted = False
-                if door.lists.active("tarpit", ip) and ip not in cfg.allowlist and door.tarpit_slots.acquire(blocking=False):
-                    try:
-                        tarpitted = True
-                        time.sleep(cfg.tarpit_seconds)
-                    finally:
-                        door.tarpit_slots.release()
-                status, size = self.proxy(body)
-                if tarpitted:
-                    kind = "tarpitted" if kind == "request" else kind
+                return Outcome(EventKind.REQUEST, 400, self.send(400, b"websocket not supported, use polling"))
+            block = door.listed_entry("block", ip)
+            if block:
+                refused = b"You're not on the list. The bouncer remembers faces. Come back later.\n"
+                return Outcome(EventKind.REFUSED, 403, self.send(403, refused, extra={"Retry-After": retry_after(block)}))
+            if bare_path(self.path) == "/.env":
+                return Outcome(EventKind.HONEYPOT, 200, self.send(200, door.honeypot_env().encode()))
+            return self.forward(ip, body)
+
+        def build_record(self, started: float, ip: str, body: bytes, outcome: Outcome) -> dict:
             record = {
                 "ts": round(started, 3),
                 "ip": ip,
                 "method": self.command,
                 "path": self.path,
                 "ua": self.headers.get("User-Agent", ""),
-                "status": status,
-                "bytes": size,
+                "status": outcome.status,
+                "bytes": outcome.size,
                 "ms": int((time.time() - started) * 1000),
-                "kind": kind,
+                "kind": outcome.kind,
             }
             if body:
-                record["body"] = body[:BODY_PREVIEW].decode("utf-8", "replace")
+                record["body"] = body[:MAX_STORED_BODY].decode("utf-8", "replace")
+            if len(body) > MAX_STORED_BODY:
+                record["truncated"] = True
             ctype = self.headers.get("Content-Type")
             if ctype:
                 record["ctype"] = ctype
             kept = {k: v for k, v in self.headers.items() if k.lower() in REPLAY_HEADERS}
             if kept:
                 record["headers"] = kept
+            return record
+
+        def handle_any(self):
+            started = time.time()
+            ip = self.client_ip()
+            body = self.read_body()
+            if self.path.startswith(ADMIN_PREFIX):
+                self.handle_admin(body)
+                return
+            outcome = self.respond(ip, body)
+            record = self.build_record(started, ip, body, outcome)
             door.write_log(record)
-            if kind != "request" or not door.is_quiet(self.command, self.path):
+            if door.should_push(outcome.kind, self.command, self.path):
                 door.pusher.push(record)
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = handle_any
@@ -349,7 +472,7 @@ def main(argv=None):
     door = Door(cfg)
     server = ThreadingHTTPServer(("0.0.0.0", cfg.port), make_handler(door))
     server.daemon_threads = True
-    print(json.dumps({"door": "listening", "port": cfg.port, "upstream": f"{cfg.upstream_host}:{cfg.upstream_port}"}), flush=True)
+    print(json.dumps({"door": "listening", "port": cfg.port, "upstream": cfg.upstream}), flush=True)
     server.serve_forever()
 
 

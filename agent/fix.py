@@ -9,13 +9,23 @@ import re
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, NamedTuple
 from urllib.parse import quote
 
 from . import net
-from .replay import PROVEN, build_control, build_request, interpret
+from .labels import FixStatus, Verdict
+from .net import bare_path
+from .replay import build_control, build_request, interpret
 
 ANTHROPIC_VERSION = "2026-10-21"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+BRANCH_PREFIX = "bouncer/fix-"
+ERROR_DETAIL_CHARS = 300
+PROBLEM_CHARS = 600
+
+KNOWN_RESULT_FIELDS = ("file", "title", "summary", "diff", "pr_url", "verify")
+VARIANT_LABELS = {Verdict.PROVEN: "worked", Verdict.NOT_RUN: "not run", Verdict.MINOR: "minor only", Verdict.INCONCLUSIVE: "unclear"}
 
 PATCH_SCHEMA = {
     "type": "object",
@@ -64,6 +74,13 @@ VARIANT_SYSTEM = """You help verify security patches for OWASP Juice Shop, the o
 Write up to 4 other requests that exploit the same weakness through the same endpoint in different ways, so a patch that only blocks the exact payload shown would fail. Use other syntax for the same bug class: other quote or comment styles, other boolean tricks, targeting another known account, or other encodings. Keep the same HTTP method and the same route; you may change the query string. `path` is the full path with query string. `body` is the raw request body, or an empty string when there is none. `idea` is a few words on what the variant tries. Nothing destructive: no requests that delete or modify data."""
 
 MAX_VARIANTS = 4
+VARIANTS_FAILED = "Claude's variant request failed, so only the original attack was replayed."
+VARIANTS_EMPTY = "Claude offered no usable variants, so only the original attack was replayed."
+
+IMPORT_PATTERN = re.compile(r"import\s+(?:\{([^}]*)\}|\*\s+as\s+(\w+)|(\w+))\s+from\s+'\./routes/([\w/.-]+)'")
+ROUTE_PATTERN = re.compile(r"app\.(get|post|put|patch|delete|all|use)\(\s*'([^']+)'(.*)")
+HANDLER_PATTERN = re.compile(r"\b(\w+)\s*(?:\.\s*\w+\s*)?\(")
+WILDCARD_VERBS = ("all", "use")
 
 
 def route_regex(path: str, prefix: bool) -> re.Pattern:
@@ -78,35 +95,45 @@ def route_regex(path: str, prefix: bool) -> re.Pattern:
     return re.compile("^" + out + ("(/.*)?$" if prefix else "/?$"))
 
 
+def route_module(name: str) -> str:
+    return "routes/" + name + ("" if name.endswith(".ts") else ".ts")
+
+
 def parse_imports(source: str) -> dict:
     names = {}
-    for m in re.finditer(r"import\s+(?:\{([^}]*)\}|\*\s+as\s+(\w+)|(\w+))\s+from\s+'\./routes/([\w/.-]+)'", source):
-        target = "routes/" + m.group(4) + ("" if m.group(4).endswith(".ts") else ".ts")
-        if m.group(1):
-            for item in m.group(1).split(","):
-                item = item.strip()
-                if item:
-                    names[item.split(" as ")[-1].strip()] = target
-        else:
-            names[m.group(2) or m.group(3)] = target
+    for m in IMPORT_PATTERN.finditer(source):
+        named, namespace, default, module = m.groups()
+        target = route_module(module)
+        if not named:
+            names[namespace or default] = target
+            continue
+        for item in named.split(","):
+            item = item.strip()
+            if item:
+                names[item.split(" as ")[-1].strip()] = target
     return names
+
+
+def handler_file(rest: str, names: dict) -> str:
+    for ident in HANDLER_PATTERN.findall(rest):
+        if ident in names:
+            return names[ident]
+    return ""
 
 
 def locate_route(server_source: str, method: str, path: str) -> str:
     names = parse_imports(server_source)
-    bare = path.split("?", 1)[0]
+    bare = bare_path(path)
     method = method.lower()
     exact, loose = [], []
-    for m in re.finditer(r"app\.(get|post|put|patch|delete|all|use)\(\s*'([^']+)'(.*)", server_source):
-        verb, route, rest = m.groups()
-        if verb not in (method, "all", "use"):
+    for verb, route, rest in ROUTE_PATTERN.findall(server_source):
+        if verb != method and verb not in WILDCARD_VERBS:
             continue
         if not route_regex(route, prefix=verb == "use").match(bare):
             continue
-        for ident in re.findall(r"\b(\w+)\s*(?:\.\s*\w+\s*)?\(", rest):
-            if ident in names:
-                (exact if verb == method else loose).append(names[ident])
-                break
+        target = handler_file(rest, names)
+        if target:
+            (exact if verb == method else loose).append(target)
     hits = exact or loose
     return hits[0] if hits else ""
 
@@ -125,6 +152,14 @@ def apply_edits(source: str, edits: list) -> tuple:
 
 def unified_diff(path: str, before: str, after: str) -> str:
     return "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), f"a/{path}", f"b/{path}"))
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def clip(value, limit: int) -> str:
+    return str(value)[:limit]
 
 
 class GitHub:
@@ -149,10 +184,15 @@ class GitHub:
         if status != 200 or not isinstance(body, list):
             return ""
         for pr in body:
-            head = pr.get("head") or {}
-            if (head.get("ref") or "").startswith(prefix) and ((head.get("repo") or {}).get("full_name") or self.repo) == self.repo:
+            if self._is_own_branch(pr, prefix):
                 return pr.get("html_url") or ""
         return ""
+
+    def _is_own_branch(self, pr: dict, prefix: str) -> bool:
+        head = pr.get("head") or {}
+        if not (head.get("ref") or "").startswith(prefix):
+            return False
+        return ((head.get("repo") or {}).get("full_name") or self.repo) == self.repo
 
     def open_pr(self, branch: str, path: str, blob_sha: str, content: str, title: str, body: str) -> dict:
         status, ref = self.call("GET", f"/git/ref/heads/{quote(self.branch)}")
@@ -160,15 +200,19 @@ class GitHub:
             return {"ok": False, "step": "base ref", "status": status}
         status, out = self.call("POST", "/git/refs", {"ref": f"refs/heads/{branch}", "sha": ref["object"]["sha"]})
         if status != 201:
-            return {"ok": False, "step": "branch", "status": status, "detail": str(out)[:300]}
+            return self._step_failed("branch", status, out)
         payload = {"message": title, "content": base64.b64encode(content.encode()).decode(), "sha": blob_sha, "branch": branch}
         status, out = self.call("PUT", f"/contents/{quote(path)}", payload)
         if status not in (200, 201):
-            return {"ok": False, "step": "commit", "status": status, "detail": str(out)[:300]}
+            return self._step_failed("commit", status, out)
         status, out = self.call("POST", "/pulls", {"title": title, "head": branch, "base": self.branch, "body": body})
         if status != 201:
-            return {"ok": False, "step": "pull request", "status": status, "detail": str(out)[:300]}
+            return self._step_failed("pull request", status, out)
         return {"ok": True, "url": out.get("html_url"), "number": out.get("number")}
+
+    @staticmethod
+    def _step_failed(step: str, status: int, out) -> dict:
+        return {"ok": False, "step": step, "status": status, "detail": clip(out, ERROR_DETAIL_CHARS)}
 
 
 class Claude:
@@ -199,31 +243,43 @@ class Claude:
         }
         headers = {"anthropic-version": ANTHROPIC_VERSION, "anthropic-beta": FALLBACK_BETA}
         status, body, elapsed = net.post_json(self.url, payload, timeout=600, headers=headers)
+        seconds = round(elapsed, 1)
         if status != 200:
-            return {"ok": False, "error": f"HTTP {status}: {str(body)[:300]}", "seconds": round(elapsed, 1)}
+            return self._failed(f"HTTP {status}: {clip(body, ERROR_DETAIL_CHARS)}", seconds)
         stop = body.get("stop_reason")
         if stop != "end_turn":
-            return {"ok": False, "error": f"stopped: {stop}", "seconds": round(elapsed, 1)}
-        text = "".join(b.get("text", "") for b in body.get("content", []) if b.get("type") == "text")
+            return self._failed(f"stopped: {stop}", seconds)
         try:
-            data = json.loads(text)
+            data = json.loads(self._reply_text(body))
         except ValueError:
-            return {"ok": False, "error": "reply was not JSON", "seconds": round(elapsed, 1)}
-        return {"ok": True, "data": data, "model": body.get("model"), "usage": body.get("usage", {}), "seconds": round(elapsed, 1)}
+            return self._failed("reply was not JSON", seconds)
+        return {"ok": True, "data": data, "model": body.get("model"), "usage": body.get("usage", {}), "seconds": seconds}
+
+    @staticmethod
+    def _reply_text(body: dict) -> str:
+        return "".join(b.get("text", "") for b in body.get("content", []) if b.get("type") == "text")
+
+    @staticmethod
+    def _failed(error: str, seconds: float) -> dict:
+        return {"ok": False, "error": error, "seconds": seconds}
+
+
+def is_variant_in_scope(path: str, body: str, bare: str) -> bool:
+    if not path.startswith("/") or bare_path(path) != bare:
+        return False
+    return len(path) <= 2000 and len(body) <= 4000
 
 
 def clean_variants(req: dict, raw: list) -> list:
-    bare = req.get("path", "/").split("?", 1)[0]
+    bare = bare_path(req.get("path", "/"))
     seen = {(req.get("path"), req.get("body") or "")}
     out = []
     for v in raw or []:
         path, body = str(v.get("path") or ""), str(v.get("body") or "")
-        if not path.startswith("/") or path.split("?", 1)[0] != bare or len(path) > 2000 or len(body) > 4000:
-            continue
-        if (path, body) in seen:
+        if not is_variant_in_scope(path, body, bare) or (path, body) in seen:
             continue
         seen.add((path, body))
-        variant = {"method": req.get("method", "GET"), "path": path, "headers": dict(req.get("headers") or {}), "idea": str(v.get("idea") or "")[:120]}
+        variant = {"method": req.get("method", "GET"), "path": path, "headers": dict(req.get("headers") or {}), "idea": clip(v.get("idea") or "", 120)}
         if body or "body" in req:
             variant["body"] = body
         out.append(variant)
@@ -234,34 +290,197 @@ def clean_variants(req: dict, raw: list) -> list:
 
 def describe_attack(req: dict, why: str) -> str:
     lines = [f"{req.get('method')} {req.get('path')}"]
-    for k, v in (req.get("headers") or {}).items():
-        lines.append(f"{k}: {v}")
+    lines.extend(f"{k}: {v}" for k, v in (req.get("headers") or {}).items())
     if req.get("body"):
         lines.append("")
-        lines.append(str(req["body"])[:3000])
+        lines.append(clip(req["body"], 3000))
     return "\n".join(lines) + f"\n\nReplay result: {why}"
+
+
+def stage_verdict(variant: dict, verify: dict, stage: str, index: int, control: dict) -> Verdict:
+    runs = (verify.get("variants") or {}).get(stage) or []
+    run = runs[index] if index < len(runs) else None
+    if not run:
+        return Verdict.NOT_RUN
+    return interpret(variant, {"ok": True, "control": control, **run})["verdict"]
 
 
 def variant_table(variants: list, verify: dict) -> list:
     control = ((verify.get("replay") or {}).get("control")) or {}
     rows = []
     for i, v in enumerate(variants):
-        verdicts = {}
-        for stage in ("before", "after"):
-            runs = (verify.get("variants") or {}).get(stage) or []
-            run = runs[i] if i < len(runs) else None
-            verdicts[stage] = interpret(v, {"ok": True, "control": control, **run})["verdict"] if run else "NOT_RUN"
+        verdicts = {stage: stage_verdict(v, verify, stage, i, control) for stage in ("before", "after")}
         shown = v["path"] + (" " + v["body"] if v.get("body") else "")
         rows.append({"idea": v.get("idea", ""), "request": shown[:300], **verdicts})
     return rows
 
 
 def branch_prefix(path: str) -> str:
-    return "bouncer/fix-" + re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-") + "-"
+    return BRANCH_PREFIX + re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-") + "-"
 
 
 def smoke_diff(before: dict, after: dict) -> list:
     return [f"{k}: {before.get(k)} -> {after.get(k)}" for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
+
+
+def retry_feedback(patch: dict, problem: str) -> str:
+    edits = json.dumps(patch.get("edits"), indent=1)[:6000]
+    return f"\n\nYour previous edits were:\n{edits}\n\nThey failed: {problem}\nTry again."
+
+
+@dataclass
+class FixJob:
+    incident: dict
+    req: dict
+    why: str
+    control_status: int | None
+    path: str = ""
+    original: dict = field(default_factory=dict)
+    variants: list = field(default_factory=list)
+    variants_note: str = ""
+
+    @classmethod
+    def from_incident(cls, incident: dict) -> FixJob:
+        replay = incident.get("replay") or {}
+        return cls(
+            incident=incident,
+            req=replay.get("request") or build_request(incident["event"]),
+            why=replay.get("why", ""),
+            control_status=(replay.get("evidence") or {}).get("control_status"),
+        )
+
+    @property
+    def method(self) -> str:
+        return self.req.get("method", "GET")
+
+    @property
+    def text(self) -> str:
+        return self.original["text"]
+
+    @property
+    def base_sha(self) -> str:
+        return sha256_hex(self.text)
+
+    def attack_prompt(self) -> str:
+        return f"Proven attack:\n{describe_attack(self.req, self.why)}"
+
+    def patch_prompt(self) -> str:
+        return f"{self.attack_prompt()}\n\nFile `{self.path}`:\n```ts\n{self.text}\n```"
+
+    def verify_payload(self, new_text: str) -> dict:
+        return {"files": {self.path: {"content": new_text, "base_sha256": self.base_sha}}, "request": self.req, "control": build_control(self.req), "variants": self.variants}
+
+
+class PatchTry(NamedTuple):
+    new_text: str | None
+    verify: dict
+    problem: str
+
+
+def ready_result(job: FixJob, patch: dict, new_text: str, attempts: list, verify: dict) -> dict:
+    return {
+        "status": FixStatus.READY,
+        "file": job.path,
+        "title": patch["title"],
+        "summary": patch["summary"],
+        "diff": unified_diff(job.path, job.text, new_text),
+        "attempts": attempts,
+        "verify": {
+            "build_ms": verify["build"]["ms"],
+            "after": interpret(job.req, verify["replay"])["verdict"],
+            "smoke": verify["smoke_after"],
+            "variants": variant_table(job.variants, verify),
+            "variants_note": job.variants_note,
+        },
+    }
+
+
+def table_cell(text: str) -> str:
+    return text.replace("|", "/")
+
+
+def smoke_rows(smoke: dict) -> str:
+    return "\n".join(f"| {k} | {v.get('status')} | {v.get('count') if v.get('count') is not None else ''} |" for k, v in smoke.items())
+
+
+def variant_row(row: dict) -> str:
+    request = table_cell(row["request"][:120]).replace("`", "")
+    before = VARIANT_LABELS.get(row["before"], "not shown")
+    after = VARIANT_LABELS.get(row["after"], "blocked")
+    return f"| {table_cell(row['idea'])} | `{request}` | {before} | {after} |"
+
+
+def variant_section(rows: list, note: str = "") -> str:
+    if not rows:
+        return f"\n{note}\n" if note else ""
+    lines = "\n".join(variant_row(r) for r in rows)
+    return f"""
+Other ways into the same hole, written by Claude and tried on the copy before and after the patch:
+
+| idea | request | before | after |
+|---|---|---|---|
+{lines}
+"""
+
+
+def code_fence(text: str) -> str:
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def pr_body(job: FixJob, result: dict) -> str:
+    when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(job.incident.get("ts", time.time())))
+    verify = result["verify"]
+    method, path = job.req.get("method"), job.req.get("path", "")
+    body_excerpt = clip(job.req.get("body") or "", 800)
+    fenced = f"{method} {path[:500]}\n{body_excerpt}"
+    fence = code_fence(fenced)
+    return f"""{result['summary']}
+
+### What happened
+At {when} a request to `{method} {bare_path(path)}` was replayed on an isolated copy of this app and it worked: {job.why}.
+
+{fence}
+{fenced}
+{fence}
+
+### How this patch was checked
+On the isolated copy, Bouncer applied this patch, rebuilt the server ({verify['build_ms']} ms), replayed the same attack and a harmless control request, then rolled the copy back.
+
+- Attack after the patch: **{verify['after']}**
+- Normal checks after the patch, all matching the unpatched app:
+
+| check | status | items |
+|---|---|---|
+{smoke_rows(verify['smoke'])}
+{variant_section(verify.get('variants') or [], verify.get('variants_note') or "")}
+Opened by Bouncer. Review before merging.
+"""
+
+
+def with_note(line: str, note: str) -> str:
+    return f"{line} {note}" if note else line
+
+
+class RateLimiter:
+    def __init__(self, limit: int, window_seconds: float):
+        self.limit = limit
+        self.window = window_seconds
+        self.started: deque = deque()
+        self.lock = threading.Lock()
+
+    def take(self) -> bool:
+        now = time.time()
+        with self.lock:
+            while self.started and now - self.started[0] > self.window:
+                self.started.popleft()
+            if len(self.started) >= self.limit:
+                return False
+            self.started.append(now)
+            return True
+
+
+Progress = Callable[[FixStatus, str], None]
 
 
 class Fixer:
@@ -270,86 +489,115 @@ class Fixer:
         self.claude = claude
         self.github = github
         self.runner_url = runner_url.rstrip("/")
-        self.runner_headers = {"Authorization": f"Bearer {runner_token}"} if runner_token else None
+        self.runner_headers = net.bearer(runner_token)
         self.max_per_hour = max_per_hour
+        self.limiter = RateLimiter(max_per_hour, 3600)
         self.attempts = attempts
         self.jobs: queue.Queue = queue.Queue(maxsize=50)
-        self.started: deque = deque()
         self.files: dict = {}
         self.results: dict = {}
         self.lock = threading.Lock()
         threading.Thread(target=self._work, daemon=True).start()
 
     def take_slot(self) -> bool:
-        now = time.time()
-        with self.lock:
-            while self.started and now - self.started[0] > 3600:
-                self.started.popleft()
-            if len(self.started) >= self.max_per_hour:
-                return False
-            self.started.append(now)
-            return True
+        return self.limiter.take()
 
-    def submit(self, incident: dict, report) -> str:
+    def submit(self, incident: dict, report) -> FixStatus:
         try:
             self.jobs.put_nowait((incident, report))
         except queue.Full:
-            return "queue_full"
-        return "queued"
+            return FixStatus.QUEUE_FULL
+        return FixStatus.QUEUED
 
     def _work(self):
         while True:
             incident, report = self.jobs.get()
             net.hold_awake("bouncer-fix", 900)
-            try:
-                result = self.fix(incident, lambda status, line: report(incident, {"status": status, "line": line}))
-            except Exception as exc:
-                result = {"status": "error", "line": f"fix step crashed: {exc}"[:300]}
-            report(incident, result)
+            report(incident, self._run_job(incident, report))
             if self.jobs.empty():
                 net.release_awake("bouncer-fix")
+
+    def _run_job(self, incident: dict, report) -> dict:
+        try:
+            return self.fix(incident, lambda status, line: report(incident, {"status": status, "line": line}))
+        except Exception as exc:
+            return {"status": FixStatus.ERROR, "line": f"fix step crashed: {exc}"[:ERROR_DETAIL_CHARS]}
 
     def runner_patch(self, payload: dict) -> dict:
         status, body, _ = net.post_json(self.runner_url + "/patch", payload, timeout=600, headers=self.runner_headers)
         if status != 200:
-            return {"ok": False, "stage": "http", "error": f"runner HTTP {status}: {str(body)[:300]}"}
+            return {"ok": False, "stage": "http", "error": f"runner HTTP {status}: {clip(body, ERROR_DETAIL_CHARS)}"}
         return body
 
-    def fix(self, incident: dict, progress) -> dict:
-        event = incident["event"]
-        req = (incident.get("replay") or {}).get("request") or build_request(event)
-        why = (incident.get("replay") or {}).get("why", "")
-        control_status = ((incident.get("replay") or {}).get("evidence") or {}).get("control_status")
+    def _set_file(self, path: str, status: FixStatus | None, result: dict | None = None) -> None:
+        with self.lock:
+            if status is None:
+                self.files.pop(path, None)
+            else:
+                self.files[path] = status
+            if result is not None:
+                self.results[path] = result
+
+    def fix(self, incident: dict, progress: Progress) -> dict:
+        job = FixJob.from_incident(incident)
         server = self.github.file("server.ts")
         if not server:
-            return {"status": "failed", "line": "Could not read server.ts from the repo."}
-        path = locate_route(server["text"], req.get("method", "GET"), req.get("path", "/"))
-        if not path:
-            return {"status": "failed", "line": f"No route file found for {req.get('method')} {req.get('path', '').split('?')[0]}."}
+            return {"status": FixStatus.FAILED, "line": "Could not read server.ts from the repo."}
+        job.path = locate_route(server["text"], job.method, job.req.get("path", "/"))
+        if not job.path:
+            return {"status": FixStatus.FAILED, "line": f"No route file found for {job.req.get('method')} {bare_path(job.req.get('path', ''))}."}
+        claimed = self._claim(job.path)
+        if claimed:
+            return claimed
+        try:
+            return self._fix_claimed(job, progress)
+        except Exception:
+            self._set_file(job.path, None)
+            raise
+
+    def _fix_claimed(self, job: FixJob, progress: Progress) -> dict:
+        existing = self._reuse_open_pr(job.path)
+        if existing:
+            return existing
+        job.original = self.github.file(job.path)
+        if not job.original:
+            self._set_file(job.path, FixStatus.FAILED)
+            return {"status": FixStatus.FAILED, "file": job.path, "line": f"Could not read {job.path} from the repo."}
+        if not self.take_slot():
+            self._set_file(job.path, None)
+            return {"status": FixStatus.RATE_LIMITED, "file": job.path, "line": f"Hit the limit of {self.max_per_hour} fix attempts an hour. {job.path} stays as it is for now."}
+        progress(FixStatus.WORKING, f"Calling the carpenter for {job.path}.")
+        return self._attempt_patches(job)
+
+    def _claim(self, path: str) -> dict | None:
         with self.lock:
             known = self.files.get(path)
-            if known == "working":
-                return {"status": "skipped", "file": path, "line": f"Already working on {path}."}
-            if known in ("ready", "pr_opened"):
+            if known == FixStatus.WORKING:
+                return {"status": FixStatus.SKIPPED, "file": path, "line": f"Already working on {path}."}
+            if known in (FixStatus.READY, FixStatus.PR_OPENED):
                 return self.known(path)
-            self.files[path] = "working"
+            self.files[path] = FixStatus.WORKING
+        return None
+
+    def _reuse_open_pr(self, path: str) -> dict | None:
         url = self.github.open_pr_url(branch_prefix(path))
-        if url:
-            self.files[path] = "pr_opened"
-            self.results[path] = {"status": "pr_opened", "file": path, "pr_url": url}
-            return self.known(path)
-        original = self.github.file(path)
-        if not original:
-            self.files[path] = "failed"
-            return {"status": "failed", "file": path, "line": f"Could not read {path} from the repo."}
-        if not self.take_slot():
-            self.files.pop(path, None)
-            return {"status": "rate_limited", "file": path, "line": f"Hit the limit of {self.max_per_hour} fix attempts an hour. {path} stays as it is for now."}
-        progress("working", f"Calling the carpenter for {path}.")
-        base_sha = hashlib.sha256(original["text"].encode()).hexdigest()
-        prompt = f"Proven attack:\n{describe_attack(req, why)}\n\nFile `{path}`:\n```ts\n{original['text']}\n```"
-        asked = self.claude.variants(f"Proven attack:\n{describe_attack(req, why)}")
-        variants = clean_variants(req, asked.get("variants") if asked.get("ok") else [])
+        if not url:
+            return None
+        self._set_file(path, FixStatus.PR_OPENED, {"status": FixStatus.PR_OPENED, "file": path, "pr_url": url})
+        return self.known(path)
+
+    def _ask_variants(self, job: FixJob) -> list:
+        asked = self.claude.variants(job.attack_prompt())
+        variants = clean_variants(job.req, asked.get("variants") if asked.get("ok") else [])
+        if not asked.get("ok"):
+            job.variants_note = VARIANTS_FAILED
+        elif not variants:
+            job.variants_note = VARIANTS_EMPTY
+        return variants
+
+    def _attempt_patches(self, job: FixJob) -> dict:
+        prompt = job.patch_prompt()
+        job.variants = self._ask_variants(job)
         feedback = ""
         attempts = []
         for attempt in range(1, self.attempts + 1):
@@ -358,61 +606,52 @@ class Fixer:
                 attempts.append({"attempt": attempt, "problem": answer["error"]})
                 break
             patch = answer["patch"]
-            new_text, problem = apply_edits(original["text"], patch.get("edits") or [])
-            verify = {}
-            if not problem:
-                verify = self.runner_patch({"files": {path: {"content": new_text, "base_sha256": base_sha}}, "request": req, "control": build_control(req), "variants": variants})
-                problem = self.judge(req, verify, control_status, variants)
-            attempts.append({"attempt": attempt, "problem": problem, "claude_seconds": answer["seconds"], "model": answer.get("model")})
-            if not problem:
-                diff = unified_diff(path, original["text"], new_text)
-                result = {
-                    "status": "ready",
-                    "file": path,
-                    "title": patch["title"],
-                    "summary": patch["summary"],
-                    "diff": diff,
-                    "attempts": attempts,
-                    "verify": {
-                        "build_ms": verify["build"]["ms"],
-                        "after": interpret(req, verify["replay"])["verdict"],
-                        "smoke": verify["smoke_after"],
-                        "variants": variant_table(variants, verify),
-                    },
-                }
-                return self.ship(incident, result, original, new_text, req, why)
-            feedback = f"\n\nYour previous edits were:\n{json.dumps(patch.get('edits'), indent=1)[:6000]}\n\nThey failed: {problem}\nTry again."
-        self.files[path] = "failed"
+            tried = self._try_patch(job, patch)
+            attempts.append({"attempt": attempt, "problem": tried.problem, "claude_seconds": answer["seconds"], "model": answer.get("model")})
+            if not tried.problem:
+                return self.ship(job, ready_result(job, patch, tried.new_text, attempts, tried.verify), tried.new_text)
+            feedback = retry_feedback(patch, tried.problem)
+        return self._give_up(job.path, attempts)
+
+    def _try_patch(self, job: FixJob, patch: dict) -> PatchTry:
+        new_text, problem = apply_edits(job.text, patch.get("edits") or [])
+        if problem:
+            return PatchTry(new_text, {}, problem)
+        verify = self.runner_patch(job.verify_payload(new_text))
+        return PatchTry(new_text, verify, self.judge(job.req, verify, job.control_status, job.variants))
+
+    def _give_up(self, path: str, attempts: list) -> dict:
+        self._set_file(path, FixStatus.FAILED)
         last = attempts[-1]["problem"] if attempts else "no attempt"
-        return {"status": "failed", "file": path, "attempts": attempts, "line": f"Couldn't fix {path} safely: {last}"[:400]}
+        return {"status": FixStatus.FAILED, "file": path, "attempts": attempts, "line": f"Couldn't fix {path} safely: {last}"[:400]}
 
     def known(self, path: str) -> dict:
         prev = self.results.get(path) or {}
-        keep = {k: prev[k] for k in ("file", "title", "summary", "diff", "pr_url", "verify") if prev.get(k)}
+        keep = {k: prev[k] for k in KNOWN_RESULT_FIELDS if prev.get(k)}
         if prev.get("pr_url"):
-            return dict(keep, status="pr_exists", line=f"Same hole as before. {path} already has a pull request waiting for the owner.")
-        return dict(keep, status="ready", line=f"Same hole as before. The patch for {path} is already tested and waiting.")
+            return dict(keep, status=FixStatus.PR_EXISTS, line=f"Same hole as before. {path} already has a pull request waiting for the owner.")
+        return dict(keep, status=FixStatus.READY, line=f"Same hole as before. The patch for {path} is already tested and waiting.")
 
     def judge(self, req: dict, verify: dict, control_status, variants: list | None = None) -> str:
         problem = self.judge_main(req, verify, control_status)
         if problem:
             return problem
         for row in variant_table(variants or [], verify):
-            if row["after"] == PROVEN:
-                return f"a variant of the attack still works after the patch ({row['idea']}): {row['request']}"[:600]
+            if row["after"] == Verdict.PROVEN:
+                return f"a variant of the attack still works after the patch ({row['idea']}): {row['request']}"[:PROBLEM_CHARS]
         return ""
 
     def judge_main(self, req: dict, verify: dict, control_status) -> str:
         if not verify.get("ok"):
-            return f"replay box error at {verify.get('stage')}: {verify.get('error') or verify.get('reset')}"[:600]
+            return f"replay box error at {verify.get('stage')}: {verify.get('error') or verify.get('reset')}"[:PROBLEM_CHARS]
         build = verify.get("build") or {}
         if not build.get("ok"):
             return "TypeScript build failed:\n" + build.get("log", "")[-1500:]
         replay = verify.get("replay") or {}
         verdict = interpret(req, replay)
-        if verdict["verdict"] == PROVEN:
+        if verdict["verdict"] == Verdict.PROVEN:
             return "the attack still works after the patch: " + verdict["why"]
-        if verdict["verdict"] == "ERROR":
+        if verdict["verdict"] == Verdict.ERROR:
             return "replay after the patch failed: " + verdict["why"]
         now_control = (replay.get("control") or {}).get("status")
         if control_status is not None and now_control != control_status:
@@ -422,71 +661,23 @@ class Fixer:
             return "legitimate behaviour changed: " + "; ".join(changed)
         return ""
 
-    def ship(self, incident: dict, result: dict, original: dict, new_text: str, req: dict, why: str) -> dict:
-        path = result["file"]
-        body = self.pr_body(incident, result, req, why)
-        result["pr_body"] = body
+    def ship(self, job: FixJob, result: dict, new_text: str) -> dict:
+        path = job.path
+        result["pr_body"] = pr_body(job, result)
         if self.mode != "pr":
-            self.files[path] = "ready"
-            self.results[path] = result
-            result["line"] = f"Patch for {path} holds up on the stunt double. Dry run, so no pull request opened."
+            result["line"] = with_note(f"Patch for {path} holds up on the stunt double. Dry run, so no pull request opened.", job.variants_note)
+            self._set_file(path, FixStatus.READY, result)
             return result
         branch = branch_prefix(path) + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        pr = self.github.open_pr(branch, path, original["sha"], new_text, result["title"], body)
+        pr = self.github.open_pr(branch, path, job.original["sha"], new_text, result["title"], result["pr_body"])
         result["pr"] = pr
-        if pr.get("ok"):
-            self.files[path] = "pr_opened"
-            self.results[path] = result
-            result["status"] = "pr_opened"
-            result["pr_url"] = pr.get("url")
-            result["line"] = f"Fixed the lock on {path}. Pull request is up for the owner to review."
-        else:
-            self.files[path] = "failed"
-            result["status"] = "pr_failed"
+        if not pr.get("ok"):
+            result["status"] = FixStatus.PR_FAILED
             result["line"] = f"Patch works but the pull request failed at {pr.get('step')} (HTTP {pr.get('status')})."
+            self._set_file(path, FixStatus.FAILED)
+            return result
+        result["status"] = FixStatus.PR_OPENED
+        result["pr_url"] = pr.get("url")
+        result["line"] = with_note(f"Fixed the lock on {path}. Pull request is up for the owner to review.", job.variants_note)
+        self._set_file(path, FixStatus.PR_OPENED, result)
         return result
-
-    def pr_body(self, incident: dict, result: dict, req: dict, why: str) -> str:
-        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(incident.get("ts", time.time())))
-        smoke = result["verify"]["smoke"]
-        rows = "\n".join(f"| {k} | {v.get('status')} | {v.get('count') if v.get('count') is not None else ''} |" for k, v in smoke.items())
-        body_excerpt = str(req.get("body") or "")[:800]
-        return f"""{result['summary']}
-
-### What happened
-At {when} a request to `{req.get('method')} {req.get('path', '').split('?')[0]}` was replayed on an isolated copy of this app and it worked: {why}.
-
-```
-{req.get('method')} {req.get('path', '')[:500]}
-{body_excerpt}
-```
-
-### How this patch was checked
-On the isolated copy, Bouncer applied this patch, rebuilt the server ({result['verify']['build_ms']} ms), replayed the same attack and a harmless control request, then rolled the copy back.
-
-- Attack after the patch: **{result['verify']['after']}**
-- Normal checks after the patch, all matching the unpatched app:
-
-| check | status | items |
-|---|---|---|
-{rows}
-{self.variant_section(result['verify'].get('variants') or [])}
-Opened by Bouncer. Review before merging.
-"""
-
-    @staticmethod
-    def variant_section(rows: list) -> str:
-        if not rows:
-            return ""
-        label = {PROVEN: "worked", "NOT_RUN": "not run", "MINOR": "minor only", "INCONCLUSIVE": "unclear"}
-        lines = "\n".join(
-            f"| {r['idea'].replace('|', '/')} | `{r['request'][:120].replace('|', '/').replace('`', '')}` | {label.get(r['before'], 'not shown')} | {label.get(r['after'], 'blocked')} |"
-            for r in rows
-        )
-        return f"""
-Other ways into the same hole, written by Claude and tried on the copy before and after the patch:
-
-| idea | request | before | after |
-|---|---|---|---|
-{lines}
-"""

@@ -1,36 +1,52 @@
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
 import json
 import os
 import queue
-import random
-import re
 import sys
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
 from . import net, persona
+from .door_client import DoorClient
+from .event_log import DecisionLog, Feed
 from .fix import Claude, Fixer, GitHub
 from .jev import Jev
-from .replay import INCONCLUSIVE, MINOR, NOT_REPRODUCED, PROVEN, Replayer
+from .labels import Decision, EventKind, FixStatus, Verdict
+from .net import bare_path
+from .policy import DecisionPolicy, Signals, Thresholds
+from .replay import Replayer
 
-SUSPICIOUS = re.compile(
-    r"""(['"`<>;$]|%27|%22|%3c|%3e|\.\./|\.\.%2f|--|/\*|\bunion\b|\bselect\b|\bsleep\(|\bor\s+1=1|\$ne|\$where|\$gt|etc/passwd|<script|onerror=|javascript:|\{\{|\$\{)""",
-    re.IGNORECASE,
-)
-SCANNER_UA = re.compile(r"sqlmap|nikto|nuclei|zgrab|masscan|nmap|dirbuster|gobuster|ffuf|wpscan|acunetix|python-requests|go-http-client|curl/|wget/|libwww", re.IGNORECASE)
-PROBE_PATH = re.compile(r"\.(php|asp|aspx|jsp|cgi)\b|/wp-|/\.git|/\.env|/phpmyadmin|/cgi-bin|/actuator|/boaform|/HNAP1|/vendor/", re.IGNORECASE)
+DEFAULT_APP_DESCRIPTION = "OWASP Juice Shop, an Angular + Express + SQLite online juice store with a REST API under /rest and /api. Not WordPress, no PHP."
+FIX_MODES = ("dry_run", "pr")
+COUNTED_ONLY_KINDS = (EventKind.REFUSED, EventKind.TARPITTED)
+QUIET_VERDICT_LINES = {Verdict.INCONCLUSIVE: "inconclusive", Verdict.MINOR: "minor"}
+AWAKE_TASK = "bouncer-incident"
+RESTORED_FEED_ROWS = 300
+KEPT_INCIDENTS = 20
+TSV_TIME = "%Y-%m-%dT%H:%M:%SZ"
+KEPT_SHAME = 200
+KEPT_VISITS = 200
+SAVE_SECONDS = 30
+UNFINISHED_FIX = (FixStatus.QUEUED, FixStatus.WORKING)
+INTERRUPTED_LINE = "Fix was cut short by a restart. The next proven attack on this hole starts it again."
 
-TSV_COLUMNS = ["ts", "ip", "method", "path", "kind", "jev_malicious", "jev_action", "jev_confidence", "decision", "replay_verdict", "evidence", "line"]
+TEXT = "text/plain"
+HTML = "text/html; charset=utf-8"
+JSON = "application/json"
+COOKIE_NAME = "bouncer"
+
 
 class Config:
-    def __init__(self, env=os.environ):
+    def __init__(self, env: Mapping[str, str] = os.environ):
         self.port = int(env.get("AGENT_PORT", "8080"))
         self.data_dir = Path(env.get("AGENT_DATA_DIR", "./agent-data"))
         self.events_sha256 = env.get("AGENT_EVENTS_SHA256", "")
@@ -45,6 +61,9 @@ class Config:
         self.tarpit_seconds = int(env.get("TARPIT_SECONDS", "600"))
         self.dedupe_seconds = int(env.get("DEDUPE_SECONDS", "600"))
         self.replay_threshold = float(env.get("REPLAY_THRESHOLD", "0.9"))
+        self.min_list_confidence = float(env.get("MIN_LIST_CONFIDENCE", "0.5"))
+        self.min_list_malicious = float(env.get("MIN_LIST_MALICIOUS", "0.8"))
+        self.failed_attack_malicious = float(env.get("FAILED_ATTACK_MALICIOUS", "0.7"))
         self.fix_mode = env.get("FIX_MODE", "off")
         self.anthropic_url = env.get("ANTHROPIC_URL", "")
         self.github_url = env.get("GITHUB_URL", "")
@@ -52,48 +71,189 @@ class Config:
         self.github_branch = env.get("GITHUB_BRANCH", "master")
         self.fix_model = env.get("FIX_MODEL", "claude-opus-5-5")
         self.fix_per_hour = int(env.get("FIX_PER_HOUR", "3"))
-        self.app_description = env.get(
-            "APP_DESCRIPTION",
-            "OWASP Juice Shop, an Angular + Express + SQLite online juice store with a REST API under /rest and /api. Not WordPress, no PHP.",
+        self.app_description = env.get("APP_DESCRIPTION", DEFAULT_APP_DESCRIPTION)
+
+    @property
+    def fixes_enabled(self) -> bool:
+        return self.fix_mode in FIX_MODES and bool(self.anthropic_url and self.github_url and self.runner_url)
+
+    @property
+    def thresholds(self) -> Thresholds:
+        return Thresholds(
+            replay=self.replay_threshold,
+            min_list_confidence=self.min_list_confidence,
+            min_list_malicious=self.min_list_malicious,
+            failed_attack_malicious=self.failed_attack_malicious,
+            dedupe_seconds=self.dedupe_seconds,
         )
 
-def shape(event: dict) -> str:
-    path = event.get("path", "")
-    bare, _, query = path.partition("?")
-    keys = ",".join(sorted(parse_qs(query, keep_blank_values=True).keys()))
-    return f"{event.get('method')} {bare}?{keys}"
+
+def build_fixer(cfg: Config) -> Fixer | None:
+    if not cfg.fixes_enabled:
+        return None
+    return Fixer(
+        cfg.fix_mode,
+        Claude(cfg.anthropic_url, cfg.fix_model),
+        GitHub(cfg.github_url, cfg.github_repo, cfg.github_branch),
+        cfg.runner_url,
+        cfg.runner_token,
+        max_per_hour=cfg.fix_per_hour,
+    )
+
+
+def utc_clock(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(ts))
+
+
+def fix_view(fix: dict | None) -> dict | None:
+    if not fix:
+        return None
+    url = fix.get("pr_url") or ""
+    variants = (fix.get("verify") or {}).get("variants") or []
+    return {
+        "status": fix.get("status"),
+        "line": fix.get("line"),
+        "file": fix.get("file"),
+        "summary": fix.get("summary"),
+        "diff": (fix.get("diff") or "")[:6000],
+        "variants": [{k: v.get(k) for k in ("idea", "before", "after")} for v in variants],
+        "pr_url": url if url.startswith("https://github.com/") else "",
+    }
+
+
+def queued_fix(status: FixStatus) -> dict:
+    return {"status": status, "line": "Fix queued." if status == FixStatus.QUEUED else f"No fix attempt: {status}."}
+
+
+def stored_text(value: str) -> str | None:
+    return None if value in ("", "None") else value
+
+
+def stored_number(value: str) -> float | None:
+    text = stored_text(value)
+    return None if text is None else float(text)
+
+
+def valid_incident(item) -> bool:
+    if not isinstance(item, dict) or not isinstance(item.get("ts"), (int, float)) or not isinstance(item.get("ip"), str):
+        return False
+    fix = item.get("fix")
+    return isinstance(item.get("event"), dict) and isinstance(item.get("replay"), dict) and (fix is None or isinstance(fix, dict))
+
+
+def settled(incident: dict) -> dict:
+    fix = incident.get("fix") or {}
+    if fix.get("status") in UNFINISHED_FIX:
+        incident["fix"] = {"status": FixStatus.INTERRUPTED, "line": INTERRUPTED_LINE}
+    return incident
+
+
+def stored_counts(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in value.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
 
 class Brain:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
-        self.tsv = cfg.data_dir / "decisions.tsv"
-        if not self.tsv.exists():
-            self.tsv.write_text("\t".join(TSV_COLUMNS) + "\n")
+        self.log = DecisionLog(cfg.data_dir / "decisions.tsv")
+        self.feed = Feed()
+        self.policy = DecisionPolicy(cfg.thresholds)
+        self.door = DoorClient(cfg.door_url, cfg.door_token)
         self.jev = Jev(cfg.jev_url, cfg.app_description) if cfg.jev_url else None
         self.replayer = Replayer(cfg.runner_url, cfg.runner_token) if cfg.runner_url else None
-        self.fixer = None
-        if cfg.fix_mode in ("dry_run", "pr") and cfg.anthropic_url and cfg.github_url and cfg.runner_url:
-            self.fixer = Fixer(
-                cfg.fix_mode,
-                Claude(cfg.anthropic_url, cfg.fix_model),
-                GitHub(cfg.github_url, cfg.github_repo, cfg.github_branch),
-                cfg.runner_url,
-                cfg.runner_token,
-                max_per_hour=cfg.fix_per_hour,
-            )
+        self.fixer = build_fixer(cfg)
         self.inbox: queue.Queue = queue.Queue(maxsize=20000)
-        self.recent: deque = deque(maxlen=300)
-        self.seen: dict = {}
         self.per_ip: dict = {}
         self.honeypot_visits: dict = {}
         self.shame: Counter = Counter()
         self.stats: Counter = Counter()
         self.incidents: list = []
-        self.listeners: list = []
-        self.lock = threading.Lock()
-        self.rng = random.Random()
+        self.incidents_path = cfg.data_dir / "incidents.json"
+        self.counters_path = cfg.data_dir / "counters.json"
+        self.save_lock = threading.Lock()
+        self.counters_saved = 0.0
+        self._restore_feed()
+        self._restore_incidents()
+        self._restore_counters()
+        self.kind_handlers = {
+            EventKind.HONEYPOT: self._on_honeypot,
+            EventKind.CANARY_REUSE: self._on_canary_reuse,
+        }
+        self.verdict_handlers = {
+            Verdict.PROVEN: self._on_proven,
+            Verdict.NOT_REPRODUCED: self._on_not_reproduced,
+            Verdict.INCONCLUSIVE: self._on_quiet_verdict,
+            Verdict.MINOR: self._on_quiet_verdict,
+        }
         threading.Thread(target=self._work, daemon=True).start()
+
+    def _restore_feed(self):
+        try:
+            stored = self.log.tail(RESTORED_FEED_ROWS)
+        except Exception:
+            return
+        for row in stored:
+            try:
+                self.feed.recent.append(self._feed_row(row))
+            except Exception:
+                continue
+
+    def _feed_row(self, row: dict) -> dict:
+        return {
+            "ts": calendar.timegm(time.strptime(row["ts"], TSV_TIME)),
+            "ip": self.mask(row["ip"]),
+            "method": row["method"],
+            "path": row["path"][:200],
+            "decision": row["decision"],
+            "line": row["line"],
+            "malicious": stored_number(row["jev_malicious"]),
+            "jev_action": stored_text(row["jev_action"]),
+            "confidence": stored_number(row["jev_confidence"]),
+            "verdict": stored_text(row["replay_verdict"]),
+            "why": None,
+        }
+
+    def _restore_incidents(self):
+        try:
+            loaded = json.loads(self.incidents_path.read_text())
+            if not isinstance(loaded, list) or not all(valid_incident(i) for i in loaded):
+                return
+        except Exception:
+            return
+        self.incidents = [settled(i) for i in loaded[-KEPT_INCIDENTS:]]
+
+    def _restore_counters(self):
+        try:
+            loaded = json.loads(self.counters_path.read_text())
+            stats, shame, visits = (stored_counts(loaded.get(k)) for k in ("stats", "shame", "honeypot_visits"))
+        except Exception:
+            return
+        self.stats.update(stats)
+        self.shame.update(shame)
+        self.honeypot_visits.update(visits)
+
+    def _counters(self) -> dict:
+        visits = sorted(self.honeypot_visits.items(), key=lambda kv: kv[1])[-KEPT_VISITS:]
+        return {"stats": dict(self.stats), "shame": dict(self.shame.most_common(KEPT_SHAME)), "honeypot_visits": dict(visits)}
+
+    def _write_json(self, path: Path, build) -> None:
+        with self.save_lock:
+            try:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(build(), default=str))
+                tmp.replace(path)
+            except Exception:
+                self.stats["save_failed"] += 1
+
+    def _save_incidents(self):
+        self._write_json(self.incidents_path, lambda: self.incidents[-KEPT_INCIDENTS:])
+
+    def _save_counters(self):
+        self.counters_saved = time.time()
+        self._write_json(self.counters_path, self._counters)
 
     def submit(self, events: list):
         for e in events:
@@ -105,169 +265,159 @@ class Brain:
     def _work(self):
         while True:
             event = self.inbox.get()
-            net.hold_awake("bouncer-incident", 300)
+            net.hold_awake(AWAKE_TASK, 300)
             try:
                 self.handle(event)
             except Exception as exc:
-                self.emit({"ts": time.time(), "ip": event.get("ip"), "path": event.get("path"), "decision": "error", "line": f"agent error: {exc}"[:300]})
+                self.emit({"ts": time.time(), "ip": event.get("ip"), "path": event.get("path"), "decision": Decision.ERROR, "line": f"agent error: {exc}"[:300]})
             if self.inbox.empty():
-                net.release_awake("bouncer-incident")
+                self._save_counters()
+                net.release_awake(AWAKE_TASK)
+            elif time.time() - self.counters_saved >= SAVE_SECONDS:
+                self._save_counters()
 
     def history(self, ip: str) -> str:
         items = self.per_ip.get(ip, [])[-5:]
         return "; ".join(f"{d['method']} {d['path'][:80]} -> {d['decision']}" for d in items)
 
     def handle(self, event: dict):
-        ip = event.get("ip", "?")
-        kind = event.get("kind", "request")
         self.stats["events"] += 1
-        record = {
-            "ts": event.get("ts", time.time()),
-            "ip": ip,
-            "method": event.get("method"),
-            "path": event.get("path", ""),
-            "kind": kind,
-            "ua": event.get("ua", ""),
-        }
-        if kind in ("refused", "tarpitted"):
+        record = self._record(event)
+        kind = record["kind"]
+        if kind in COUNTED_ONLY_KINDS:
             self.stats[kind] += 1
             return
-        if kind == "honeypot":
-            self.honeypot_visits[ip] = record["ts"]
-            self.shame[event.get("path", "")] += 1
-            self.set_list("tarpit", ip, self.cfg.tarpit_seconds, "took the honeypot .env")
-            return self.decide(record, "tarpit", line=persona.line("honeypot", self.rng))
-        if kind == "canary_reuse":
-            story = ""
-            if self.honeypot_visits:
-                origin_ip, origin_ts = max(self.honeypot_visits.items(), key=lambda kv: kv[1])
-                who = "this same client" if origin_ip == ip else f"{self.mask(origin_ip)}"
-                story = f" Keys were taken from the fake .env by {who} at {time.strftime('%H:%M:%S', time.gmtime(origin_ts))} UTC."
-            self.set_list("block", ip, self.cfg.block_seconds, "reused honeypot credentials")
-            return self.decide(record, "block", line=persona.line("canary_reuse", self.rng) + story)
-        if event.get("path", "").startswith("/socket.io/"):
-            self.stats["prefiltered"] += 1
+        self.kind_handlers.get(kind, self._on_request)(event, record)
+
+    @staticmethod
+    def _record(event: dict) -> dict:
+        return {
+            "ts": event.get("ts", time.time()),
+            "ip": event.get("ip", "?"),
+            "method": event.get("method"),
+            "path": event.get("path", ""),
+            "kind": EventKind.parse(event.get("kind", EventKind.REQUEST), EventKind.REQUEST),
+            "ua": event.get("ua", ""),
+        }
+
+    def _on_honeypot(self, event: dict, record: dict):
+        self.honeypot_visits[record["ip"]] = record["ts"]
+        self.shame[record["path"]] += 1
+        self._list_and_decide(record, Decision.TARPIT, "took the honeypot .env", persona.line("honeypot", record["path"]))
+
+    def _on_canary_reuse(self, event: dict, record: dict):
+        line = persona.line("canary_reuse", record["path"]) + self._honeypot_story(record["ip"])
+        self._list_and_decide(record, Decision.BLOCK, "reused honeypot credentials", line)
+
+    def _honeypot_story(self, ip: str) -> str:
+        if ip in self.honeypot_visits:
+            return f" Keys were taken from the fake .env by this same client at {utc_clock(self.honeypot_visits[ip])} UTC."
+        if not self.honeypot_visits:
+            return ""
+        origin_ip, origin_ts = max(self.honeypot_visits.items(), key=lambda kv: kv[1])
+        return f" Keys were last taken from the fake .env by {self.mask(origin_ip)} at {utc_clock(origin_ts)} UTC."
+
+    def _on_request(self, event: dict, record: dict):
+        screening = self.policy.screen(event, record["ip"], record["ts"])
+        if screening.skipped:
+            self.stats[screening.skipped] += 1
             return
-        text = f"{event.get('path', '')} {event.get('body', '')}"
-        suspicious = bool(SUSPICIOUS.search(text))
-        key = (ip, shape(event), hashlib.sha256(text.encode()).hexdigest() if suspicious else "")
-        prior = self.seen.get(key)
-        if prior and record["ts"] - prior["ts"] < self.cfg.dedupe_seconds:
-            prior["count"] += 1
-            self.stats["deduped"] += 1
-            return
-        scanner = bool(SCANNER_UA.search(event.get("ua", "")))
-        probe = bool(PROBE_PATH.search(event.get("path", "")))
-        failed = (event.get("status") or 0) >= 400
-        if not (suspicious or scanner or probe or failed):
-            self.stats["prefiltered"] += 1
-            return
-        self.seen[key] = {"ts": record["ts"], "count": 1}
-        if probe:
-            self.shame[event.get("path", "").split("?", 1)[0]] += 1
-        triage = self.jev.triage(event, self.history(ip)) if self.jev else {"ok": False, "error": "jev not configured"}
+        signals = screening.signals
+        if signals.probe:
+            self.shame[bare_path(record["path"])] += 1
+        triage = self._triage(event, record["ip"])
         record["jev"] = triage
-        if not triage.get("ok"):
-            action = "watch"
-        else:
-            action = triage.get("action") or "watch"
-            if action in ("block", "tarpit") and (triage.get("confidence") or 0) < 0.5 and (triage.get("malicious") or 0) < 0.8:
-                action = "watch"
-            if (triage.get("malicious") or 0) >= self.cfg.replay_threshold and action in ("block", "tarpit") and not probe:
-                action = "replay"
-        if action == "replay" and self.replayer:
-            self.decide(record, "replay", line=persona.line("replay", self.rng))
-            result = self.replayer.run(event)
-            record = dict(record)
-            record["replay"] = result
-            verdict = result["verdict"]
-            if verdict == PROVEN:
-                self.set_list("block", ip, self.cfg.block_seconds, "proven exploit: " + result["why"][:120])
-                incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result}
-                self.incidents.append(incident)
-                self.decide(record, "block", line=persona.line("proven", self.rng))
-                if self.fixer:
-                    queued = self.fixer.submit(incident, self.fix_report)
-                    incident["fix"] = {"status": queued, "line": "Fix queued." if queued == "queued" else f"No fix attempt: {queued}."}
-                return
-            if verdict == NOT_REPRODUCED:
-                if (triage.get("malicious") or 0) >= 0.7:
-                    self.set_list("tarpit", ip, self.cfg.tarpit_seconds, "failed attack attempt")
-                    return self.decide(record, "tarpit", line=persona.line("not_reproduced", self.rng))
-                return self.decide(record, "watch", line=persona.line("not_reproduced", self.rng))
-            if verdict == INCONCLUSIVE:
-                return self.decide(record, "watch", line=persona.line("inconclusive", self.rng))
-            if verdict == MINOR:
-                return self.decide(record, "watch", line=persona.line("minor", self.rng))
-            return self.decide(record, "watch", line=f"Back room is jammed ({result.get('why')}). Watching instead.")
-        if action == "block":
-            self.set_list("block", ip, self.cfg.block_seconds, "jev: block")
-            return self.decide(record, "block", line=persona.line("block", self.rng))
-        if action == "tarpit":
-            self.set_list("tarpit", ip, self.cfg.tarpit_seconds, "jev: tarpit")
-            return self.decide(record, "tarpit", line=persona.line("tarpit", self.rng))
-        if action == "ignore":
-            return self.decide(record, "ignore", line=persona.line("ignore_probe" if (probe or scanner) else "ignore", self.rng))
-        return self.decide(record, "watch", line=persona.line("watch", self.rng))
+        decision = self.policy.choose(triage, signals)
+        if decision == Decision.REPLAY and self.replayer:
+            return self._replay(event, record, triage)
+        self._act(record, decision, signals)
+
+    def _triage(self, event: dict, ip: str) -> dict:
+        if not self.jev:
+            return {"ok": False, "error": "jev not configured"}
+        return self.jev.triage(event, self.history(ip))
+
+    def _act(self, record: dict, decision: Decision, signals: Signals):
+        path = record["path"]
+        if decision.listed:
+            return self._list_and_decide(record, decision, f"jev: {decision}", persona.line(decision, path))
+        if decision == Decision.IGNORE:
+            kind = "ignore_probe" if signals.probe or signals.scanner else "ignore"
+            return self.decide(record, Decision.IGNORE, line=persona.line(kind, path))
+        return self.decide(record, Decision.WATCH, line=persona.line("watch", path))
+
+    def _replay(self, event: dict, record: dict, triage: dict):
+        self.decide(record, Decision.REPLAY, line=persona.line("replay", record["path"]))
+        result = self.replayer.run(event)
+        record = {**record, "replay": result}
+        handler = self.verdict_handlers.get(result["verdict"], self._on_jammed)
+        handler(event, record, triage)
+
+    def _on_proven(self, event: dict, record: dict, triage: dict):
+        ip, result = record["ip"], record["replay"]
+        self.set_list(Decision.BLOCK, ip, "proven exploit: " + result["why"][:120])
+        incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result}
+        self.incidents.append(incident)
+        self.decide(record, Decision.BLOCK, line=persona.line("proven", record["path"]))
+        if self.fixer:
+            incident["fix"] = queued_fix(self.fixer.submit(incident, self.fix_report))
+        self._save_incidents()
+
+    def _on_not_reproduced(self, event: dict, record: dict, triage: dict):
+        line = persona.line("not_reproduced", record["path"])
+        decision = self.policy.after_failed_replay(triage)
+        if decision.listed:
+            return self._list_and_decide(record, decision, "failed attack attempt", line)
+        self.decide(record, decision, line=line)
+
+    def _on_quiet_verdict(self, event: dict, record: dict, triage: dict):
+        kind = QUIET_VERDICT_LINES[record["replay"]["verdict"]]
+        self.decide(record, Decision.WATCH, line=persona.line(kind, record["path"]))
+
+    def _on_jammed(self, event: dict, record: dict, triage: dict):
+        self.decide(record, Decision.WATCH, line=f"Back room is jammed ({record['replay'].get('why')}). Watching instead.")
+
+    def _list_and_decide(self, record: dict, decision: Decision, reason: str, line: str):
+        self.set_list(decision, record["ip"], reason)
+        self.decide(record, decision, line=line)
+
+    def list_seconds(self, kind: Decision) -> int:
+        return self.cfg.block_seconds if kind == Decision.BLOCK else self.cfg.tarpit_seconds
 
     def fix_report(self, incident: dict, fix: dict):
         incident["fix"] = fix
+        self._save_incidents()
         event = incident["event"]
-        record = {"ts": time.time(), "ip": incident["ip"], "method": event.get("method"), "path": event.get("path", ""), "kind": "fix"}
-        record["replay"] = {"verdict": fix.get("status", "").upper(), "evidence": {k: fix[k] for k in ("file", "pr_url") if fix.get(k)}}
-        self.decide(record, "fix", line=fix.get("line", ""))
+        record = {"ts": time.time(), "ip": incident["ip"], "method": event.get("method"), "path": event.get("path", ""), "kind": EventKind.FIX}
+        record["replay"] = {"verdict": str(fix.get("status", "")).upper(), "evidence": {k: fix[k] for k in ("file", "pr_url") if fix.get(k)}}
+        self.decide(record, Decision.FIX, line=fix.get("line", ""))
 
-    def set_list(self, kind: str, ip: str, seconds: int, reason: str) -> bool:
-        if ip in self.cfg.owner_ips or not self.cfg.door_url:
+    def set_list(self, kind: Decision, ip: str, reason: str) -> bool:
+        if self.is_owner(ip) or not self.door.enabled:
             return False
-        endpoint = "blocklist" if kind == "block" else "tarpit"
-        status, _, _ = net.request(
-            f"{self.cfg.door_url}/_bouncer/{endpoint}",
-            "PUT",
-            {ip: {"until": time.time() + seconds, "reason": reason}},
-            timeout=15,
-            headers={"Authorization": f"Bearer {self.cfg.door_token}"} if self.cfg.door_token else None,
-        )
-        self.stats[f"{kind}_sent" if status == 200 else f"{kind}_failed"] += 1
-        return status == 200
+        ok = self.door.put(kind, ip, self.list_seconds(kind), reason)
+        self.stats[f"{kind}_sent" if ok else f"{kind}_failed"] += 1
+        return ok
+
+    def is_owner(self, ip: str | None) -> bool:
+        return ip in self.cfg.owner_ips
 
     def mask(self, ip: str) -> str:
-        return "you (owner)" if ip in self.cfg.owner_ips else ip
+        return "you (owner)" if self.is_owner(ip) else ip
 
-    def decide(self, record: dict, decision: str, line: str):
-        record = dict(record)
-        if record.get("ip") in self.cfg.owner_ips and decision in ("block", "tarpit"):
-            decision = "would_" + decision
-            line = f"That's you, boss. Anyone else gets a {decision[6:]} here. ({line})"
-        record["decision"] = decision
-        record["line"] = line
+    def decide(self, record: dict, decision: Decision, line: str):
+        if self.is_owner(record.get("ip")) and decision.listed:
+            line = f"That's you, boss. Anyone else gets a {decision} here. ({line})"
+            decision = decision.for_owner()
+        record = {**record, "decision": decision, "line": line}
         self.stats[decision] += 1
-        self.per_ip.setdefault(record["ip"], []).append(record)
-        self.per_ip[record["ip"]] = self.per_ip[record["ip"]][-20:]
-        self.write_tsv(record)
+        self._remember(record)
+        self.log.write(record)
         self.emit(record)
 
-    def write_tsv(self, r: dict):
-        jev = r.get("jev") or {}
-        rep = r.get("replay") or {}
-        row = [
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r.get("ts", time.time()))),
-            r.get("ip", ""),
-            r.get("method") or "",
-            r.get("path", "")[:300],
-            r.get("kind", ""),
-            str(jev.get("malicious", "")),
-            str(jev.get("action", "")),
-            str(jev.get("confidence", "")),
-            r.get("decision", ""),
-            rep.get("verdict", ""),
-            json.dumps(rep.get("evidence", {}), separators=(",", ":")) if rep else "",
-            r.get("line", ""),
-        ]
-        clean = [str(c).replace("\t", " ").replace("\n", " ") for c in row]
-        with self.lock:
-            with self.tsv.open("a") as f:
-                f.write("\t".join(clean) + "\n")
+    def _remember(self, record: dict):
+        ip = record["ip"]
+        self.per_ip[ip] = (self.per_ip.get(ip, []) + [record])[-20:]
 
     def public_view(self, r: dict) -> dict:
         jev = r.get("jev") or {}
@@ -287,38 +437,23 @@ class Brain:
         }
 
     def emit(self, record: dict):
-        view = self.public_view(record)
-        self.recent.append(view)
-        for q in list(self.listeners):
-            try:
-                q.put_nowait(view)
-            except queue.Full:
-                pass
+        self.feed.publish(self.public_view(record))
 
-    @staticmethod
-    def fix_view(fix: dict | None) -> dict | None:
-        if not fix:
-            return None
-        url = fix.get("pr_url") or ""
+    def incident_view(self, incident: dict) -> dict:
         return {
-            "status": fix.get("status"),
-            "line": fix.get("line"),
-            "file": fix.get("file"),
-            "summary": fix.get("summary"),
-            "diff": (fix.get("diff") or "")[:6000],
-            "variants": [{k: v.get(k) for k in ("idea", "before", "after")} for v in ((fix.get("verify") or {}).get("variants") or [])],
-            "pr_url": url if url.startswith("https://github.com/") else "",
+            "ts": incident["ts"],
+            "ip": self.mask(incident["ip"]),
+            "path": incident["event"].get("path"),
+            "why": incident["replay"].get("why"),
+            "fix": fix_view(incident.get("fix")),
         }
 
     def state(self) -> dict:
         return {
             "stats": dict(self.stats),
-            "recent": list(self.recent)[-100:],
+            "recent": self.feed.latest(100),
             "shame": [{"path": p, "count": c, "caption": persona.shame_caption(p, c)} for p, c in self.shame.most_common(10)],
-            "incidents": [
-                {"ts": i["ts"], "ip": self.mask(i["ip"]), "path": i["event"].get("path"), "why": i["replay"].get("why"), "fix": self.fix_view(i.get("fix"))}
-                for i in self.incidents[-20:]
-            ],
+            "incidents": [self.incident_view(i) for i in self.incidents[-KEPT_INCIDENTS:]],
         }
 
 DASHBOARD = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -357,8 +492,14 @@ LOGIN = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=vie
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0e0e12;color:#ececf1;font:16px system-ui,sans-serif}form{display:flex;gap:8px;padding:16px}input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #333;background:#18181f;color:inherit}</style></head>
 <body><form method=post action=login><input type=password name=passphrase placeholder="What's the password?" autofocus><button>Let me in</button></form></body></html>"""
 
+
+def sha_matches(secret: str, expected_sha: str) -> bool:
+    return hmac.compare_digest(hashlib.sha256(secret.encode()).hexdigest(), expected_sha)
+
+
 def make_handler(brain: Brain):
     cfg = brain.cfg
+    not_found = (404, b"not found", TEXT)
 
     def cookie_value() -> str:
         return hmac.new(cfg.dash_sha256.encode(), b"bouncer-dashboard", hashlib.sha256).hexdigest()
@@ -382,62 +523,53 @@ def make_handler(brain: Brain):
             self.wfile.write(body)
 
         def bearer_ok(self, expected_sha: str) -> bool:
-            header = self.headers.get("Authorization", "")
-            if not expected_sha or not header.startswith("Bearer "):
+            scheme, _, token = self.headers.get("Authorization", "").partition(" ")
+            if not expected_sha or scheme != "Bearer" or not token:
                 return False
-            return hmac.compare_digest(hashlib.sha256(header[7:].encode()).hexdigest(), expected_sha)
+            return sha_matches(token, expected_sha)
 
         def dash_ok(self) -> bool:
             if not cfg.dash_sha256:
                 return False
             cookies = dict(p.strip().split("=", 1) for p in self.headers.get("Cookie", "").split(";") if "=" in p)
-            return hmac.compare_digest(cookies.get("bouncer", ""), cookie_value())
+            return hmac.compare_digest(cookies.get(COOKIE_NAME, ""), cookie_value())
 
         def body(self) -> bytes:
             n = int(self.headers.get("Content-Length") or 0)
             return self.rfile.read(n) if n > 0 else b""
 
-        def do_POST(self):
-            data = self.body()
-            if self.path == "/events":
-                if not self.bearer_ok(cfg.events_sha256):
-                    return self.reply(404, b"not found", "text/plain")
-                try:
-                    events = json.loads(data).get("events", [])
-                except (ValueError, AttributeError):
-                    return self.reply(400, b"bad json", "text/plain")
-                brain.submit(events)
-                return self.reply(202, json.dumps({"accepted": len(events)}).encode(), "application/json")
-            if self.path == "/login":
-                given = parse_qs(data.decode("utf-8", "replace")).get("passphrase", [""])[0]
-                if cfg.dash_sha256 and hmac.compare_digest(hashlib.sha256(given.encode()).hexdigest(), cfg.dash_sha256):
-                    return self.reply(
-                        303,
-                        b"",
-                        "text/plain",
-                        {"Location": "./", "Set-Cookie": f"bouncer={cookie_value()}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800"},
-                    )
-                time.sleep(1)
-                return self.reply(401, LOGIN.encode(), "text/html; charset=utf-8")
-            return self.reply(404, b"not found", "text/plain")
+        def post_events(self, data: bytes):
+            if not self.bearer_ok(cfg.events_sha256):
+                return self.reply(*not_found)
+            try:
+                events = json.loads(data).get("events", [])
+            except (ValueError, AttributeError):
+                return self.reply(400, b"bad json", TEXT)
+            brain.submit(events)
+            return self.reply(202, json.dumps({"accepted": len(events)}).encode(), JSON)
 
-        def do_GET(self):
-            path = self.path.split("?", 1)[0]
-            if path == "/healthz":
-                return self.reply(200, b"ok", "text/plain")
-            if not self.dash_ok():
-                return self.reply(200, LOGIN.encode(), "text/html; charset=utf-8")
-            if path == "/":
-                return self.reply(200, DASHBOARD.encode(), "text/html; charset=utf-8")
-            if path == "/api/state":
-                return self.reply(200, json.dumps(brain.state()).encode(), "application/json")
-            if path == "/stream":
-                return self.stream()
-            return self.reply(404, b"not found", "text/plain")
+        def post_login(self, data: bytes):
+            given = parse_qs(data.decode("utf-8", "replace")).get("passphrase", [""])[0]
+            if cfg.dash_sha256 and sha_matches(given, cfg.dash_sha256):
+                cookie = f"{COOKIE_NAME}={cookie_value()}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800"
+                return self.reply(303, b"", TEXT, {"Location": "./", "Set-Cookie": cookie})
+            time.sleep(1)
+            return self.reply(401, LOGIN.encode(), HTML)
+
+        def healthz(self):
+            return self.reply(200, b"ok", TEXT)
+
+        def login_page(self):
+            return self.reply(200, LOGIN.encode(), HTML)
+
+        def dashboard(self):
+            return self.reply(200, DASHBOARD.encode(), HTML)
+
+        def api_state(self):
+            return self.reply(200, json.dumps(brain.state()).encode(), JSON)
 
         def stream(self):
-            q: queue.Queue = queue.Queue(maxsize=500)
-            brain.listeners.append(q)
+            q = brain.feed.subscribe()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
@@ -445,19 +577,46 @@ def make_handler(brain: Brain):
             self.end_headers()
             self.close_connection = True
             try:
-                while True:
-                    try:
-                        item = q.get(timeout=15)
-                        self.wfile.write(f"data: {json.dumps(item)}\n\n".encode())
-                    except queue.Empty:
-                        self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
+                self._pump(q)
             except OSError:
                 pass
             finally:
-                brain.listeners.remove(q)
+                brain.feed.unsubscribe(q)
+
+        def _pump(self, q: queue.Queue):
+            while True:
+                try:
+                    item = q.get(timeout=15)
+                    self.wfile.write(f"data: {json.dumps(item)}\n\n".encode())
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+
+        PUBLIC_GET_ROUTES = {"/healthz": healthz}
+        PRIVATE_GET_ROUTES = {"/": dashboard, "/api/state": api_state, "/stream": stream}
+        POST_ROUTES = {"/events": post_events, "/login": post_login}
+
+        def do_POST(self):
+            data = self.body()
+            route = self.POST_ROUTES.get(self.path)
+            if not route:
+                return self.reply(*not_found)
+            return route(self, data)
+
+        def do_GET(self):
+            path = bare_path(self.path)
+            public = self.PUBLIC_GET_ROUTES.get(path)
+            if public:
+                return public(self)
+            if not self.dash_ok():
+                return self.login_page()
+            route = self.PRIVATE_GET_ROUTES.get(path)
+            if not route:
+                return self.reply(*not_found)
+            return route(self)
 
     return Handler
+
 
 def main():
     cfg = Config()
@@ -466,6 +625,7 @@ def main():
     server.daemon_threads = True
     print(json.dumps({"agent": "listening", "port": cfg.port, "jev": bool(cfg.jev_url), "runner": bool(cfg.runner_url), "door": bool(cfg.door_url)}), flush=True)
     server.serve_forever()
+
 
 if __name__ == "__main__":
     sys.exit(main())

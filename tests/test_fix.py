@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from agent.fix import apply_edits, branch_prefix, clean_variants, locate_route, smoke_diff, Fixer
+from agent.fix import VARIANTS_FAILED, apply_edits, branch_prefix, clean_variants, locate_route, pr_body, smoke_diff, Fixer, FixJob
+from agent.labels import FixStatus
 
 SERVER = """import { login } from './routes/login'
 import { searchProducts } from './routes/search'
@@ -154,6 +155,7 @@ class Dedupe(unittest.TestCase):
         self.assertEqual((first["status"], again["status"], claude.calls), ("ready", "ready", 1))
         self.assertEqual(again["diff"], first["diff"])
         self.assertIn("already tested", again["line"])
+        self.assertIn(VARIANTS_FAILED, first["line"])
 
     def test_limit_counts_only_real_attempts(self):
         f = self.fixer(StubGitHub(), StubClaude(ok=False), per_hour=1)
@@ -161,6 +163,27 @@ class Dedupe(unittest.TestCase):
         out = f.fix(self.search, lambda *a: None)
         self.assertEqual((out["status"], out["file"]), ("rate_limited", "routes/search.ts"))
         self.assertNotIn("routes/search.ts", f.files)
+
+    def test_crash_releases_the_file(self):
+        f = self.fixer(StubGitHub(), CrashingClaude())
+        first = f._run_job(self.login, lambda *a: None)
+        again = f._run_job(self.login, lambda *a: None)
+        self.assertEqual(first["status"], FixStatus.ERROR)
+        self.assertNotEqual(again["status"], FixStatus.SKIPPED)
+
+
+class CrashingClaude(StubClaude):
+    def variants(self, prompt):
+        raise RuntimeError("boom")
+
+
+class PrBody(unittest.TestCase):
+    def test_backticks_in_attack_stay_inside_the_fence(self):
+        req = {"method": "POST", "path": "/rest/user/login", "headers": {}, "body": "x\n```\n# injected heading"}
+        job = FixJob(incident={"ts": 0}, req=req, why="w", control_status=401)
+        result = {"summary": "s", "verify": {"build_ms": 1, "after": "NOT_REPRODUCED", "smoke": {}, "variants": []}}
+        body = pr_body(job, result)
+        self.assertIn("````\nPOST /rest/user/login\nx\n```\n# injected heading\n````", body)
 
 
 if __name__ == "__main__":

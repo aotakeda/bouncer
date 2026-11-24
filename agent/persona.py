@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import random
+import hashlib
+
+from .net import bare_path
 
 LINES = {
     "ignore": [
@@ -32,7 +34,7 @@ LINES = {
     "block": [
         "You're done. Out.",
         "Not on the list. Not tonight.",
-        "Door's closed for you. Fifteen minutes, then we'll talk.",
+        "Door's closed for you. Come back later and we'll talk.",
     ],
     "proven": [
         "It worked on the stunt double. That's a real hole. Calling the carpenter.",
@@ -59,19 +61,23 @@ LINES = {
 }
 
 
-def line(kind: str, rng: random.Random | None = None) -> str:
+SHAME_CAPTIONS = (
+    (lambda bare: "wp-" in bare or bare.endswith(".php"), "{count}x tried to log into WordPress. This is a juice shop."),
+    (lambda bare: ".git" in bare, "{count}x asked for our git history. Bold."),
+    (lambda bare: ".env" in bare, "{count}x went straight for the secrets drawer."),
+    (lambda bare: "admin" in bare, "{count}x looking for the manager."),
+)
+
+
+def line(kind: str, path: str = "") -> str:
     options = LINES.get(kind) or LINES["watch"]
-    return (rng or random).choice(options)
+    digest = hashlib.sha256(f"{kind} {bare_path(path)}".encode()).hexdigest()
+    return options[int(digest, 16) % len(options)]
 
 
 def shame_caption(path: str, count: int) -> str:
-    bare = path.split("?", 1)[0]
-    if "wp-" in bare or bare.endswith(".php"):
-        return f"{count}x tried to log into WordPress. This is a juice shop."
-    if ".git" in bare:
-        return f"{count}x asked for our git history. Bold."
-    if ".env" in bare:
-        return f"{count}x went straight for the secrets drawer."
-    if "admin" in bare:
-        return f"{count}x looking for the manager."
+    bare = bare_path(path)
+    for matches, caption in SHAME_CAPTIONS:
+        if matches(bare):
+            return caption.format(count=count)
     return f"{count}x knocked on {bare}"
