@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from agent.fix import apply_edits, branch_prefix, locate_route, smoke_diff, Fixer
+from agent.fix import apply_edits, branch_prefix, clean_variants, locate_route, smoke_diff, Fixer
 
 SERVER = """import { login } from './routes/login'
 import { searchProducts } from './routes/search'
@@ -58,7 +58,7 @@ class Judge(unittest.TestCase):
         }
 
     def judge(self, verify):
-        return Fixer.judge(None, self.req, verify, 401)
+        return Fixer.judge(Fixer.__new__(Fixer), self.req, verify, 401)
 
     def test_good_patch_passes(self):
         self.assertEqual(self.judge(self.verify()), "")
@@ -78,6 +78,31 @@ class Judge(unittest.TestCase):
         self.assertEqual(smoke_diff(self.smoke, self.smoke), [])
 
 
+class Variants(unittest.TestCase):
+    req = {"method": "POST", "path": "/rest/user/login", "headers": {"Content-Type": "application/json"}, "body": "{}"}
+
+    def test_keeps_only_same_route_and_new_requests(self):
+        raw = [
+            {"path": "/rest/user/login", "body": '{"email":"a"}', "idea": "x"},
+            {"path": "/rest/user/login", "body": "{}", "idea": "same as original"},
+            {"path": "/api/Users", "body": "{}", "idea": "other route"},
+            {"path": "/rest/user/login", "body": '{"email":"a"}', "idea": "duplicate"},
+        ]
+        out = clean_variants(self.req, raw)
+        self.assertEqual([v["idea"] for v in out], ["x"])
+        self.assertEqual((out[0]["method"], out[0]["headers"]), ("POST", {"Content-Type": "application/json"}))
+
+    def test_variant_that_still_works_fails_the_patch(self):
+        variants = clean_variants(self.req, [{"path": "/rest/user/login", "body": '{"email":"a"}', "idea": "other quote"}])
+        verify = Judge.verify(Judge())
+        still = {"attack": {"status": 200, "canary_hits": []}, "attack_solved": {"loginAdminChallenge": {"name": "Login Admin", "difficulty": 2}}}
+        blocked = {"attack": {"status": 401, "canary_hits": []}, "attack_solved": {}}
+        verify["variants"] = {"before": [still], "after": [still]}
+        self.assertIn("variant of the attack still works", Fixer.judge(Fixer.__new__(Fixer), self.req, verify, 401, variants))
+        verify["variants"] = {"before": [still], "after": [blocked]}
+        self.assertEqual(Fixer.judge(Fixer.__new__(Fixer), self.req, verify, 401, variants), "")
+
+
 class StubGitHub:
     def __init__(self, open_url=""):
         self.open_url = open_url
@@ -94,6 +119,9 @@ class StubClaude:
     def __init__(self, ok=True):
         self.ok = ok
         self.calls = 0
+
+    def variants(self, prompt):
+        return {"ok": False, "error": "skip"}
 
     def patch(self, prompt):
         self.calls += 1

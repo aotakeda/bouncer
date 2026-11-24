@@ -138,6 +138,27 @@ if [ "$STEP" = all ] || [ "$STEP" = lock ]; then
   api -s "$REPLAY" /policy/privileges -- -s -X POST -H 'Content-Type: application/json' -d '{"profile":"minimal","noNewPrivileges":true}' >/dev/null
 fi
 
+door_admin() {
+  curl -s -X "$1" -H "Authorization: Bearer $DOOR_SECRET" "$APP_URL/_bouncer/$2"
+}
+
+if [ "$STEP" = blocks ]; then
+  door_admin GET blocklist | python3 -c '
+import sys,json,time
+d=json.load(sys.stdin)
+for kind,entries in d.items():
+    for ip,e in (entries or {}).items():
+        left=max(0,int(e.get("until",0)-time.time()))
+        print("%-9s %-40s %5ds  %s" % (kind, ip, left, str(e.get("reason",""))[:80]))'
+  exit 0
+fi
+
+if [ "$STEP" = unblock ]; then
+  IP="${2:?usage: deploy.sh unblock <ip>}"
+  for kind in blocklist tarpit; do printf '%s: ' "$kind"; door_admin DELETE "$kind/$IP"; echo; done
+  exit 0
+fi
+
 say "done"
 echo "app:       $APP_URL"
 echo "dashboard: $AGENT_URL  (passphrase in .secrets)"

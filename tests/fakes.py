@@ -192,8 +192,16 @@ def claude_handler():
             req = json.loads(self.rfile.read(n))
             ok = self.headers.get("anthropic-version") and req.get("output_config", {}).get("format", {}).get("type") == "json_schema"
             text = req["messages"][0]["content"]
-            line = next((l for l in text.splitlines() if "VULN" in l), "")
-            patch = {"title": "Use bound parameters", "summary": "Stops the injection.", "edits": [{"search": line, "replace": line.replace("VULN", "replacements")}] if line else []}
+            schema = req.get("output_config", {}).get("format", {}).get("schema", {})
+            if "variants" in schema.get("properties", {}):
+                patch = {"variants": [
+                    {"path": "/rest/user/login", "body": json.dumps({"email": "' or 1=1-- variant", "password": "z"}), "idea": "same trick, other comment"},
+                    {"path": "/rest/user/login", "body": json.dumps({"email": "admin@juice-sh.op'--", "password": "z"}), "idea": "target admin by email"},
+                    {"path": "/api/Users", "body": "{}", "idea": "other endpoint"},
+                ]}
+            else:
+                line = next((l for l in text.splitlines() if "VULN" in l), "")
+                patch = {"title": "Use bound parameters", "summary": "Stops the injection.", "edits": [{"search": line, "replace": line.replace("VULN", "replacements")}] if line else []}
             reply = {"model": req["model"], "stop_reason": "end_turn" if ok else "refusal", "content": [{"type": "text", "text": json.dumps(patch)}], "usage": {}}
             data = json.dumps(reply).encode()
             self.send_response(200)

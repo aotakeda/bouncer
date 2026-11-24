@@ -199,6 +199,16 @@ class Runner:
         }
 
 
+    def try_all(self, requests: list) -> list:
+        out = []
+        prev = self.target.solved()
+        for req in requests:
+            attack = self.send(req)
+            now = self.target.solved()
+            out.append({"attack": attack, "attack_solved": {k: v for k, v in now.items() if k not in prev}})
+            prev = now
+        return out
+
     def smoke(self) -> dict:
         login = json.dumps({"email": self.canary.get("email", ""), "password": self.canary.get("password", "")}).encode()
         checks = [
@@ -246,6 +256,8 @@ class Runner:
             if not first["ok"]:
                 return {"ok": False, "stage": "reset", "reset": first}
             before = self.smoke()
+            variants = [v for v in (payload.get("variants") or []) if isinstance(v, dict)][:4]
+            tried = {"before": self.try_all(variants)}
             build = self.cfg.app_dir / self.cfg.build_dir
             backup = self.cfg.app_dir / (self.cfg.build_dir + ".bouncer-bak")
             originals = {rel: (self.cfg.app_dir / rel).read_bytes() for rel in files}
@@ -261,7 +273,8 @@ class Runner:
                     return {"ok": True, "build": build_info, "smoke_before": before}
                 result = self._replay(dict(payload, reset=True))
                 after = self.smoke() if result.get("ok") else {}
-                return {"ok": True, "build": build_info, "replay": result, "smoke_before": before, "smoke_after": after}
+                tried["after"] = self.try_all(variants) if result.get("ok") else []
+                return {"ok": True, "build": build_info, "replay": result, "smoke_before": before, "smoke_after": after, "variants": tried}
             finally:
                 for rel, data in originals.items():
                     (self.cfg.app_dir / rel).write_bytes(data)

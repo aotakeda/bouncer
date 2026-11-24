@@ -40,7 +40,30 @@ SYSTEM = """You fix security holes in OWASP Juice Shop, a TypeScript + Express +
 
 Write the smallest change to the given file that removes the root cause of the proven attack while keeping every legitimate behaviour, response shape and status code the same for normal users. Prefer the idiomatic fix (for SQL, bound parameters through Sequelize `replacements` instead of string interpolation). Do not add dependencies. Do not add, remove or edit comments, including the `vuln-code-snippet` markers.
 
-Express the change as search/replace edits. Each `search` must be copied exactly from the file, character for character, and must occur exactly once in it. Keep edits few and tight. `title` is a short pull request title. `summary` is two or three plain sentences for a reviewer: what the hole was and what the change does."""
+Express the change as search/replace edits. Each `search` must be copied exactly from the file, character for character, and must occur exactly once in it. Keep edits few and tight. `title` is a short pull request title. `summary` is two or three plain sentences for a reviewer: what the hole was and what the change does. Describe the change exactly as your edits make it, naming the same APIs and options the edits use."""
+
+VARIANT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "variants": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "body": {"type": "string"}, "idea": {"type": "string"}},
+                "required": ["path", "body", "idea"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["variants"],
+    "additionalProperties": False,
+}
+
+VARIANT_SYSTEM = """You help verify security patches for OWASP Juice Shop, the operator's own deliberately vulnerable fork. An attack on it was just proven on an isolated copy with no internet access. A patch for it will be tested on that copy.
+
+Write up to 4 other requests that exploit the same weakness through the same endpoint in different ways, so a patch that only blocks the exact payload shown would fail. Use other syntax for the same bug class: other quote or comment styles, other boolean tricks, targeting another known account, or other encodings. Keep the same HTTP method and the same route; you may change the query string. `path` is the full path with query string. `body` is the raw request body, or an empty string when there is none. `idea` is a few words on what the variant tries. Nothing destructive: no requests that delete or modify data."""
+
+MAX_VARIANTS = 4
 
 
 def route_regex(path: str, prefix: bool) -> re.Pattern:
@@ -154,12 +177,24 @@ class Claude:
         self.model = model
 
     def patch(self, prompt: str) -> dict:
+        out = self.ask(SYSTEM, prompt, PATCH_SCHEMA, "high")
+        if out["ok"]:
+            out["patch"] = out.pop("data")
+        return out
+
+    def variants(self, prompt: str) -> dict:
+        out = self.ask(VARIANT_SYSTEM, prompt, VARIANT_SCHEMA, "medium")
+        if out["ok"]:
+            out["variants"] = (out.pop("data") or {}).get("variants") or []
+        return out
+
+    def ask(self, system: str, prompt: str, schema: dict, effort: str) -> dict:
         payload = {
             "model": self.model,
             "max_tokens": 16000,
-            "system": SYSTEM,
+            "system": system,
             "fallbacks": "default",
-            "output_config": {"effort": "high", "format": {"type": "json_schema", "schema": PATCH_SCHEMA}},
+            "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}},
             "messages": [{"role": "user", "content": prompt}],
         }
         headers = {"anthropic-version": ANTHROPIC_VERSION, "anthropic-beta": FALLBACK_BETA}
@@ -174,7 +209,27 @@ class Claude:
             data = json.loads(text)
         except ValueError:
             return {"ok": False, "error": "reply was not JSON", "seconds": round(elapsed, 1)}
-        return {"ok": True, "patch": data, "model": body.get("model"), "usage": body.get("usage", {}), "seconds": round(elapsed, 1)}
+        return {"ok": True, "data": data, "model": body.get("model"), "usage": body.get("usage", {}), "seconds": round(elapsed, 1)}
+
+
+def clean_variants(req: dict, raw: list) -> list:
+    bare = req.get("path", "/").split("?", 1)[0]
+    seen = {(req.get("path"), req.get("body") or "")}
+    out = []
+    for v in raw or []:
+        path, body = str(v.get("path") or ""), str(v.get("body") or "")
+        if not path.startswith("/") or path.split("?", 1)[0] != bare or len(path) > 2000 or len(body) > 4000:
+            continue
+        if (path, body) in seen:
+            continue
+        seen.add((path, body))
+        variant = {"method": req.get("method", "GET"), "path": path, "headers": dict(req.get("headers") or {}), "idea": str(v.get("idea") or "")[:120]}
+        if body or "body" in req:
+            variant["body"] = body
+        out.append(variant)
+        if len(out) >= MAX_VARIANTS:
+            break
+    return out
 
 
 def describe_attack(req: dict, why: str) -> str:
@@ -185,6 +240,20 @@ def describe_attack(req: dict, why: str) -> str:
         lines.append("")
         lines.append(str(req["body"])[:3000])
     return "\n".join(lines) + f"\n\nReplay result: {why}"
+
+
+def variant_table(variants: list, verify: dict) -> list:
+    control = ((verify.get("replay") or {}).get("control")) or {}
+    rows = []
+    for i, v in enumerate(variants):
+        verdicts = {}
+        for stage in ("before", "after"):
+            runs = (verify.get("variants") or {}).get(stage) or []
+            run = runs[i] if i < len(runs) else None
+            verdicts[stage] = interpret(v, {"ok": True, "control": control, **run})["verdict"] if run else "NOT_RUN"
+        shown = v["path"] + (" " + v["body"] if v.get("body") else "")
+        rows.append({"idea": v.get("idea", ""), "request": shown[:300], **verdicts})
+    return rows
 
 
 def branch_prefix(path: str) -> str:
@@ -279,6 +348,8 @@ class Fixer:
         progress("working", f"Calling the carpenter for {path}.")
         base_sha = hashlib.sha256(original["text"].encode()).hexdigest()
         prompt = f"Proven attack:\n{describe_attack(req, why)}\n\nFile `{path}`:\n```ts\n{original['text']}\n```"
+        asked = self.claude.variants(f"Proven attack:\n{describe_attack(req, why)}")
+        variants = clean_variants(req, asked.get("variants") if asked.get("ok") else [])
         feedback = ""
         attempts = []
         for attempt in range(1, self.attempts + 1):
@@ -290,8 +361,8 @@ class Fixer:
             new_text, problem = apply_edits(original["text"], patch.get("edits") or [])
             verify = {}
             if not problem:
-                verify = self.runner_patch({"files": {path: {"content": new_text, "base_sha256": base_sha}}, "request": req, "control": build_control(req)})
-                problem = self.judge(req, verify, control_status)
+                verify = self.runner_patch({"files": {path: {"content": new_text, "base_sha256": base_sha}}, "request": req, "control": build_control(req), "variants": variants})
+                problem = self.judge(req, verify, control_status, variants)
             attempts.append({"attempt": attempt, "problem": problem, "claude_seconds": answer["seconds"], "model": answer.get("model")})
             if not problem:
                 diff = unified_diff(path, original["text"], new_text)
@@ -306,6 +377,7 @@ class Fixer:
                         "build_ms": verify["build"]["ms"],
                         "after": interpret(req, verify["replay"])["verdict"],
                         "smoke": verify["smoke_after"],
+                        "variants": variant_table(variants, verify),
                     },
                 }
                 return self.ship(incident, result, original, new_text, req, why)
@@ -316,12 +388,21 @@ class Fixer:
 
     def known(self, path: str) -> dict:
         prev = self.results.get(path) or {}
-        keep = {k: prev[k] for k in ("file", "title", "summary", "diff", "pr_url") if prev.get(k)}
+        keep = {k: prev[k] for k in ("file", "title", "summary", "diff", "pr_url", "verify") if prev.get(k)}
         if prev.get("pr_url"):
             return dict(keep, status="pr_exists", line=f"Same hole as before. {path} already has a pull request waiting for the owner.")
         return dict(keep, status="ready", line=f"Same hole as before. The patch for {path} is already tested and waiting.")
 
-    def judge(self, req: dict, verify: dict, control_status) -> str:
+    def judge(self, req: dict, verify: dict, control_status, variants: list | None = None) -> str:
+        problem = self.judge_main(req, verify, control_status)
+        if problem:
+            return problem
+        for row in variant_table(variants or [], verify):
+            if row["after"] == PROVEN:
+                return f"a variant of the attack still works after the patch ({row['idea']}): {row['request']}"[:600]
+        return ""
+
+    def judge_main(self, req: dict, verify: dict, control_status) -> str:
         if not verify.get("ok"):
             return f"replay box error at {verify.get('stage')}: {verify.get('error') or verify.get('reset')}"[:600]
         build = verify.get("build") or {}
@@ -389,6 +470,23 @@ On the isolated copy, Bouncer applied this patch, rebuilt the server ({result['v
 | check | status | items |
 |---|---|---|
 {rows}
-
+{self.variant_section(result['verify'].get('variants') or [])}
 Opened by Bouncer. Review before merging.
+"""
+
+    @staticmethod
+    def variant_section(rows: list) -> str:
+        if not rows:
+            return ""
+        label = {PROVEN: "worked", "NOT_RUN": "not run", "MINOR": "minor only", "INCONCLUSIVE": "unclear"}
+        lines = "\n".join(
+            f"| {r['idea'].replace('|', '/')} | `{r['request'][:120].replace('|', '/').replace('`', '')}` | {label.get(r['before'], 'not shown')} | {label.get(r['after'], 'blocked')} |"
+            for r in rows
+        )
+        return f"""
+Other ways into the same hole, written by Claude and tried on the copy before and after the patch:
+
+| idea | request | before | after |
+|---|---|---|---|
+{lines}
 """

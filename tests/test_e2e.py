@@ -158,6 +158,10 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(puts[0]["body"]["branch"].startswith("bouncer/fix-routes-login-ts"))
         prs = [c for c in calls if c["path"].endswith("/pulls")]
         self.assertTrue(any("Attack after the patch: **NOT_REPRODUCED**" in c["body"]["body"] for c in prs))
+        pr_text = next(c["body"]["body"] for c in prs)
+        self.assertIn("| same trick, other comment |", pr_text)
+        self.assertIn("| worked | blocked |", pr_text)
+        self.assertNotIn("other endpoint", pr_text)
         self.assertIn("// VULN", (self.app / "routes" / "login.ts").read_text())
         self.assertEqual((self.app / "build" / "login.mode").read_text(), "vuln")
 

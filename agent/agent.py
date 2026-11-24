@@ -306,6 +306,7 @@ class Brain:
             "file": fix.get("file"),
             "summary": fix.get("summary"),
             "diff": (fix.get("diff") or "")[:6000],
+            "variants": [{k: v.get(k) for k in ("idea", "before", "after")} for v in ((fix.get("verify") or {}).get("variants") or [])],
             "pr_url": url if url.startswith("https://github.com/") else "",
         }
 
@@ -343,7 +344,7 @@ const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
 const t=ts=>new Date(ts*1000).toLocaleTimeString();
 function ev(e){const pct=v=>v==null?'':Math.round(v*100)+'%';return `<div class=ev><span class="tag ${esc(e.decision)}">${esc(e.decision)}</span>${e.verdict?`<span class="tag ${esc(e.verdict)}">${esc(e.verdict)}</span>`:''}<span class=meta>${t(e.ts)} · ${esc(e.ip)}${e.malicious!=null?` · Jev: attack ${pct(e.malicious)}, says ${esc(e.jev_action)} (${pct(e.confidence)} sure)`:''}</span><div><code>${esc(e.method)} ${esc(e.path)}</code></div><p class=line>${esc(e.line)}${e.why?` <span class=meta>(${esc(e.why)})</span>`:''}</p></div>`}
 const colour=d=>esc(d).split('\\n').map(l=>l.startsWith('+')&&!l.startsWith('+++')?`<span class=add>${l}</span>`:l.startsWith('-')&&!l.startsWith('---')?`<span class=del>${l}</span>`:l).join('\\n');
-function fx(f){if(!f)return '';return `<p class=line><span class="tag ${esc((f.status||'').toUpperCase())}">fix: ${esc(f.status)}</span>${esc(f.line)}${f.pr_url?` <a href="${esc(f.pr_url)}" target=_blank rel=noopener>pull request</a>`:''}</p>${f.summary?`<p class="line meta">${esc(f.summary)}</p>`:''}${f.diff?`<details><summary class=meta>patch for ${esc(f.file)}</summary><pre>${colour(f.diff)}</pre></details>`:''}`}
+function fx(f){if(!f)return '';return `<p class=line><span class="tag ${esc((f.status||'').toUpperCase())}">fix: ${esc(f.status)}</span>${esc(f.line)}${f.pr_url?` <a href="${esc(f.pr_url)}" target=_blank rel=noopener>pull request</a>`:''}</p>${f.summary?`<p class="line meta">${esc(f.summary)}</p>`:''}${f.diff?`<details><summary class=meta>patch for ${esc(f.file)}</summary><pre>${colour(f.diff)}</pre></details>`:''}${(f.variants||[]).length?`<details><summary class=meta>${f.variants.length} other ways in, tried before and after</summary>${f.variants.map(v=>`<p class="line meta"><span class="tag ${v.before==='PROVEN'?'PROVEN':''}">${v.before==='PROVEN'?'worked':'not shown'}</span> &rarr; <span class="tag ${v.after==='PROVEN'?'PROVEN':'READY'}">${v.after==='PROVEN'?'still works':'blocked'}</span> ${esc(v.idea)}</p>`).join('')}</details>`:''}`}
 const feed=document.getElementById('feed');
 function render(s){const st=s.stats||{};document.getElementById('stats').innerHTML=[['events','seen'],['prefiltered','waved through'],['replay','replayed'],['block','bounced'],['tarpit','slow-laned'],['refused','refused at door']].map(([k,l])=>`<div><b>${st[k]||0}</b>${l}</div>`).join('');
 document.getElementById('shame').innerHTML=(s.shame||[]).map(x=>`<div class=ev><code>${esc(x.path)}</code><p class=line>${esc(x.caption)}</p></div>`).join('')||'<p class=meta>Nobody embarrassing yet.</p>';
