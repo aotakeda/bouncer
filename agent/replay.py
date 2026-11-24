@@ -104,6 +104,8 @@ def interpret(req: dict, result: dict) -> dict:
         "canaries_leaked": len(leaked),
         "reset_ms": (result.get("reset") or {}).get("ms"),
     }
+    if not attack.get("status"):
+        return _outcome(Verdict.ERROR, f"target did not answer: {attack.get('error') or 'status 0'}", evidence)
     if major or leaked:
         return _outcome(Verdict.PROVEN, "; ".join(_proven_reasons(major, leaked)), evidence)
     if solved:

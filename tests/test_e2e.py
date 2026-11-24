@@ -116,6 +116,7 @@ class EndToEnd(unittest.TestCase):
         self.fail(f"expected {expected} decisions, got {len(rows)}: {rows}")
 
     def test_flow(self):
+        before = len(self.decisions(0))
         sqli = {"email": "' or 1=1--", "password": "x"}
         self.assertEqual(call(self.door + "/", "1.1.1.1")[0], 200)
         call(self.door + "/wp-login.php", "2.2.2.2", ua="Mozilla/5.0 zgrab/0.x")
@@ -123,7 +124,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("CANARY-honey-77", call(self.door + "/.env", "4.4.4.4")[1])
         call(self.door + "/rest/user/login", "5.5.5.5", "POST", {"email": "admin@juice-sh.op", "password": "CANARY-honey-77"})
         call(self.door + "/rest/user/login", OWNER, "POST", sqli)
-        rows = self.decisions(7)
+        rows = self.decisions(before + 7)[before:]
         by_ip: dict = {}
         for r in rows:
             by_ip.setdefault(r["ip"], []).append(r)
@@ -161,7 +162,8 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any("Attack after the patch: **NOT_REPRODUCED**" in c["body"]["body"] for c in prs))
         pr_text = next(c["body"]["body"] for c in prs)
         self.assertIn("| same trick, other comment |", pr_text)
-        self.assertIn("| worked | blocked |", pr_text)
+        self.assertIn("| target admin by email |", pr_text)
+        self.assertEqual(pr_text.count("| worked | blocked |"), 2)
         self.assertNotIn("other endpoint", pr_text)
         self.assertIn("// VULN", (self.app / "routes" / "login.ts").read_text())
         self.assertEqual((self.app / "build" / "login.mode").read_text(), "vuln")
@@ -178,12 +180,13 @@ class EndToEnd(unittest.TestCase):
 
     def test_owner_can_ask_to_be_treated_as_a_stranger(self):
         stranger = {"X-Bouncer-Stranger": "1"}
+        prior = sum(1 for r in self.decisions(0) if r["ip"] == "owner-as-stranger" and r["decision"] == "block")
         call(self.door + "/rest/user/login", OWNER, "POST", {"email": "' or 1=1-- demo", "password": "x"}, ua="sqlmap/1.8", extra=stranger)
         deadline = time.time() + 20
         rows = []
-        while time.time() < deadline and not any(r["decision"] == "block" for r in rows):
+        while time.time() < deadline and sum(1 for r in rows if r["decision"] == "block") <= prior:
             time.sleep(0.2)
-            rows = [r for r in self.decisions(1) if r["ip"] == "owner-as-stranger"]
+            rows = [r for r in self.decisions(0) if r["ip"] == "owner-as-stranger"]
         self.assertEqual(rows[-1]["decision"], "block")
         self.assertEqual(call(self.door + "/", OWNER, extra=stranger)[0], 403)
         self.assertEqual(call(self.door + "/", OWNER)[0], 200)
@@ -205,12 +208,87 @@ class EndToEnd(unittest.TestCase):
 
     def test_dashboard_needs_passphrase(self):
         agent = f"http://127.0.0.1:{self.p['agent']}"
-        with urllib.request.urlopen(agent + "/api/state") as r:
+        with urllib.request.urlopen(agent + "/") as r:
             self.assertIn(b"password", r.read())
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(agent + "/api/state")
+        self.assertEqual(ctx.exception.code, 401)
         req = urllib.request.Request(agent + "/events", data=b'{"events":[]}', method="POST")
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(req)
         self.assertEqual(ctx.exception.code, 404)
+
+    def test_dashboard_can_view_and_unblock_ips(self):
+        agent = f"http://127.0.0.1:{self.p['agent']}"
+        stranger = {"X-Bouncer-Stranger": "1"}
+        call(self.door + "/rest/user/login", OWNER, "POST", {"email": "' or 1=1-- dash-unblock", "password": "x"}, ua="sqlmap/1.8", extra=stranger)
+        deadline = time.time() + 20
+        while time.time() < deadline and call(self.door + "/", OWNER, extra=stranger)[0] != 403:
+            time.sleep(0.2)
+        self.assertEqual(call(self.door + "/", OWNER, extra=stranger)[0], 403)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        login_req = urllib.request.Request(agent + "/login", data=b"passphrase=let+me+in", method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            opener.open(login_req)
+            self.fail("expected 303 redirect on login")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 303)
+            cookie = e.headers.get("Set-Cookie", "").split(";", 1)[0]
+        self.assertTrue(cookie.startswith("bouncer="))
+
+        state_req = urllib.request.Request(agent + "/api/state", headers={"Cookie": cookie})
+        with urllib.request.urlopen(state_req) as r:
+            state = json.loads(r.read())
+        self.assertTrue(any(x["ip"] == "owner-as-stranger" and x["kind"] == "block" for x in state["lists"]))
+
+        bad_ctype = urllib.request.Request(agent + "/api/unblock", data=b"ip=owner-as-stranger", method="POST", headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(bad_ctype)
+        self.assertEqual(ctx.exception.code, 415)
+
+        unblock_req = urllib.request.Request(agent + "/api/unblock", data=json.dumps({"ip": "owner-as-stranger"}).encode(), method="POST", headers={"Cookie": cookie, "Content-Type": "application/json"})
+        with urllib.request.urlopen(unblock_req) as r:
+            self.assertTrue(json.loads(r.read())["ok"])
+        self.assertEqual(call(self.door + "/", OWNER, extra=stranger)[0], 200)
+
+    def test_door_rejects_bad_length_and_decodes_chunked(self):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.p["door"], timeout=5)
+        conn.putrequest("POST", "/rest/user/login")
+        conn.putheader("Content-Length", "not-a-number")
+        conn.endheaders()
+        self.assertEqual(conn.getresponse().status, 400)
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.p["door"], timeout=5)
+        conn.putrequest("POST", "/rest/user/login")
+        conn.putheader("Content-Length", str(5 * 1024 * 1024))
+        conn.endheaders()
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
+
+        payload = json.dumps({"email": "admin@juice-sh.op", "password": "CANARY-honey-77"}).encode()
+        chunked = f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
+        conn = http.client.HTTPConnection("127.0.0.1", self.p["door"], timeout=5)
+        conn.putrequest("POST", "/rest/user/login")
+        conn.putheader("Sprite-Client-Ip", "9.8.7.6")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.endheaders()
+        conn.send(chunked)
+        self.assertEqual(conn.getresponse().status, 401)
+        conn.close()
+
+        deadline = time.time() + 15
+        while time.time() < deadline and call(self.door + "/", "9.8.7.6")[0] != 403:
+            time.sleep(0.2)
+        self.assertEqual(call(self.door + "/", "9.8.7.6")[0], 403)
 
 
 if __name__ == "__main__":

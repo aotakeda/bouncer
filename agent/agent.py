@@ -35,6 +35,8 @@ KEPT_INCIDENTS = 20
 TSV_TIME = "%Y-%m-%dT%H:%M:%SZ"
 KEPT_SHAME = 200
 KEPT_VISITS = 200
+KEPT_IPS = 2000
+MAX_BODY = 4 * 1024 * 1024
 SAVE_SECONDS = 30
 UNFINISHED_FIX = (FixStatus.QUEUED, FixStatus.WORKING)
 INTERRUPTED_LINE = "Fix was cut short by a restart. The next proven attack on this hole starts it again."
@@ -43,6 +45,14 @@ TEXT = "text/plain"
 HTML = "text/html; charset=utf-8"
 JSON = "application/json"
 COOKIE_NAME = "bouncer"
+
+
+class BadRequest(Exception):
+    pass
+
+
+class PayloadTooLarge(Exception):
+    pass
 
 
 class Config:
@@ -173,8 +183,10 @@ class Brain:
         self.incidents: list = []
         self.incidents_path = cfg.data_dir / "incidents.json"
         self.counters_path = cfg.data_dir / "counters.json"
+        self.state_lock = threading.RLock()
         self.save_lock = threading.Lock()
         self.counters_saved = 0.0
+        self._lists_cache: tuple[float, dict] = (0.0, {"block": {}, "tarpit": {}})
         self._restore_feed()
         self._restore_incidents()
         self._restore_counters()
@@ -236,31 +248,38 @@ class Brain:
         self.honeypot_visits.update(visits)
 
     def _counters(self) -> dict:
-        visits = sorted(self.honeypot_visits.items(), key=lambda kv: kv[1])[-KEPT_VISITS:]
-        return {"stats": dict(self.stats), "shame": dict(self.shame.most_common(KEPT_SHAME)), "honeypot_visits": dict(visits)}
+        with self.state_lock:
+            visits = sorted(self.honeypot_visits.items(), key=lambda kv: kv[1])[-KEPT_VISITS:]
+            return {"stats": dict(self.stats), "shame": dict(self.shame.most_common(KEPT_SHAME)), "honeypot_visits": dict(visits)}
 
-    def _write_json(self, path: Path, build) -> None:
+    def _incidents_snapshot(self) -> list:
+        with self.state_lock:
+            return [dict(i, fix=dict(i["fix"]) if isinstance(i.get("fix"), dict) else i.get("fix")) for i in self.incidents[-KEPT_INCIDENTS:]]
+
+    def _write_json(self, path: Path, data) -> None:
         with self.save_lock:
             try:
                 tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(build(), default=str))
+                tmp.write_text(json.dumps(data, default=str))
                 tmp.replace(path)
             except Exception:
-                self.stats["save_failed"] += 1
+                with self.state_lock:
+                    self.stats["save_failed"] += 1
 
     def _save_incidents(self):
-        self._write_json(self.incidents_path, lambda: self.incidents[-KEPT_INCIDENTS:])
+        self._write_json(self.incidents_path, self._incidents_snapshot())
 
     def _save_counters(self):
         self.counters_saved = time.time()
-        self._write_json(self.counters_path, self._counters)
+        self._write_json(self.counters_path, self._counters())
 
     def submit(self, events: list):
         for e in events:
             try:
                 self.inbox.put_nowait(e)
             except queue.Full:
-                self.stats["dropped"] += 1
+                with self.state_lock:
+                    self.stats["dropped"] += 1
 
     def _work(self):
         while True:
@@ -277,15 +296,18 @@ class Brain:
                 self._save_counters()
 
     def history(self, ip: str) -> str:
-        items = self.per_ip.get(ip, [])[-5:]
+        with self.state_lock:
+            items = list(self.per_ip.get(ip, [])[-5:])
         return "; ".join(f"{d['method']} {d['path'][:80]} -> {d['decision']}" for d in items)
 
     def handle(self, event: dict):
-        self.stats["events"] += 1
+        with self.state_lock:
+            self.stats["events"] += 1
         record = self._record(event)
         kind = record["kind"]
         if kind in COUNTED_ONLY_KINDS:
-            self.stats[kind] += 1
+            with self.state_lock:
+                self.stats[kind] += 1
             return
         self.kind_handlers.get(kind, self._on_request)(event, record)
 
@@ -301,8 +323,9 @@ class Brain:
         }
 
     def _on_honeypot(self, event: dict, record: dict):
-        self.honeypot_visits[record["ip"]] = record["ts"]
-        self.shame[record["path"]] += 1
+        with self.state_lock:
+            self.honeypot_visits[record["ip"]] = record["ts"]
+            self.shame[record["path"]] += 1
         self._list_and_decide(record, Decision.TARPIT, "took the honeypot .env", persona.line("honeypot", record["path"]))
 
     def _on_canary_reuse(self, event: dict, record: dict):
@@ -310,21 +333,25 @@ class Brain:
         self._list_and_decide(record, Decision.BLOCK, "reused honeypot credentials", line)
 
     def _honeypot_story(self, ip: str) -> str:
-        if ip in self.honeypot_visits:
-            return f" Keys were taken from the fake .env by this same client at {utc_clock(self.honeypot_visits[ip])} UTC."
-        if not self.honeypot_visits:
-            return ""
-        origin_ip, origin_ts = max(self.honeypot_visits.items(), key=lambda kv: kv[1])
+        with self.state_lock:
+            if ip in self.honeypot_visits:
+                ts = self.honeypot_visits[ip]
+                return f" Keys were taken from the fake .env by this same client at {utc_clock(ts)} UTC."
+            if not self.honeypot_visits:
+                return ""
+            origin_ip, origin_ts = max(self.honeypot_visits.items(), key=lambda kv: kv[1])
         return f" Keys were last taken from the fake .env by {self.mask(origin_ip)} at {utc_clock(origin_ts)} UTC."
 
     def _on_request(self, event: dict, record: dict):
         screening = self.policy.screen(event, record["ip"], record["ts"])
         if screening.skipped:
-            self.stats[screening.skipped] += 1
+            with self.state_lock:
+                self.stats[screening.skipped] += 1
             return
         signals = screening.signals
         if signals.probe:
-            self.shame[bare_path(record["path"])] += 1
+            with self.state_lock:
+                self.shame[bare_path(record["path"])] += 1
         triage = self._triage(event, record["ip"])
         record["jev"] = triage
         decision = self.policy.choose(triage, signals)
@@ -357,10 +384,18 @@ class Brain:
         ip, result = record["ip"], record["replay"]
         self.set_list(Decision.BLOCK, ip, "proven exploit: " + result["why"][:120])
         incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result}
-        self.incidents.append(incident)
+        if self.fixer:
+            incident["fix"] = queued_fix(FixStatus.QUEUED)
+        with self.state_lock:
+            self.incidents.append(incident)
+            if len(self.incidents) > KEPT_INCIDENTS:
+                self.incidents = self.incidents[-KEPT_INCIDENTS:]
         self.decide(record, Decision.BLOCK, line=persona.line("proven", record["path"]))
         if self.fixer:
-            incident["fix"] = queued_fix(self.fixer.submit(incident, self.fix_report))
+            status = self.fixer.submit(incident, self.fix_report)
+            if status != FixStatus.QUEUED:
+                with self.state_lock:
+                    incident["fix"] = queued_fix(status)
         self._save_incidents()
 
     def _on_not_reproduced(self, event: dict, record: dict, triage: dict):
@@ -385,7 +420,8 @@ class Brain:
         return self.cfg.block_seconds if kind == Decision.BLOCK else self.cfg.tarpit_seconds
 
     def fix_report(self, incident: dict, fix: dict):
-        incident["fix"] = fix
+        with self.state_lock:
+            incident["fix"] = fix
         self._save_incidents()
         event = incident["event"]
         record = {"ts": time.time(), "ip": incident["ip"], "method": event.get("method"), "path": event.get("path", ""), "kind": EventKind.FIX}
@@ -396,7 +432,20 @@ class Brain:
         if self.is_owner(ip) or not self.door.enabled:
             return False
         ok = self.door.put(kind, ip, self.list_seconds(kind), reason)
-        self.stats[f"{kind}_sent" if ok else f"{kind}_failed"] += 1
+        with self.state_lock:
+            self.stats[f"{kind}_sent" if ok else f"{kind}_failed"] += 1
+            if ok:
+                self._lists_cache = (0.0, {"block": {}, "tarpit": {}})
+        return ok
+
+    def unblock(self, ip: str) -> bool:
+        if not self.door.enabled or not ip:
+            return False
+        ok = self.door.unblock(ip)
+        if ok:
+            with self.state_lock:
+                self.stats["unblocked"] += 1
+                self._lists_cache = (0.0, {"block": {}, "tarpit": {}})
         return ok
 
     def is_owner(self, ip: str | None) -> bool:
@@ -410,13 +459,16 @@ class Brain:
             line = f"That's you, boss. Anyone else gets a {decision} here. ({line})"
             decision = decision.for_owner()
         record = {**record, "decision": decision, "line": line}
-        self.stats[decision] += 1
-        self._remember(record)
+        with self.state_lock:
+            self.stats[decision] += 1
+            self._remember(record)
         self.log.write(record)
         self.emit(record)
 
     def _remember(self, record: dict):
         ip = record["ip"]
+        if ip not in self.per_ip and len(self.per_ip) >= KEPT_IPS:
+            self.per_ip.pop(next(iter(self.per_ip)))
         self.per_ip[ip] = (self.per_ip.get(ip, []) + [record])[-20:]
 
     def public_view(self, r: dict) -> dict:
@@ -448,12 +500,44 @@ class Brain:
             "fix": fix_view(incident.get("fix")),
         }
 
-    def state(self) -> dict:
+    def _door_snapshot(self) -> dict:
+        now = time.time()
+        with self.state_lock:
+            cached_at, snap = self._lists_cache
+            if cached_at and now - cached_at < 3.0:
+                return snap
+        fresh = self.door.snapshot(timeout=3)
+        with self.state_lock:
+            self._lists_cache = (time.time(), fresh)
+        return fresh
+
+    def active_lists(self, viewer_ip: str = "") -> list:
+        snap = self._door_snapshot()
+        now = time.time()
+        rows = []
+        for kind in ("block", "tarpit"):
+            for ip, entry in (snap.get(kind) or {}).items():
+                rows.append({
+                    "kind": kind,
+                    "ip": ip,
+                    "label": self.mask(ip),
+                    "yours": bool(viewer_ip and ip == viewer_ip),
+                    "left": max(0, int(entry.get("until", 0) - now)),
+                    "reason": str(entry.get("reason", ""))[:120],
+                })
+        return rows
+
+    def state(self, viewer_ip: str = "") -> dict:
+        with self.state_lock:
+            stats = dict(self.stats)
+            shame = [{"path": p, "count": c, "caption": persona.shame_caption(p, c)} for p, c in self.shame.most_common(10)]
+            incidents = [self.incident_view(i) for i in self.incidents[-KEPT_INCIDENTS:]]
         return {
-            "stats": dict(self.stats),
+            "stats": stats,
             "recent": self.feed.latest(100),
-            "shame": [{"path": p, "count": c, "caption": persona.shame_caption(p, c)} for p, c in self.shame.most_common(10)],
-            "incidents": [self.incident_view(i) for i in self.incidents[-KEPT_INCIDENTS:]],
+            "shame": shame,
+            "incidents": incidents,
+            "lists": self.active_lists(viewer_ip),
         }
 
 DASHBOARD = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -467,25 +551,36 @@ main{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px;max-width:
 .stats{display:flex;gap:18px;flex-wrap:wrap;color:var(--mute)}.stats b{color:var(--fg);font-size:18px;display:block}
 .ev{border-top:1px solid var(--line);padding:10px 0}.ev:first-child{border-top:0}
 .tag{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;margin-right:6px;background:var(--line)}
-.block{background:var(--red);color:#000}.tarpit{background:var(--amber);color:#000}.replay{background:var(--blue);color:#000}.ignore{background:#2a2a33}.watch{background:#3a3a46}.would_block,.would_tarpit{background:#3a3a46;outline:1px dashed var(--red)}
-.PROVEN{background:var(--red);color:#000}.fix,.READY,.PR_OPENED,.PR_EXISTS{background:var(--green);color:#000}.FAILED,.PR_FAILED,.RATE_LIMITED{background:var(--amber);color:#000}
+.block{background:var(--red);color:#000}.tarpit{background:var(--amber);color:#000}.replay,.QUEUED,.WORKING{background:var(--blue);color:#000}.ignore{background:#2a2a33}.watch,.MINOR,.INCONCLUSIVE{background:#3a3a46}.would_block,.would_tarpit{background:#3a3a46;outline:1px dashed var(--red)}
+.PROVEN,.ERROR{background:var(--red);color:#000}.fix,.READY,.PR_OPENED,.PR_EXISTS{background:var(--green);color:#000}.FAILED,.PR_FAILED,.RATE_LIMITED,.INTERRUPTED{background:var(--amber);color:#000}
 pre{font:12px/1.4 ui-monospace,monospace;background:#0b0b0f;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:360px}.add{color:var(--green)}.del{color:var(--red)}a{color:var(--blue)}.NOT_REPRODUCED{background:var(--green);color:#000}
 code{font:12px ui-monospace,monospace;color:var(--mute);word-break:break-all}.line{margin:4px 0 0}.meta{color:var(--mute);font-size:12px}
-</style></head><body><header><h1>Bouncer</h1><span class=meta>Personal security agent at the door of a deliberately vulnerable OWASP Juice Shop</span></header>
+button.btn{font:12px inherit;padding:3px 9px;border-radius:6px;border:1px solid var(--line);background:#26262f;color:var(--fg);cursor:pointer;float:right}button.btn:hover{border-color:var(--blue)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;vertical-align:middle}.dot.off{background:var(--amber)}
+</style></head><body><header><h1>Bouncer</h1><span class=meta>Personal security agent at the door of a deliberately vulnerable OWASP Juice Shop</span><span class=meta style="margin-left:auto"><span class=dot id=dot></span><span id=conn>live</span></span></header>
 <main><section class=card><h2>Tonight at the door</h2><div class=stats id=stats></div><div id=feed></div></section>
-<aside><div class="card"><h2>Wall of shame</h2><div id=shame></div></div><div class="card" style="margin-top:16px"><h2>Proven break-ins</h2><div id=inc></div></div></aside></main>
+<aside><div class="card"><h2>On the list</h2><div id=lists></div></div><div class="card" style="margin-top:16px"><h2>Wall of shame</h2><div id=shame></div></div><div class="card" style="margin-top:16px"><h2>Proven break-ins</h2><div id=inc></div></div></aside></main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const t=ts=>new Date(ts*1000).toLocaleTimeString();
 function ev(e){const pct=v=>v==null?'':Math.round(v*100)+'%';return `<div class=ev><span class="tag ${esc(e.decision)}">${esc(e.decision)}</span>${e.verdict?`<span class="tag ${esc(e.verdict)}">${esc(e.verdict)}</span>`:''}<span class=meta>${t(e.ts)} · ${esc(e.ip)}${e.malicious!=null?` · Jev: attack ${pct(e.malicious)}, says ${esc(e.jev_action)} (${pct(e.confidence)} sure)`:''}</span><div><code>${esc(e.method)} ${esc(e.path)}</code></div><p class=line>${esc(e.line)}${e.why?` <span class=meta>(${esc(e.why)})</span>`:''}</p></div>`}
 const colour=d=>esc(d).split('\\n').map(l=>l.startsWith('+')&&!l.startsWith('+++')?`<span class=add>${l}</span>`:l.startsWith('-')&&!l.startsWith('---')?`<span class=del>${l}</span>`:l).join('\\n');
-function fx(f){if(!f)return '';return `<p class=line><span class="tag ${esc((f.status||'').toUpperCase())}">fix: ${esc(f.status)}</span>${esc(f.line)}${f.pr_url?` <a href="${esc(f.pr_url)}" target=_blank rel=noopener>pull request</a>`:''}</p>${f.summary?`<p class="line meta">${esc(f.summary)}</p>`:''}${f.diff?`<details><summary class=meta>patch for ${esc(f.file)}</summary><pre>${colour(f.diff)}</pre></details>`:''}${(f.variants||[]).length?`<details><summary class=meta>${f.variants.length} other ways in, tried before and after</summary>${f.variants.map(v=>`<p class="line meta"><span class="tag ${v.before==='PROVEN'?'PROVEN':''}">${v.before==='PROVEN'?'worked':'not shown'}</span> &rarr; <span class="tag ${v.after==='PROVEN'?'PROVEN':'READY'}">${v.after==='PROVEN'?'still works':'blocked'}</span> ${esc(v.idea)}</p>`).join('')}</details>`:''}`}
-const feed=document.getElementById('feed');
+const afterTag=v=>v.after==='PROVEN'?['PROVEN','still works']:v.after==='ERROR'?['ERROR','error']:v.after==='NOT_RUN'?['','not run']:['READY','blocked'];
+function fx(f){if(!f)return '';return `<p class=line><span class="tag ${esc((f.status||'').toUpperCase())}">fix: ${esc(f.status)}</span>${esc(f.line)}${f.pr_url?` <a href="${esc(f.pr_url)}" target=_blank rel=noopener>pull request</a>`:''}</p>${f.summary?`<p class="line meta">${esc(f.summary)}</p>`:''}${f.diff?`<details><summary class=meta>patch for ${esc(f.file)}</summary><pre>${colour(f.diff)}</pre></details>`:''}${(f.variants||[]).length?`<details><summary class=meta>${f.variants.length} other ways in, tried before and after</summary>${f.variants.map(v=>{const [cls,lbl]=afterTag(v);return `<p class="line meta"><span class="tag ${v.before==='PROVEN'?'PROVEN':''}">${v.before==='PROVEN'?'worked':'not shown'}</span> &rarr; <span class="tag ${cls}">${lbl}</span> ${esc(v.idea)}</p>`}).join('')}</details>`:''}`}
+const feed=document.getElementById('feed'),dot=document.getElementById('dot'),conn=document.getElementById('conn');
+let lastShame='',lastInc='',lastLists='';
+async function unblock(ip){const r=await fetch('api/unblock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});if(r.status===401)return location.reload();sync()}
 function render(s){const st=s.stats||{};document.getElementById('stats').innerHTML=[['events','seen'],['prefiltered','waved through'],['replay','replayed'],['block','bounced'],['tarpit','slow-laned'],['refused','refused at door']].map(([k,l])=>`<div><b>${st[k]||0}</b>${l}</div>`).join('');
-document.getElementById('shame').innerHTML=(s.shame||[]).map(x=>`<div class=ev><code>${esc(x.path)}</code><p class=line>${esc(x.caption)}</p></div>`).join('')||'<p class=meta>Nobody embarrassing yet.</p>';
-document.getElementById('inc').innerHTML=(s.incidents||[]).map(x=>`<div class=ev><span class=meta>${t(x.ts)} · ${esc(x.ip)}</span><div><code>${esc(x.path)}</code></div><p class=line>${esc(x.why)}</p>${fx(x.fix)}</div>`).join('')||'<p class=meta>No proven break-ins.</p>'}
-fetch('api/state').then(r=>r.json()).then(s=>{render(s);feed.innerHTML=(s.recent||[]).slice().reverse().map(ev).join('')});
-const es=new EventSource('stream');es.onmessage=m=>{feed.insertAdjacentHTML('afterbegin',ev(JSON.parse(m.data)));fetch('api/state').then(r=>r.json()).then(render)};
+const listsKey=JSON.stringify(s.lists||[]);if(listsKey!==lastLists){lastLists=listsKey;document.getElementById('lists').innerHTML=(s.lists||[]).map(x=>`<div class=ev><button class=btn data-ip="${esc(x.ip)}">Unblock</button><span class="tag ${esc(x.kind)}">${esc(x.kind)}</span><code>${esc(x.label)}</code>${x.yours?' <span class=meta>(you)</span>':''}<div class=meta>${x.left}s left · ${esc(x.reason)}</div></div>`).join('')||'<p class=meta>Door is open. Nobody blocked.</p>';document.querySelectorAll('#lists button[data-ip]').forEach(b=>b.onclick=()=>unblock(b.dataset.ip))}
+const shameKey=JSON.stringify(s.shame||[]);if(shameKey!==lastShame){lastShame=shameKey;document.getElementById('shame').innerHTML=(s.shame||[]).map(x=>`<div class=ev><code>${esc(x.path)}</code><p class=line>${esc(x.caption)}</p></div>`).join('')||'<p class=meta>Nobody embarrassing yet.</p>'}
+const incKey=JSON.stringify(s.incidents||[]);if(incKey!==lastInc){lastInc=incKey;document.getElementById('inc').innerHTML=(s.incidents||[]).map(x=>`<div class=ev><span class=meta>${t(x.ts)} · ${esc(x.ip)}</span><div><code>${esc(x.path)}</code></div><p class=line>${esc(x.why)}</p>${fx(x.fix)}</div>`).join('')||'<p class=meta>No proven break-ins.</p>'}}
+async function sync(init=false){const r=await fetch('api/state');if(r.status===401)return location.reload();const s=await r.json();render(s);if(init)feed.innerHTML=(s.recent||[]).slice().reverse().map(ev).join('')}
+sync(true);
+const es=new EventSource('stream');
+let wasOff=false;
+es.onopen=()=>{dot.className='dot';conn.textContent='live';if(wasOff){wasOff=false;sync(true)}};
+es.onerror=()=>{wasOff=true;dot.className='dot off';conn.textContent='reconnecting...'};
+es.onmessage=m=>{feed.insertAdjacentHTML('afterbegin',ev(JSON.parse(m.data)));while(feed.children.length>150)feed.lastElementChild.remove();sync()};
 </script></body></html>"""
 
 LOGIN = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Bouncer</title>
@@ -534,16 +629,32 @@ def make_handler(brain: Brain):
             cookies = dict(p.strip().split("=", 1) for p in self.headers.get("Cookie", "").split(";") if "=" in p)
             return hmac.compare_digest(cookies.get(COOKIE_NAME, ""), cookie_value())
 
+        def client_ip(self) -> str:
+            return self.headers.get("Sprite-Client-Ip") or self.client_address[0]
+
         def body(self) -> bytes:
-            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.headers.get("Content-Length")
+            if not raw:
+                return b""
+            try:
+                n = int(raw)
+            except ValueError as exc:
+                raise BadRequest("invalid Content-Length") from exc
+            if n < 0:
+                raise BadRequest("negative Content-Length")
+            if n > MAX_BODY:
+                raise PayloadTooLarge("body too large")
             return self.rfile.read(n) if n > 0 else b""
 
         def post_events(self, data: bytes):
             if not self.bearer_ok(cfg.events_sha256):
                 return self.reply(*not_found)
             try:
-                events = json.loads(data).get("events", [])
-            except (ValueError, AttributeError):
+                payload = json.loads(data)
+                events = payload.get("events", []) if isinstance(payload, dict) else None
+            except ValueError:
+                return self.reply(400, b"bad json", TEXT)
+            if not isinstance(events, list):
                 return self.reply(400, b"bad json", TEXT)
             brain.submit(events)
             return self.reply(202, json.dumps({"accepted": len(events)}).encode(), JSON)
@@ -556,6 +667,25 @@ def make_handler(brain: Brain):
             time.sleep(1)
             return self.reply(401, LOGIN.encode(), HTML)
 
+        def post_unblock(self, data: bytes):
+            if not self.dash_ok():
+                return self.reply(401, b"unauthorized", TEXT)
+            if "application/json" not in self.headers.get("Content-Type", "").lower():
+                return self.reply(415, b"expected application/json", TEXT)
+            try:
+                payload = json.loads(data or b"{}")
+            except ValueError:
+                return self.reply(400, b"bad json", TEXT)
+            if not isinstance(payload, dict):
+                return self.reply(400, b"bad json", TEXT)
+            ip = payload.get("ip")
+            if not ip or ip == "self":
+                ip = self.client_ip()
+            if not isinstance(ip, str) or any(c.isspace() or c == "/" for c in ip):
+                return self.reply(400, b"bad ip", TEXT)
+            ok = brain.unblock(ip)
+            return self.reply(200, json.dumps({"ok": ok, "ip": ip}).encode(), JSON)
+
         def healthz(self):
             return self.reply(200, b"ok", TEXT)
 
@@ -566,7 +696,7 @@ def make_handler(brain: Brain):
             return self.reply(200, DASHBOARD.encode(), HTML)
 
         def api_state(self):
-            return self.reply(200, json.dumps(brain.state()).encode(), JSON)
+            return self.reply(200, json.dumps(brain.state(self.client_ip())).encode(), JSON)
 
         def stream(self):
             q = brain.feed.subscribe()
@@ -594,11 +724,18 @@ def make_handler(brain: Brain):
 
         PUBLIC_GET_ROUTES = {"/healthz": healthz}
         PRIVATE_GET_ROUTES = {"/": dashboard, "/api/state": api_state, "/stream": stream}
-        POST_ROUTES = {"/events": post_events, "/login": post_login}
+        POST_ROUTES = {"/events": post_events, "/login": post_login, "/api/unblock": post_unblock}
 
         def do_POST(self):
-            data = self.body()
-            route = self.POST_ROUTES.get(self.path)
+            try:
+                data = self.body()
+            except BadRequest:
+                self.close_connection = True
+                return self.reply(400, b"bad request", TEXT)
+            except PayloadTooLarge:
+                self.close_connection = True
+                return self.reply(413, b"payload too large", TEXT)
+            route = self.POST_ROUTES.get(bare_path(self.path))
             if not route:
                 return self.reply(*not_found)
             return route(self, data)
@@ -609,7 +746,11 @@ def make_handler(brain: Brain):
             if public:
                 return public(self)
             if not self.dash_ok():
-                return self.login_page()
+                if path == "/":
+                    return self.login_page()
+                if path in self.PRIVATE_GET_ROUTES:
+                    return self.reply(401, b"unauthorized", TEXT)
+                return self.reply(*not_found)
             route = self.PRIVATE_GET_ROUTES.get(path)
             if not route:
                 return self.reply(*not_found)

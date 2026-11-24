@@ -81,7 +81,8 @@ def juice_handler(state: Juice):
                 md5 = hashlib.md5(str(body.get("password", "")).encode()).hexdigest()
                 if any(u["email"] == body.get("email") and u["md5"] == md5 for u in state.users):
                     return self.out(200, {"authentication": {"token": "fake-user-token"}})
-                if "' or 1=1" in str(body.get("email", "")) and not state.fixed["login"]:
+                email = str(body.get("email", ""))
+                if ("' or 1=1" in email or "admin@juice-sh.op'--" in email) and not state.fixed["login"]:
                     state.solved.add("loginAdminChallenge")
                     return self.out(200, {"authentication": {"token": "fake-admin-token"}})
                 return self.out(401, {"error": "Invalid email or password."})

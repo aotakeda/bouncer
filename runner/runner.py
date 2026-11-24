@@ -38,6 +38,11 @@ JSON_HEADERS = {"Content-Type": "application/json"}
 POLL_SECONDS = 0.25
 ERROR_CHARS = 300
 MAX_VARIANTS = 4
+MAX_BODY = 4 * 1024 * 1024
+
+
+class PayloadTooLarge(Exception):
+    pass
 
 
 def elapsed_ms(started: float) -> int:
@@ -169,6 +174,7 @@ class Runner:
         self.target = Target(cfg)
         self.lock = threading.Lock()
         self.canary = empty_canary()
+        self.recover_staged()
 
     @property
     def build_path(self) -> Path:
@@ -177,6 +183,27 @@ class Runner:
     @property
     def backup_path(self) -> Path:
         return self.cfg.app_dir / (self.cfg.build_dir + ".bouncer-bak")
+
+    @property
+    def src_backup_path(self) -> Path:
+        return self.cfg.app_dir / ".bouncer-src-bak"
+
+    def recover_staged(self) -> bool:
+        recovered = False
+        if self.src_backup_path.is_dir():
+            for saved in self.src_backup_path.rglob("*"):
+                if saved.is_file():
+                    rel = saved.relative_to(self.src_backup_path)
+                    dest = self.cfg.app_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(saved.read_bytes())
+                    recovered = True
+            shutil.rmtree(self.src_backup_path, ignore_errors=True)
+        if self.backup_path.exists():
+            shutil.rmtree(self.build_path, ignore_errors=True)
+            self.backup_path.rename(self.build_path)
+            recovered = True
+        return recovered
 
     def service_started(self) -> str | None:
         if not self.cfg.service:
@@ -253,11 +280,17 @@ class Runner:
     def try_all(self, requests: list) -> list:
         out = []
         prev = self.target.solved()
-        for req in requests:
+        for i, req in enumerate(requests):
             attack = self.send(req)
             now = self.target.solved()
-            out.append({"attack": attack, "attack_solved": newly_solved(prev, now)})
-            prev = now
+            solved = newly_solved(prev, now)
+            out.append({"attack": attack, "attack_solved": solved})
+            if solved and i + 1 < len(requests):
+                if not self.reset()["ok"]:
+                    break
+                prev = self.target.solved()
+            else:
+                prev = now
         return out
 
     def smoke(self) -> dict:
@@ -297,6 +330,11 @@ class Runner:
     @contextmanager
     def staged(self, files: dict) -> Iterator[None]:
         originals = {rel: (self.cfg.app_dir / rel).read_bytes() for rel in files}
+        shutil.rmtree(self.src_backup_path, ignore_errors=True)
+        for rel, data in originals.items():
+            saved = self.src_backup_path / rel
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            saved.write_bytes(data)
         shutil.rmtree(self.backup_path, ignore_errors=True)
         shutil.copytree(self.build_path, self.backup_path, symlinks=True)
         try:
@@ -304,8 +342,10 @@ class Runner:
         finally:
             for rel, data in originals.items():
                 (self.cfg.app_dir / rel).write_bytes(data)
+            shutil.rmtree(self.src_backup_path, ignore_errors=True)
             shutil.rmtree(self.build_path, ignore_errors=True)
-            self.backup_path.rename(self.build_path)
+            if self.backup_path.exists():
+                self.backup_path.rename(self.build_path)
             self.reset()
 
     def build(self, files: dict) -> dict:
@@ -321,6 +361,7 @@ class Runner:
             return self._patch(payload, files)
 
     def _patch(self, payload: dict, files: dict) -> dict:
+        self.recover_staged()
         problem = self.check_files(files)
         if problem:
             return {"ok": False, "stage": "validate", "error": problem}
@@ -371,7 +412,14 @@ def make_handler(runner: Runner):
             return hmac.compare_digest(digest, cfg.secret_sha256)
 
         def read_json(self):
-            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.headers.get("Content-Length")
+            if not raw:
+                return {}
+            length = int(raw)
+            if length < 0:
+                raise ValueError("negative Content-Length")
+            if length > MAX_BODY:
+                raise PayloadTooLarge("body too large")
             return json.loads(self.rfile.read(length) or b"{}")
 
         def do_GET(self):
@@ -384,7 +432,13 @@ def make_handler(runner: Runner):
                 return self.not_found()
             try:
                 payload = self.read_json()
+            except PayloadTooLarge:
+                self.close_connection = True
+                return self.reply(413, {"error": "body too large"})
             except ValueError:
+                self.close_connection = True
+                return self.reply(400, {"error": "bad json"})
+            if not isinstance(payload, dict):
                 return self.reply(400, {"error": "bad json"})
             route = self.POST_ROUTES.get(self.path)
             if route is None:

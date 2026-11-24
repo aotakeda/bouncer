@@ -16,14 +16,18 @@ QUESTIONS = {
 }
 
 
+def one_line(value, limit: int) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ")[:limit]
+
+
 def describe(event: dict) -> str:
-    parts = [f"{event.get('method')} {event.get('path')}", f"status={event.get('status')}"]
+    parts = [f"{one_line(event.get('method', ''), 20)} {one_line(event.get('path', ''), 500)}", f"status={event.get('status')}"]
     if event.get("ua"):
-        parts.append(f"ua={event['ua'][:200]}")
+        parts.append(f"ua={one_line(event['ua'], 200)}")
     if event.get("ctype"):
-        parts.append(f"content-type={event['ctype']}")
+        parts.append(f"content-type={one_line(event['ctype'], 120)}")
     if event.get("body"):
-        parts.append(f"body={event['body'][:1500]}")
+        parts.append(f"body={one_line(event['body'], 1500)}")
     return " ".join(parts)
 
 

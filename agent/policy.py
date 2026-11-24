@@ -17,6 +17,7 @@ PROBE_PATH = re.compile(r"\.(php|asp|aspx|jsp|cgi)\b|/wp-|/\.git|/\.env|/phpmyad
 
 PREFILTERED = "prefiltered"
 DEDUPED = "deduped"
+MAX_SEEN = 10000
 JEV_ACTIONS = (Decision.IGNORE, Decision.WATCH, Decision.TARPIT, Decision.REPLAY, Decision.BLOCK)
 
 
@@ -75,7 +76,9 @@ class DecisionPolicy:
         self.seen: dict = {}
 
     def screen(self, event: dict, ip: str, ts: float) -> Screening:
-        if event.get("path", "").startswith("/socket.io/"):
+        path = event.get("path", "")
+        low = path.lower()
+        if path.startswith("/socket.io/") and ".." not in low and "%2e" not in low:
             return Screening(PREFILTERED, None)
         text = request_text(event)
         suspicious = bool(SUSPICIOUS.search(text))
@@ -85,8 +88,17 @@ class DecisionPolicy:
         signals = read_signals(event, suspicious)
         if not signals.interesting:
             return Screening(PREFILTERED, None)
+        if len(self.seen) >= MAX_SEEN:
+            self._prune(ts)
         self.seen[key] = {"ts": ts, "count": 1}
         return Screening("", signals)
+
+    def _prune(self, ts: float) -> None:
+        cutoff = ts - self.thresholds.dedupe_seconds
+        self.seen = {k: v for k, v in self.seen.items() if v["ts"] > cutoff}
+        if len(self.seen) >= MAX_SEEN:
+            keep = sorted(self.seen.items(), key=lambda kv: kv[1]["ts"])[-(MAX_SEEN // 2):]
+            self.seen = dict(keep)
 
     def _is_duplicate(self, key: tuple, ts: float) -> bool:
         prior = self.seen.get(key)
@@ -102,9 +114,14 @@ class DecisionPolicy:
         if action not in JEV_ACTIONS:
             return Decision.WATCH
         t = self.thresholds
-        if action.listed and (triage.get("confidence") or 0) < t.min_list_confidence and malicious(triage) < t.min_list_malicious:
+        score = malicious(triage)
+        if action.listed and (triage.get("confidence") or 0) < t.min_list_confidence and score < t.min_list_malicious:
             return Decision.WATCH
-        if action.listed and malicious(triage) >= t.replay and not signals.probe:
+        if action == Decision.BLOCK and not signals.probe:
+            if score >= t.replay or score >= t.min_list_malicious or signals.suspicious:
+                return Decision.REPLAY
+            return Decision.TARPIT
+        if action == Decision.TARPIT and score >= t.replay and not signals.probe:
             return Decision.REPLAY
         return action
 

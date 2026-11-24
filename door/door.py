@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,7 +39,9 @@ QUIET_PATHS = {"/", "/socket.io/", "/rest/admin/application-version", "/rest/adm
 SOCKET_IO_PATH = "/socket.io/"
 REPLAY_HEADERS = {"authorization", "cookie", "accept", "x-user-email"}
 MAX_STORED_BODY = 65536
+MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_BATCH_BODY = 1048576
+PUSH_RETRY_DELAYS = (1.0, 3.0)
 
 STRANGER = "owner-as-stranger"
 ADMIN_PREFIX = "/_bouncer/"
@@ -71,11 +74,56 @@ class AdminRequest(NamedTuple):
     body: bytes
 
 
+class BadRequest(Exception):
+    pass
+
+
+class PayloadTooLarge(Exception):
+    pass
+
+
 LogFn = Callable[[dict], None]
 
 
 def bare_path(path: str) -> str:
     return path.split("?", 1)[0]
+
+
+def has_traversal(path: str) -> bool:
+    low = path.lower()
+    return ".." in low or "%2e" in low
+
+
+def read_chunked(stream, limit: int) -> bytes:
+    chunks = []
+    total = 0
+    while True:
+        line = stream.readline(4096)
+        if not line:
+            raise BadRequest("truncated chunked body")
+        size_str = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_str, 16)
+        except ValueError as exc:
+            raise BadRequest("bad chunk size") from exc
+        if size < 0:
+            raise BadRequest("negative chunk size")
+        if size == 0:
+            while True:
+                trailer = stream.readline(4096)
+                if trailer in (b"", b"\r\n", b"\n"):
+                    break
+            return b"".join(chunks)
+        total += size
+        if total > limit:
+            raise PayloadTooLarge("chunked body too large")
+        data = stream.read(size)
+        if len(data) < size:
+            raise BadRequest("truncated chunk data")
+        chunks.append(data)
+        crlf = stream.read(2)
+        if crlf != b"\r\n":
+            raise BadRequest("missing chunk terminator")
 
 
 def json_bytes(obj) -> bytes:
@@ -164,11 +212,12 @@ class Lists:
 
 
 class Pusher:
-    def __init__(self, url: str, flush_seconds: float, log: LogFn, token: str = ""):
+    def __init__(self, url: str, flush_seconds: float, log: LogFn, token: str = "", retry_delays: tuple[float, ...] = PUSH_RETRY_DELAYS):
         self.url = url
         self.token = token
         self.flush_seconds = flush_seconds
         self.log = log
+        self.retry_delays = retry_delays
         self.q: queue.Queue = queue.Queue(maxsize=10000)
         if url:
             threading.Thread(target=self._run, daemon=True).start()
@@ -208,11 +257,21 @@ class Pusher:
 
     def _send(self, batch: list) -> None:
         body = json_bytes({"events": batch})
-        req = urllib.request.Request(self.url, data=body, method="POST", headers=self._headers())
-        try:
-            urllib.request.urlopen(req, timeout=15).read()
-        except Exception as exc:
-            self.log({"kind": "push_failed", "error": str(exc)[:200], "events": len(batch)})
+        last_error = ""
+        for attempt in range(len(self.retry_delays) + 1):
+            req = urllib.request.Request(self.url, data=body, method="POST", headers=self._headers())
+            try:
+                urllib.request.urlopen(req, timeout=15).read()
+                return
+            except urllib.error.HTTPError as exc:
+                last_error = str(exc)[:200]
+                if exc.code < 500:
+                    break
+            except Exception as exc:
+                last_error = str(exc)[:200]
+            if attempt < len(self.retry_delays):
+                time.sleep(self.retry_delays[attempt])
+        self.log({"kind": "push_failed", "error": last_error, "events": len(batch)})
 
 
 class Door:
@@ -282,6 +341,8 @@ class Door:
 
     @staticmethod
     def is_quiet(method: str, path: str) -> bool:
+        if has_traversal(path):
+            return False
         bare = bare_path(path)
         if bare == SOCKET_IO_PATH and method in ("GET", "POST"):
             return True
@@ -313,11 +374,24 @@ def make_handler(door: Door):
             return ip
 
         def read_body(self) -> bytes:
-            length = int(self.headers.get("Content-Length") or 0)
+            te = self.headers.get("Transfer-Encoding", "")
+            if "chunked" in te.lower():
+                return read_chunked(self.rfile, MAX_REQUEST_BODY)
+            raw = self.headers.get("Content-Length")
+            if not raw:
+                return b""
+            try:
+                length = int(raw)
+            except ValueError as exc:
+                raise BadRequest("invalid Content-Length") from exc
+            if length < 0:
+                raise BadRequest("negative Content-Length")
+            if length > MAX_REQUEST_BODY:
+                raise PayloadTooLarge("body too large")
             return self.rfile.read(length) if length > 0 else b""
 
         def write_body(self, body: bytes) -> None:
-            if self.command != "HEAD":
+            if self.command != "HEAD" and body:
                 self.wfile.write(body)
 
         def send(self, status: int, body: bytes, ctype: str = TEXT_TYPE, extra: dict | None = None) -> int:
@@ -361,6 +435,8 @@ def make_handler(door: Door):
                 entries = json.loads(req.body or b"{}")
             except ValueError:
                 return self.send(400, b"bad json")
+            if not isinstance(entries, dict) or not all(isinstance(v, dict) for v in entries.values()):
+                return self.send(400, b"bad json")
             return self.send_json(door.lists.put(req.kind, entries, cfg.allowlist))
 
         def admin_delete(self, req: AdminRequest) -> int:
@@ -399,9 +475,11 @@ def make_handler(door: Door):
             for k, v in resp.getheaders():
                 if k.lower() not in HOP_BY_HOP:
                     self.send_header(k, v)
-            self.send_header("Content-Length", str(len(data)))
+            if resp.status not in (204, 304):
+                self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.write_body(data)
+            if resp.status not in (204, 304):
+                self.write_body(data)
 
         def canary_haystack(self, body: bytes) -> str:
             return self.path + " " + body.decode("utf-8", "replace") + " " + " ".join(self.headers.values())
@@ -452,7 +530,16 @@ def make_handler(door: Door):
         def handle_any(self):
             started = time.time()
             ip = self.client_ip()
-            body = self.read_body()
+            try:
+                body = self.read_body()
+            except BadRequest:
+                self.close_connection = True
+                self.send(400, b"Bad Request")
+                return
+            except PayloadTooLarge:
+                self.close_connection = True
+                self.send(413, b"Payload Too Large")
+                return
             if self.path.startswith(ADMIN_PREFIX):
                 self.handle_admin(body)
                 return
