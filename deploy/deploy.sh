@@ -34,7 +34,10 @@ url_of() { sprite info -s "$1" 2>/dev/null | awk '/^URL:/{print $2}'; }
 
 policy() {
   local s="$1" rules="$2"
-  api -s "$s" /policy/network -- -s -X POST -H 'Content-Type: application/json' -d "{\"rules\":$rules}" >/dev/null
+  api -s "$s" /policy/network -- -s -f -X POST -H 'Content-Type: application/json' -d "{\"rules\":$rules}" >/dev/null || {
+    echo "network policy update failed on $s" >&2
+    return 1
+  }
 }
 
 CONNECTIONS_JSON=""
@@ -145,6 +148,19 @@ step_refresh() {
   refresh_juice "$REPLAY" &
   wait
   step_lock
+  clear_shields
+}
+
+clear_shields() {
+  local route
+  door_admin GET blocklist | python3 -c '
+import sys,json
+for route in (json.load(sys.stdin).get("shield") or {}):
+    print(route)' | while IFS= read -r route; do
+    printf 'unshield %s: ' "$route"
+    door_admin DELETE "shield/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$route")"
+    echo
+  done
 }
 
 step_links() {
@@ -168,7 +184,7 @@ deploy_door() {
   plant_canaries
   service "$APP" juice --cmd node --args build/app --dir /home/sprite/juice-shop --env "PORT=3000,NODE_ENV=production"
   service "$APP" door --cmd python3 --args "$REMOTE/door/door.py" --dir "$REMOTE" --http-port 8080 \
-    --env "DOOR_DATA_DIR=$REMOTE/door-data,DOOR_ADMIN_SHA256=$(sha "$DOOR_SECRET"),DOOR_EVENTS_URL=$GW/custom_api/$events_id/events,DOOR_ALLOWLIST=${OWNER_IP:-}"
+    --env "DOOR_DATA_DIR=$REMOTE/door-data,DOOR_ADMIN_SHA256=$(sha "$DOOR_SECRET"),DOOR_EVENTS_URL=$GW/custom_api/$events_id/events,DOOR_ALLOWLIST=${OWNER_IP:-},DOOR_BLOCK_SECONDS=${BLOCK_SECONDS:-300}"
   sprite config update -s "$APP" --url-auth public >/dev/null
 }
 
@@ -184,7 +200,7 @@ deploy_agent() {
   local replay_id="$1" door_id="$2" jev_id="$3" claude_id="$4" github_id="$5"
   say "agent on $AGENT"
   service "$AGENT" agent --cmd python3 --args "-m,agent.agent" --dir "$REMOTE" --http-port 8080 \
-    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$jev_id/v1/systemone,RUNNER_URL=$GW/custom_api/$replay_id,DOOR_URL=$GW/custom_api/$door_id,OWNER_IPS=${OWNER_IP:-},BLOCK_SECONDS=${BLOCK_SECONDS:-300},FIX_MODE=$FIX_MODE,ANTHROPIC_URL=$GW/anthropic/$claude_id,GITHUB_URL=$GW/github/$github_id"
+    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$jev_id/v1/systemone,RUNNER_URL=$GW/custom_api/$replay_id,DOOR_URL=$GW/custom_api/$door_id,OWNER_IPS=${OWNER_IP:-},BLOCK_SECONDS=${BLOCK_SECONDS:-300},SHIELD_SECONDS=${SHIELD_SECONDS:-86400},FIX_MODE=$FIX_MODE,ANTHROPIC_URL=$GW/anthropic/$claude_id,GITHUB_URL=$GW/github/$github_id"
   sprite config update -s "$AGENT" --url-auth public >/dev/null
 }
 
@@ -211,7 +227,10 @@ step_lock() {
   policy "$APP" "$LOCKED_EGRESS"
   policy "$AGENT" "$LOCKED_EGRESS"
   policy "$REPLAY" '[{"domain":"*","action":"deny"}]'
-  api -s "$REPLAY" /policy/privileges -- -s -X POST -H 'Content-Type: application/json' -d '{"profile":"minimal","noNewPrivileges":true}' >/dev/null
+  api -s "$REPLAY" /policy/privileges -- -s -f -X POST -H 'Content-Type: application/json' -d '{"profile":"minimal","noNewPrivileges":true}' >/dev/null || {
+    echo "privilege profile update failed on $REPLAY" >&2
+    return 1
+  }
 }
 
 step_blocks() {
@@ -240,5 +259,6 @@ case "$STEP" in
   install|refresh|links|services|lock) "step_$STEP"; summary ;;
   blocks) step_blocks ;;
   unblock) step_unblock "${2:-}" ;;
-  *) echo "usage: deploy.sh [all|install|refresh|links|services|lock|blocks|unblock <ip>]" >&2; exit 1 ;;
+  unshield) clear_shields ;;
+  *) echo "usage: deploy.sh [all|install|refresh|links|services|lock|blocks|unblock <ip>|unshield]" >&2; exit 1 ;;
 esac

@@ -10,7 +10,14 @@ from .net import bare_path, clip
 if TYPE_CHECKING:
     from .fix import FixJob
 
-VARIANT_LABELS = {Verdict.PROVEN: "worked", Verdict.NOT_RUN: "not run", Verdict.MINOR: "minor only", Verdict.INCONCLUSIVE: "unclear", Verdict.ERROR: "error"}
+VARIANT_LABELS = {
+    Verdict.PROVEN: "worked",
+    Verdict.NOT_REPRODUCED: "no effect",
+    Verdict.NOT_RUN: "not run",
+    Verdict.MINOR: "minor only",
+    Verdict.INCONCLUSIVE: "unclear",
+    Verdict.ERROR: "error",
+}
 
 
 def table_cell(text: str) -> str:
@@ -23,8 +30,9 @@ def smoke_rows(smoke: dict) -> str:
 
 def variant_row(row: dict) -> str:
     request = table_cell(row["request"][:120]).replace("`", "")
-    before = VARIANT_LABELS.get(row["before"], "not shown")
-    after = VARIANT_LABELS.get(row["after"], "blocked")
+    before = VARIANT_LABELS.get(row["before"], "unclear")
+    blocked = row["before"] == Verdict.PROVEN and row["after"] == Verdict.NOT_REPRODUCED
+    after = "blocked" if blocked else VARIANT_LABELS.get(row["after"], "unclear")
     return f"| {table_cell(row['idea'])} | `{request}` | {before} | {after} |"
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import queue
 import sys
 import threading
 import time
@@ -15,10 +14,11 @@ from .door_client import DoorClient
 from .event_log import DecisionLog, Feed
 from .fix import Fixer
 from .github import GitHub
+from .inbox import FairInbox
 from .jev import Jev
 from .labels import Decision, EventKind, FixStatus, Verdict
 from .net import bare_path
-from .policy import DecisionPolicy, Signals
+from .policy import REPEAT_PROVEN, DecisionPolicy, Signals
 from .replay import Replayer
 from .store import Store
 from .views import Views
@@ -33,6 +33,18 @@ LISTS_CACHE_SECONDS = 3.0
 NO_LISTS_CACHE: tuple[float, dict] = (0.0, {})
 KIND_OUTCOMES = {EventKind.REFUSED: "blocked", EventKind.TARPITTED: "slowed"}
 DECISION_OUTCOMES = {Decision.BLOCK: "blocked", Decision.TARPIT: "slowed"}
+INBOX_TOTAL = 20000
+TRUSTED_FETCH_SITES = ("", "none", "same-origin")
+RETRY_KEY = "__retry__"
+REPEAT_LINE = "Same trick that already worked in the back room. No second test needed. Out."
+SHIELDED_LINE = "The door already turned it away: this route is shielded until the fix is merged. It would have worked, so they're out."
+CROSS_SITE_HONEYPOT_LINE = "Fake .env fetched from inside another site's page. Probably an innocent browser being used as a puppet. Not slowing it down."
+UNTAKEN_BAIT_LINE = "Bait value showed up, but this client never took the bait. Could be someone's browser being used against them. Not blocking."
+FLOOD_LINE = "Too many requests to check at once. Slow lane while I work through the pile."
+
+
+def trusted_fetch(event: dict) -> bool:
+    return str(event.get("fetch_site") or "").strip().lower() in TRUSTED_FETCH_SITES
 
 
 def build_fixer(cfg: Config) -> Fixer | None:
@@ -79,7 +91,9 @@ class Brain:
         self.jev = Jev(cfg.jev_url, cfg.app_description) if cfg.jev_url else None
         self.replayer = Replayer(cfg.runner_url, cfg.runner_token) if cfg.runner_url else None
         self.fixer = build_fixer(cfg)
-        self.inbox: queue.Queue = queue.Queue(maxsize=20000)
+        self.inbox = FairInbox(cfg.pending_per_ip, INBOX_TOTAL)
+        self.flooding: set = set()
+        self.flood_lock = threading.Lock()
         self.rids = itertools.count(1)
         self.rid_prefix = format(int(time.time()), "x")
         self.lists_lock = threading.Lock()
@@ -118,10 +132,13 @@ class Brain:
             if not isinstance(e, dict):
                 self.store.count("malformed")
                 continue
-            try:
-                self.inbox.put_nowait(e)
-            except queue.Full:
-                self.store.count("dropped")
+            ip = e.get("ip") if isinstance(e.get("ip"), str) else "?"
+            if self.inbox.put(ip, e):
+                continue
+            self.store.count("dropped")
+            if self.inbox.size < self.inbox.total:
+                with self.flood_lock:
+                    self.flooding.add(ip)
 
     def _work(self):
         while True:
@@ -151,6 +168,10 @@ class Brain:
         return "; ".join(f"{d['method']} {d['path'][:80]} -> {d['decision']}" for d in self.store.recent(ip, 5))
 
     def handle(self, event: dict):
+        if RETRY_KEY in event:
+            retry = event[RETRY_KEY]
+            self._replay(retry["event"], retry["record"], retry["triage"], retry["attempt"])
+            return
         self.store.count("events")
         record = self._record(event)
         record["rid"] = f"{self.rid_prefix}-{next(self.rids)}"
@@ -159,8 +180,16 @@ class Brain:
             self.store.count(kind)
             self.store.count_traffic(record["ts"], KIND_OUTCOMES[kind])
             return
+        self._slow_flooder(record)
         decision = self.kind_handlers.get(kind, self._on_request)(event, record)
         self.store.count_traffic(record["ts"], DECISION_OUTCOMES.get(decision, "allowed"))
+
+    def _slow_flooder(self, record: dict):
+        with self.flood_lock:
+            if record["ip"] not in self.flooding:
+                return
+            self.flooding.discard(record["ip"])
+        self._list_and_decide(dict(record), Decision.TARPIT, "flooded the triage queue", FLOOD_LINE)
 
     @staticmethod
     def _record(event: dict) -> dict:
@@ -174,13 +203,28 @@ class Brain:
         }
 
     def _on_honeypot(self, event: dict, record: dict) -> Decision:
+        if not trusted_fetch(event):
+            self.store.shame_path(record["path"])
+            return self.decide(record, Decision.WATCH, line=CROSS_SITE_HONEYPOT_LINE)
         self.store.visit_honeypot(record["ip"], record["ts"])
         self.store.shame_path(record["path"])
-        return self._list_and_decide(record, Decision.TARPIT, "took the honeypot .env", persona.line("honeypot", record["path"]))
+        line = persona.line("honeypot", record["path"])
+        if event.get("took_bait"):
+            self.store.count("tarpit_by_door")
+            return self.decide(record, Decision.TARPIT, line=line)
+        return self._list_and_decide(record, Decision.TARPIT, "took the honeypot .env", line)
 
     def _on_canary_reuse(self, event: dict, record: dict) -> Decision:
+        origin = self.store.honeypot_origin(record["ip"])
+        took = bool(event.get("took_bait")) or bool(origin and origin[0] == record["ip"])
+        if not took or not trusted_fetch(event):
+            return self.decide(record, Decision.WATCH, line=UNTAKEN_BAIT_LINE)
         line = persona.line("canary_reuse", record["path"]) + self._honeypot_story(record["ip"])
-        blocked = self.set_list(Decision.BLOCK, record["ip"], "reused honeypot credentials")
+        if event.get("took_bait"):
+            self.store.count("block_by_door")
+            blocked = self.door.enabled and not self.cfg.is_owner(record["ip"])
+        else:
+            blocked = self.set_list(Decision.BLOCK, record["ip"], "reused honeypot credentials")
         self.store.remember_catch(record, blocked)
         return self.decide(record, Decision.BLOCK, line=line)
 
@@ -195,6 +239,9 @@ class Brain:
 
     def _on_request(self, event: dict, record: dict) -> Decision | None:
         screening = self.policy.screen(event, record["ip"], record["ts"])
+        if screening.skipped == REPEAT_PROVEN:
+            self.store.count(REPEAT_PROVEN)
+            return self._list_and_decide(record, Decision.BLOCK, "repeated a proven exploit", REPEAT_LINE)
         if screening.skipped:
             self.store.count(screening.skipped)
             return None
@@ -222,21 +269,32 @@ class Brain:
             return self.decide(record, Decision.IGNORE, line=persona.line(kind, path))
         return self.decide(record, Decision.WATCH, line=persona.line("watch", path))
 
-    def _replay(self, event: dict, record: dict, triage: dict) -> Decision:
-        self.decide(record, Decision.REPLAY, line=persona.line("replay", record["path"]))
+    def _replay(self, event: dict, record: dict, triage: dict, attempt: int = 0) -> Decision:
+        if not attempt:
+            self.decide(record, Decision.REPLAY, line=persona.line("replay", record["path"]))
         result = self.replayer.run(event)
-        record = {**record, "replay": result}
+        replayed = {**record, "replay": result, "attempt": attempt}
         handler = self.verdict_handlers.get(result["verdict"], self._on_jammed)
-        return handler(event, record, triage)
+        return handler(event, replayed, triage)
+
+    def _shield(self, record: dict, why: str) -> None:
+        if self.cfg.shield_seconds <= 0 or not self.door.enabled:
+            return
+        route = f"{record.get('method')} {bare_path(record['path'])}"
+        ok = self.door.put_shield(route, self.cfg.shield_seconds, "proven exploit: " + why[:120])
+        self.store.count("shield_sent" if ok else "shield_failed")
 
     def _on_proven(self, event: dict, record: dict, triage: dict) -> Decision:
         ip, result = record["ip"], record["replay"]
+        self.policy.mark_proven(event, ip, record["ts"])
+        self._shield(record, result["why"])
         blocked = self.set_list(Decision.BLOCK, ip, "proven exploit: " + result["why"][:120])
         incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result, "jev": triage, "blocked": blocked, "rid": record.get("rid")}
         if self.fixer:
             incident["fix"] = queued_fix(FixStatus.QUEUED)
         self.store.add_incident(incident)
-        decision = self.decide(record, Decision.BLOCK, line=persona.line("proven", record["path"]))
+        line = SHIELDED_LINE if record.get("kind") == EventKind.SHIELDED else persona.line("proven", record["path"])
+        decision = self.decide({k: v for k, v in record.items() if k != "attempt"}, Decision.BLOCK, line=line)
         if self.fixer:
             status = self.fixer.submit(incident, self.fix_report)
             if status != FixStatus.QUEUED:
@@ -256,6 +314,19 @@ class Brain:
         return self.decide(record, Decision.WATCH, line=persona.line(kind, record["path"]))
 
     def _on_jammed(self, event: dict, record: dict, triage: dict) -> Decision:
+        attempt = record.get("attempt", 0)
+        if record["replay"].get("busy") and attempt < self.cfg.busy_retries:
+            base = {k: v for k, v in record.items() if k not in ("replay", "attempt")}
+            payload = {RETRY_KEY: {"event": event, "record": base, "triage": triage, "attempt": attempt + 1}}
+            timer = threading.Timer(self.cfg.busy_retry_seconds, self.inbox.put, args=(record["ip"], payload))
+            timer.daemon = True
+            timer.start()
+            self.store.count("replay_retry")
+            slow = self.policy.after_failed_replay(triage)
+            line = f"Back room is busy testing a fix. Trying again in {int(self.cfg.busy_retry_seconds)}s."
+            if slow.listed and not attempt:
+                return self._list_and_decide(base, slow, "waiting for proof", line + " Slow lane until then.")
+            return self.decide(base, Decision.WATCH, line=line)
         return self.decide(record, Decision.WATCH, line=f"Back room is jammed ({record['replay'].get('why')}). Watching instead.")
 
     def _list_and_decide(self, record: dict, decision: Decision, reason: str, line: str) -> Decision:

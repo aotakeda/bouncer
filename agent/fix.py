@@ -74,7 +74,7 @@ def clean_variants(req: dict, raw: list) -> list:
 
 
 def untrusted_block(tag: str, text: str) -> str:
-    safe = text.replace(f"</{tag}>", f"<\\/{tag}>")
+    safe = re.sub(rf"<(\s*/?\s*){re.escape(tag)}", lambda m: "&lt;" + m.group(1) + tag, text, flags=re.IGNORECASE)
     return f"<{tag}>\n{safe}\n</{tag}>"
 
 

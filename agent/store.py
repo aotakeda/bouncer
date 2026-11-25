@@ -190,9 +190,10 @@ class Store:
     def remember(self, record: dict):
         ip = record["ip"]
         with self.lock:
-            if ip not in self.per_ip and len(self.per_ip) >= KEPT_IPS:
+            history = self.per_ip.pop(ip, [])
+            if len(self.per_ip) >= KEPT_IPS:
                 self.per_ip.pop(next(iter(self.per_ip)))
-            self.per_ip[ip] = (self.per_ip.get(ip, []) + [record])[-KEPT_PER_IP:]
+            self.per_ip[ip] = (history + [record])[-KEPT_PER_IP:]
 
     def recent(self, ip: str, n: int) -> list:
         with self.lock:

@@ -89,6 +89,8 @@ def _proven_reasons(major: dict, leaked: list) -> list:
 
 
 def interpret(req: dict, result: dict) -> dict:
+    if not result.get("ok") and result.get("stage") == "busy":
+        return {**_outcome(Verdict.ERROR, "back room busy testing a fix", {}), "busy": True}
     if not result.get("ok"):
         return _outcome(Verdict.ERROR, f"runner failed at {result.get('stage', 'call')}", {})
     attack = result["attack"]
@@ -127,6 +129,6 @@ class Replayer:
         payload = {"reset": True, "request": req, "control": build_control(req)}
         status, body, elapsed = net.post_json(self.runner_url + "/replay", payload, timeout=120, headers=self.headers)
         seconds = round(elapsed, 2)
-        if status != 200:
+        if status != 200 or not isinstance(body, dict):
             return {"verdict": Verdict.ERROR, "why": f"runner returned HTTP {status}", "evidence": {"body": str(body)[:300]}, "seconds": seconds}
         return {**interpret(req, body), "seconds": seconds, "request": req}

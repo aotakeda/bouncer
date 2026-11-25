@@ -11,7 +11,7 @@ from string import Template
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
-from .net import bare_path
+from .net import bare_path, ip_key
 
 if TYPE_CHECKING:
     from .agent import Brain
@@ -26,6 +26,7 @@ LOGIN_TEMPLATE = Template(Path(__file__).with_name("login.html").read_text())
 WARN_SVG = '<svg width="16" height="16" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true" style="flex-shrink:0"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm-8,56a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm8,104a12,12,0,1,1,12-12A12,12,0,0,1,128,184Z"/></svg>'
 LOGIN_ERROR = f'<p class="err" role="alert">{WARN_SVG}<span>Wrong passphrase. Try again.</span></p>'
 LOGIN_ERROR_ATTR = ' aria-invalid="true" class="bad"'
+FOREIGN_FETCH_SITES = ("cross-site", "same-site")
 
 
 class Rejected(Exception):
@@ -86,7 +87,7 @@ def make_handler(brain: Brain):
             return hmac.compare_digest(cookies.get(COOKIE_NAME, ""), cookie_value())
 
         def client_ip(self) -> str:
-            return self.headers.get("Sprite-Client-Ip") or self.client_address[0]
+            return ip_key(self.headers.get("Sprite-Client-Ip") or self.client_address[0])
 
         def body(self) -> bytes:
             raw = self.headers.get("Content-Length")
@@ -105,7 +106,9 @@ def make_handler(brain: Brain):
         def dash_json(self, data: bytes):
             if not self.dash_ok():
                 raise Rejected(401, b"unauthorized")
-            if "application/json" not in self.headers.get("Content-Type", "").lower():
+            if (self.headers.get("Sec-Fetch-Site") or "").lower() in FOREIGN_FETCH_SITES:
+                raise Rejected(403, b"cross-site request refused")
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
                 raise Rejected(415, b"expected application/json")
             try:
                 return json.loads(data or b"{}")

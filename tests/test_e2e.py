@@ -81,7 +81,7 @@ class EndToEnd(unittest.TestCase):
                 "AGENT_PORT": p["agent"], "AGENT_DATA_DIR": cls.tmp / "agent", "AGENT_EVENTS_SHA256": sha("events-secret"), "AGENT_DASH_SHA256": sha("let me in"),
                 "JEV_URL": f"http://127.0.0.1:{p['jev']}/v1/systemone", "RUNNER_URL": f"http://127.0.0.1:{p['runner']}", "RUNNER_TOKEN": "runner-secret",
                 "DOOR_URL": f"http://127.0.0.1:{p['door']}", "DOOR_TOKEN": "door-secret", "OWNER_IPS": OWNER,
-                "FIX_MODE": "pr", "ANTHROPIC_URL": f"http://127.0.0.1:{p['claude']}", "GITHUB_URL": f"http://127.0.0.1:{p['github']}", "FIX_PER_HOUR": "20"}),
+                "SHIELD_SECONDS": "0", "FIX_MODE": "pr", "ANTHROPIC_URL": f"http://127.0.0.1:{p['claude']}", "GITHUB_URL": f"http://127.0.0.1:{p['github']}", "FIX_PER_HOUR": "20"}),
             ([sys.executable, str(ROOT / "door" / "door.py")], {
                 "DOOR_PORT": p["door"], "DOOR_UPSTREAM": f"http://127.0.0.1:{p['juice']}", "DOOR_DATA_DIR": cls.tmp / "door", "DOOR_ADMIN_SHA256": sha("door-secret"),
                 "DOOR_EVENTS_URL": f"http://127.0.0.1:{p['agent']}/events", "DOOR_EVENTS_TOKEN": "events-secret", "DOOR_ALLOWLIST": OWNER,
@@ -122,25 +122,33 @@ class EndToEnd(unittest.TestCase):
         call(self.door + "/wp-login.php", "2.2.2.2", ua="Mozilla/5.0 zgrab/0.x")
         self.assertEqual(call(self.door + "/rest/user/login", "3.3.3.3", "POST", sqli, ua="sqlmap/1.8")[0], 200)
         self.assertIn("CANARY-honey-77", call(self.door + "/.env", "4.4.4.4")[1])
+        call(self.door + "/rest/user/login", "4.4.4.4", "POST", {"email": "admin@juice-sh.op", "password": "CANARY-honey-77"})
         call(self.door + "/rest/user/login", "5.5.5.5", "POST", {"email": "admin@juice-sh.op", "password": "CANARY-honey-77"})
         call(self.door + "/rest/user/login", OWNER, "POST", sqli)
-        rows = self.decisions(before + 7)[before:]
-        by_ip: dict = {}
-        for r in rows:
-            by_ip.setdefault(r["ip"], []).append(r)
+        deadline = time.time() + 20
+        while True:
+            rows = self.decisions(before + 8)[before:]
+            by_ip: dict = {}
+            for r in rows:
+                by_ip.setdefault(r["ip"], []).append(r)
+            if len(by_ip.get(OWNER, [])) >= 2 or time.time() > deadline:
+                break
+            time.sleep(0.2)
 
         self.assertNotIn("1.1.1.1", by_ip)
         self.assertEqual(by_ip["2.2.2.2"][-1]["decision"], "ignore")
         self.assertEqual([r["decision"] for r in by_ip["3.3.3.3"]], ["replay", "block"])
         self.assertEqual(by_ip["3.3.3.3"][-1]["replay_verdict"], "PROVEN")
         self.assertIn("loginAdminChallenge", by_ip["3.3.3.3"][-1]["evidence"])
-        self.assertEqual(by_ip["4.4.4.4"][-1]["decision"], "tarpit")
-        self.assertEqual(by_ip["5.5.5.5"][-1]["decision"], "block")
-        self.assertIn("fake .env", by_ip["5.5.5.5"][-1]["line"])
+        self.assertEqual([r["decision"] for r in by_ip["4.4.4.4"]], ["tarpit", "block"])
+        self.assertIn("fake .env", by_ip["4.4.4.4"][-1]["line"])
+        self.assertEqual(call(self.door + "/", "4.4.4.4")[0], 403)
+        self.assertEqual(by_ip["5.5.5.5"][-1]["decision"], "watch")
+        self.assertIn("never took the bait", by_ip["5.5.5.5"][-1]["line"])
+        self.assertEqual(call(self.door + "/", "5.5.5.5")[0], 200)
         self.assertEqual(by_ip[OWNER][-1]["replay_verdict"], "PROVEN")
 
         self.assertEqual(call(self.door + "/", "3.3.3.3")[0], 403)
-        self.assertEqual(call(self.door + "/", "5.5.5.5")[0], 403)
         self.assertEqual(call(self.door + "/", OWNER)[0], 200)
 
     def test_proven_login_gets_verified_pull_request(self):
@@ -251,6 +259,16 @@ class EndToEnd(unittest.TestCase):
             urllib.request.urlopen(bad_ctype)
         self.assertEqual(ctx.exception.code, 415)
 
+        disguised = urllib.request.Request(agent + "/api/unblock", data=b'{"ip":"owner-as-stranger"}', method="POST", headers={"Cookie": cookie, "Content-Type": "text/plain; x=application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(disguised)
+        self.assertEqual(ctx.exception.code, 415)
+
+        foreign = urllib.request.Request(agent + "/api/unblock", data=b'{"ip":"owner-as-stranger"}', method="POST", headers={"Cookie": cookie, "Content-Type": "application/json", "Sec-Fetch-Site": "same-site"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(foreign)
+        self.assertEqual(ctx.exception.code, 403)
+
         unblock_req = urllib.request.Request(agent + "/api/unblock", data=json.dumps({"ip": "owner-as-stranger"}).encode(), method="POST", headers={"Cookie": cookie, "Content-Type": "application/json"})
         with urllib.request.urlopen(unblock_req) as r:
             self.assertTrue(json.loads(r.read())["ok"])
@@ -273,6 +291,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(conn.getresponse().status, 413)
         conn.close()
 
+        call(self.door + "/.env", "9.8.7.6")
         payload = json.dumps({"email": "admin@juice-sh.op", "password": "CANARY-honey-77"}).encode()
         chunked = f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
         conn = http.client.HTTPConnection("127.0.0.1", self.p["door"], timeout=5)
@@ -289,6 +308,38 @@ class EndToEnd(unittest.TestCase):
         while time.time() < deadline and call(self.door + "/", "9.8.7.6")[0] != 403:
             time.sleep(0.2)
         self.assertEqual(call(self.door + "/", "9.8.7.6")[0], 403)
+
+    def test_repeat_of_proven_exploit_is_blocked_again_without_replay(self):
+        attack = {"email": "' or 1=1-- repeat", "password": "x"}
+        call(self.door + "/rest/user/login", "7.7.7.8", "POST", attack, ua="sqlmap/1.8")
+        deadline = time.time() + 20
+        while time.time() < deadline and call(self.door + "/", "7.7.7.8")[0] != 403:
+            time.sleep(0.2)
+        req = urllib.request.Request(self.door + "/_bouncer/blocklist/7.7.7.8", method="DELETE", headers={"Authorization": "Bearer door-secret"})
+        urllib.request.urlopen(req).close()
+        self.assertEqual(call(self.door + "/", "7.7.7.8")[0], 200)
+        call(self.door + "/rest/user/login", "7.7.7.8", "POST", attack, ua="sqlmap/1.8")
+        deadline = time.time() + 10
+        while time.time() < deadline and call(self.door + "/", "7.7.7.8")[0] != 403:
+            time.sleep(0.2)
+        self.assertEqual(call(self.door + "/", "7.7.7.8")[0], 403)
+        rows = [r for r in self.decisions(0) if r["ip"] == "7.7.7.8"]
+        self.assertEqual([r["decision"] for r in rows], ["replay", "block", "block"])
+        self.assertIn("already worked", rows[-1]["line"])
+
+    def test_cross_site_bait_does_not_slow_or_block_a_browser(self):
+        site = {"Sec-Fetch-Site": "cross-site"}
+        self.assertEqual(call(self.door + "/.env", "8.8.4.5", extra=site)[0], 200)
+        call(self.door + "/rest/user/login", "8.8.4.5", "POST", {"email": "a@b.c", "password": "CANARY-honey-77"}, extra=site)
+        rows = []
+        deadline = time.time() + 10
+        while time.time() < deadline and len(rows) < 2:
+            time.sleep(0.2)
+            rows = [r for r in self.decisions(0) if r["ip"] == "8.8.4.5"]
+        self.assertEqual([r["decision"] for r in rows], ["watch", "watch"])
+        started = time.time()
+        self.assertEqual(call(self.door + "/", "8.8.4.5")[0], 200)
+        self.assertLess(time.time() - started, 0.15)
 
     def test_runner_refusal_does_not_parse_body_as_next_request(self):
         smuggled = b"GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer runner-secret\r\n\r\n"

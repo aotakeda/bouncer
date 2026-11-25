@@ -7,6 +7,7 @@ from . import net
 from .labels import Decision
 
 ENDPOINTS = {Decision.BLOCK: "blocklist", Decision.TARPIT: "tarpit"}
+SHIELD_ENDPOINT = "shield"
 
 
 class DoorClient:
@@ -23,6 +24,18 @@ class DoorClient:
             f"{self.url}/_bouncer/{ENDPOINTS[kind]}",
             "PUT",
             {ip: {"until": time.time() + seconds, "reason": reason}},
+            timeout=15,
+            headers=self.headers,
+        )
+        return status == 200
+
+    def put_shield(self, route: str, seconds: int, reason: str) -> bool:
+        if not self.enabled:
+            return False
+        status, _, _ = net.request(
+            f"{self.url}/_bouncer/{SHIELD_ENDPOINT}",
+            "PUT",
+            {route: {"until": time.time() + seconds, "reason": reason}},
             timeout=15,
             headers=self.headers,
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import os
 import socket
@@ -15,6 +16,18 @@ ERROR_DETAIL_CHARS = 300
 
 def bare_path(path: str) -> str:
     return path.split("?", 1)[0]
+
+
+def ip_key(ip: str) -> str:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 4:
+        return str(addr)
+    if addr.ipv4_mapped:
+        return str(addr.ipv4_mapped)
+    return str(ipaddress.ip_network(f"{addr}/64", strict=False))
 
 
 def clip(value, limit: int) -> str:

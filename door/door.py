@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import queue
@@ -16,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from enum import Enum
 from typing import Callable, NamedTuple
-from urllib.parse import urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 HOP_BY_HOP = {
     "connection",
@@ -30,10 +31,19 @@ HOP_BY_HOP = {
     "host",
     "content-length",
 }
+UPSTREAM_SKIP = HOP_BY_HOP | {"date", "server"}
 
 STATIC_PATH = re.compile(
     r"^/(assets/.*|[\w.-]+\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|map|webmanifest))$"
 )
+
+ATTACK = re.compile(
+    r"""(\bunion\b[\s\S]{0,80}\bselect\b|\bor\b\s*['"]?\s*\d+\s*=\s*\d+|'\s*(or|and|\)|;|--|#)|--\s|/\*|\bsleep\s*\(|\bbenchmark\s*\(|\.\./|<script|onerror\s*=|javascript:|\$where|\$ne\b|\$gt\b|etc/passwd)""",
+    re.IGNORECASE,
+)
+TRUSTED_FETCH_SITES = {"", "none", "same-origin"}
+CANARY_SKIP_HEADERS = {"referer", "origin"}
+BAIT_SECONDS = 86400
 
 QUIET_PATHS = {"/", "/socket.io/", "/rest/admin/application-version", "/rest/admin/application-configuration", "/rest/languages"}
 SOCKET_IO_PATH = "/socket.io/"
@@ -46,7 +56,8 @@ PUSH_RETRY_DELAYS = (1.0, 3.0)
 STRANGER = "owner-as-stranger"
 ADMIN_PREFIX = "/_bouncer/"
 BEARER = "Bearer "
-LIST_KINDS = {"blocklist": "block", "tarpit": "tarpit"}
+LIST_KINDS = {"blocklist": "block", "tarpit": "tarpit", "shield": "shield"}
+LIST_NAMES = ("block", "tarpit", "shield", "bait")
 TEXT_TYPE = "text/plain; charset=utf-8"
 JSON_TYPE = "application/json"
 
@@ -57,9 +68,16 @@ class EventKind(str, Enum):
     HONEYPOT = "honeypot"
     CANARY_REUSE = "canary_reuse"
     TARPITTED = "tarpitted"
+    SHIELDED = "shielded"
 
     def __str__(self) -> str:
         return self.value
+
+
+class Slow(str, Enum):
+    NO = "no"
+    SLOWED = "slowed"
+    REFUSE = "refuse"
 
 
 class Outcome(NamedTuple):
@@ -87,6 +105,35 @@ LogFn = Callable[[dict], None]
 
 def bare_path(path: str) -> str:
     return path.split("?", 1)[0]
+
+
+def client_key(ip: str) -> str:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 4:
+        return str(addr)
+    if addr.ipv4_mapped:
+        return str(addr.ipv4_mapped)
+    return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+
+
+def wire_path(path: str) -> str:
+    return "".join(c if 32 < ord(c) < 127 else "%%%02X" % (ord(c) & 0xFF) for c in path)
+
+
+def route_key(method: str, path: str) -> str:
+    return f"{method} {bare_path(path)}"
+
+
+def looks_like_attack(path: str, body: bytes) -> bool:
+    text = unquote_plus(path) + " " + body.decode("utf-8", "replace")
+    return bool(ATTACK.search(text))
+
+
+def trusted_fetch(headers) -> bool:
+    return (headers.get("Sec-Fetch-Site") or "").strip().lower() in TRUSTED_FETCH_SITES
 
 
 def has_traversal(path: str) -> bool:
@@ -148,9 +195,13 @@ class Config:
         self.admin_sha256 = env.get("DOOR_ADMIN_SHA256", "")
         self.events_url = env.get("DOOR_EVENTS_URL", "")
         self.events_token = env.get("DOOR_EVENTS_TOKEN", "")
-        self.allowlist = {ip.strip() for ip in env.get("DOOR_ALLOWLIST", "").split(",") if ip.strip()}
+        self.allowlist = {client_key(ip.strip()) for ip in env.get("DOOR_ALLOWLIST", "").split(",") if ip.strip()}
         self.tarpit_seconds = float(env.get("DOOR_TARPIT_SECONDS", "10"))
-        self.tarpit_max = int(env.get("DOOR_TARPIT_MAX", "5"))
+        self.tarpit_max = int(env.get("DOOR_TARPIT_MAX", "50"))
+        self.tarpit_per_ip = int(env.get("DOOR_TARPIT_PER_IP", "2"))
+        self.tarpit_list_seconds = float(env.get("DOOR_TARPIT_LIST_SECONDS", "600"))
+        self.block_seconds = float(env.get("DOOR_BLOCK_SECONDS", "300"))
+        self.log_max_bytes = int(env.get("DOOR_LOG_MAX_BYTES", str(50 * 1024 * 1024)))
         self.canaries_file = Path(env.get("DOOR_CANARIES", str(self.data_dir / "canaries.json")))
         self.flush_seconds = float(env.get("DOOR_FLUSH_SECONDS", "2"))
 
@@ -163,16 +214,20 @@ class Lists:
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.Lock()
-        self.data = {"block": {}, "tarpit": {}}
+        self.data = {name: {} for name in LIST_NAMES}
         self._load()
 
     def _load(self) -> None:
         if not self.path.exists():
             return
         try:
-            self.data.update(json.loads(self.path.read_text()))
+            loaded = json.loads(self.path.read_text())
         except ValueError:
-            pass
+            return
+        if isinstance(loaded, dict):
+            for name in LIST_NAMES:
+                if isinstance(loaded.get(name), dict):
+                    self.data[name] = loaded[name]
 
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -198,6 +253,18 @@ class Lists:
                     self.data[kind][ip] = entry
             self._save()
             return {"ok": True, "skipped_allowlisted": skipped}
+
+    def add(self, kind: str, key: str, seconds: float, reason: str, allowlist: set) -> None:
+        if key in allowlist:
+            return
+        with self.lock:
+            now = time.time()
+            current = self.data[kind].get(key)
+            until = now + seconds
+            if current and current.get("until", 0) > until:
+                return
+            self.data[kind][key] = {"until": until, "reason": reason, "ts": now}
+            self._save()
 
     def delete(self, kind: str, ip: str) -> bool:
         with self.lock:
@@ -281,7 +348,9 @@ class Door:
         self.lists = Lists(cfg.data_dir / "lists.json")
         self.log_path = cfg.data_dir / "access.log"
         self.log_lock = threading.Lock()
-        self.tarpit_slots = threading.BoundedSemaphore(cfg.tarpit_max)
+        self.tarpit_lock = threading.Lock()
+        self.tarpit_busy: dict = {}
+        self.tarpit_total = 0
         self.canaries = self._load_canaries()
         self.pusher = Pusher(cfg.events_url, cfg.flush_seconds, self.write_log, cfg.events_token)
 
@@ -309,9 +378,29 @@ class Door:
     def canary_hits(self, text: str) -> list:
         return [value for value in self.honeypot.values() if value and value in text]
 
+    def took_bait(self, ip: str) -> bool:
+        return bool(self.lists.active("bait", ip))
+
+    def mark_bait(self, ip: str) -> None:
+        self.lists.add("bait", ip, BAIT_SECONDS, "took the honeypot .env", self.cfg.allowlist)
+        self.lists.add("tarpit", ip, self.cfg.tarpit_list_seconds, "took the honeypot .env", self.cfg.allowlist)
+
+    def block_bait_reuse(self, ip: str) -> None:
+        self.lists.add("block", ip, self.cfg.block_seconds, "reused honeypot credentials", self.cfg.allowlist)
+
+    def shielded(self, ip: str, method: str, path: str, body: bytes) -> bool:
+        if ip in self.cfg.allowlist or not self.lists.active("shield", route_key(method, path)):
+            return False
+        return looks_like_attack(path, body)
+
     def write_log(self, record: dict) -> None:
         line = json.dumps(record, separators=(",", ":"))
         with self.log_lock:
+            try:
+                if self.log_path.stat().st_size > self.cfg.log_max_bytes:
+                    self.log_path.replace(self.log_path.with_suffix(".log.1"))
+            except OSError:
+                pass
             with self.log_path.open("a") as f:
                 f.write(line + "\n")
 
@@ -328,16 +417,25 @@ class Door:
     def is_listed(self, kind: str, ip: str) -> bool:
         return bool(self.listed_entry(kind, ip))
 
-    def tarpit(self, ip: str) -> bool:
+    def tarpit(self, ip: str) -> Slow:
         if not self.is_listed("tarpit", ip):
-            return False
-        if not self.tarpit_slots.acquire(blocking=False):
-            return False
+            return Slow.NO
+        with self.tarpit_lock:
+            if self.tarpit_busy.get(ip, 0) >= self.cfg.tarpit_per_ip or self.tarpit_total >= self.cfg.tarpit_max:
+                return Slow.REFUSE
+            self.tarpit_busy[ip] = self.tarpit_busy.get(ip, 0) + 1
+            self.tarpit_total += 1
         try:
             time.sleep(self.cfg.tarpit_seconds)
         finally:
-            self.tarpit_slots.release()
-        return True
+            with self.tarpit_lock:
+                self.tarpit_total -= 1
+                left = self.tarpit_busy.get(ip, 1) - 1
+                if left > 0:
+                    self.tarpit_busy[ip] = left
+                else:
+                    self.tarpit_busy.pop(ip, None)
+        return Slow.SLOWED
 
     @staticmethod
     def is_quiet(method: str, path: str) -> bool:
@@ -368,7 +466,7 @@ def make_handler(door: Door):
             pass
 
         def client_ip(self) -> str:
-            ip = self.headers.get("Sprite-Client-Ip") or self.client_address[0]
+            ip = client_key(self.headers.get("Sprite-Client-Ip") or self.client_address[0])
             if ip in cfg.allowlist and self.headers.get("X-Bouncer-Stranger"):
                 return STRANGER
             return ip
@@ -424,7 +522,7 @@ def make_handler(door: Door):
             action = self.ADMIN_ACTIONS.get(self.command)
             if action is None:
                 return self.method_not_allowed()
-            target = parts[2] if len(parts) == 3 else ""
+            target = unquote(parts[2]) if len(parts) == 3 else ""
             return action(self, AdminRequest(LIST_KINDS[parts[1]], target, body))
 
         def admin_snapshot(self, req: AdminRequest) -> int:
@@ -460,10 +558,10 @@ def make_handler(door: Door):
         def proxy(self, body: bytes) -> tuple[int, int]:
             conn = http.client.HTTPConnection(cfg.upstream_host, cfg.upstream_port, timeout=60)
             try:
-                conn.request(self.command, self.path, body=body or None, headers=self.upstream_headers())
+                conn.request(self.command, wire_path(self.path), body=body or None, headers=self.upstream_headers())
                 resp = conn.getresponse()
                 data = resp.read()
-            except (OSError, http.client.HTTPException):
+            except (OSError, http.client.HTTPException, ValueError):
                 conn.close()
                 return 502, self.send(502, b"Bad Gateway")
             self.relay(resp, data)
@@ -473,7 +571,7 @@ def make_handler(door: Door):
         def relay(self, resp: http.client.HTTPResponse, data: bytes) -> None:
             self.send_response(resp.status, resp.reason)
             for k, v in resp.getheaders():
-                if k.lower() not in HOP_BY_HOP:
+                if k.lower() not in UPSTREAM_SKIP:
                     self.send_header(k, v)
             if resp.status not in (204, 304):
                 self.send_header("Content-Length", str(len(data)))
@@ -482,25 +580,37 @@ def make_handler(door: Door):
                 self.write_body(data)
 
         def canary_haystack(self, body: bytes) -> str:
-            return self.path + " " + body.decode("utf-8", "replace") + " " + " ".join(self.headers.values())
+            headers = " ".join(v for k, v in self.headers.items() if k.lower() not in CANARY_SKIP_HEADERS)
+            return self.path + " " + body.decode("utf-8", "replace") + " " + headers
 
         def forward(self, ip: str, body: bytes) -> Outcome:
-            kind = EventKind.CANARY_REUSE if door.canary_hits(self.canary_haystack(body)) else EventKind.REQUEST
-            tarpitted = door.tarpit(ip)
+            reuse = bool(door.canary_hits(self.canary_haystack(body)))
+            kind = EventKind.CANARY_REUSE if reuse else EventKind.REQUEST
+            slow = door.tarpit(ip)
+            if slow == Slow.REFUSE:
+                wait = str(max(1, int(cfg.tarpit_seconds)))
+                return Outcome(EventKind.TARPITTED, 429, self.send(429, b"Slow down.\n", extra={"Retry-After": wait}))
             status, size = self.proxy(body)
-            if tarpitted and kind == EventKind.REQUEST:
+            if reuse and trusted_fetch(self.headers) and door.took_bait(ip):
+                door.block_bait_reuse(ip)
+            if slow == Slow.SLOWED and kind == EventKind.REQUEST:
                 kind = EventKind.TARPITTED
             return Outcome(kind, status, size)
+
+        def refuse_blocked(self, block: dict) -> Outcome:
+            refused = b"You're not on the list. The bouncer remembers faces. Come back later.\n"
+            return Outcome(EventKind.REFUSED, 403, self.send(403, refused, extra={"Retry-After": retry_after(block)}))
 
         def respond(self, ip: str, body: bytes) -> Outcome:
             if self.headers.get("Upgrade", "").lower() == "websocket":
                 return Outcome(EventKind.REQUEST, 400, self.send(400, b"websocket not supported, use polling"))
-            block = door.listed_entry("block", ip)
-            if block:
-                refused = b"You're not on the list. The bouncer remembers faces. Come back later.\n"
-                return Outcome(EventKind.REFUSED, 403, self.send(403, refused, extra={"Retry-After": retry_after(block)}))
             if bare_path(self.path) == "/.env":
+                if trusted_fetch(self.headers):
+                    door.mark_bait(ip)
                 return Outcome(EventKind.HONEYPOT, 200, self.send(200, door.honeypot_env().encode()))
+            if door.shielded(ip, self.command, self.path, body):
+                shield = b"This route is shielded until its security fix is merged.\n"
+                return Outcome(EventKind.SHIELDED, 403, self.send(403, shield))
             return self.forward(ip, body)
 
         def build_record(self, started: float, ip: str, body: bytes, outcome: Outcome) -> dict:
@@ -522,6 +632,11 @@ def make_handler(door: Door):
             ctype = self.headers.get("Content-Type")
             if ctype:
                 record["ctype"] = ctype
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            if fetch_site:
+                record["fetch_site"] = fetch_site[:40]
+            if outcome.kind in (EventKind.CANARY_REUSE, EventKind.HONEYPOT):
+                record["took_bait"] = door.took_bait(ip)
             kept = {k: v for k, v in self.headers.items() if k.lower() in REPLAY_HEADERS}
             if kept:
                 record["headers"] = kept
@@ -530,6 +645,13 @@ def make_handler(door: Door):
         def handle_any(self):
             started = time.time()
             ip = self.client_ip()
+            block = None if self.path.startswith(ADMIN_PREFIX) else door.listed_entry("block", ip)
+            if block:
+                self.close_connection = True
+                record = self.build_record(started, ip, b"", self.refuse_blocked(block))
+                door.write_log(record)
+                door.pusher.push(record)
+                return
             try:
                 body = self.read_body()
             except BadRequest:

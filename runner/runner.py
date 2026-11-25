@@ -39,6 +39,7 @@ POLL_SECONDS = 0.25
 ERROR_CHARS = 300
 MAX_VARIANTS = 4
 MAX_BODY = 4 * 1024 * 1024
+BUSY = {"ok": False, "stage": "busy"}
 
 
 class PayloadTooLarge(Exception):
@@ -71,6 +72,7 @@ class Config:
         self.app_dir = Path(env.get("RUNNER_APP_DIR", "/home/sprite/juice-shop"))
         self.build_cmd = env.get("RUNNER_BUILD_CMD", "./node_modules/.bin/tsc")
         self.build_dir = env.get("RUNNER_BUILD_DIR", "build")
+        self.busy_wait = float(env.get("RUNNER_BUSY_WAIT", "10"))
 
 
 class Target:
@@ -251,8 +253,12 @@ class Runner:
         return r
 
     def replay(self, payload: dict) -> dict:
-        with self.lock:
+        if not self.lock.acquire(timeout=self.cfg.busy_wait):
+            return dict(BUSY)
+        try:
             return self._replay(payload)
+        finally:
+            self.lock.release()
 
     def _needs_reset(self, payload: dict) -> bool:
         return payload.get("reset", True) or not self.canary["planted"]

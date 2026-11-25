@@ -30,6 +30,7 @@ class EventKind(Label):
     TARPITTED = "tarpitted"
     HONEYPOT = "honeypot"
     CANARY_REUSE = "canary_reuse"
+    SHIELDED = "shielded"
     FIX = "fix"
 
 

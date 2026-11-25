@@ -225,7 +225,8 @@ class PrBody(unittest.TestCase):
         desc = describe_attack(req, "solved Login Admin")
         self.assertTrue(desc.startswith("<untrusted_http_request>\n"))
         self.assertEqual(desc.count("</untrusted_http_request>"), 1)
-        self.assertIn("<\\/untrusted_http_request>", desc)
+        self.assertIn("&lt;/untrusted_http_request>", desc)
+        self.assertEqual(desc.count("</untrusted_http_request>"), 1)
 
     def test_deleted_external_fork_is_not_own_branch(self):
         gh = GitHub("http://gh", "aotakeda/juice-shop", "master")

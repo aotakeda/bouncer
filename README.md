@@ -8,11 +8,15 @@ The app in this demo is a fork of [OWASP Juice Shop](https://github.com/aotakeda
 
 ## How it works
 
-1. **Proxy** (`door/`). Every request to the shop goes through the proxy, which logs it. The proxy also serves a fake `/.env` file as bait, slows down some clients and refuses blocked ones.
-2. **Triage** (`agent/jev.py`). Unusual requests go to the Jev System One model, which scores how malicious they look.
+1. **Proxy** (`door/`). Every request to the shop goes through the proxy, which logs it. The proxy also serves a fake `/.env` file as bait, slows down some clients and refuses blocked ones. It slows down a client the moment it takes the bait, and blocks it the moment it reuses the bait, without waiting for the agent.
+2. **Triage** (`agent/jev.py`). Unusual requests go to the Jev System One model, which scores how malicious they look. The request text is marked as untrusted in the prompt, and a request shaped like a known attack (SQL injection, path traversal, script injection) always goes to replay, whatever Jev says.
 3. **Replay** (`runner/`). High-scoring requests go to the replay server, an isolated copy of the shop with no internet access. The replay server resets the copy and sends the attack next to a harmless control request. The attack counts as real if it leaks a test account's data or solves a Juice Shop challenge.
-4. **Decision**. Bouncer blocks an IP address only when it has proof. Either the attack worked on the replay server, or the client reused the fake credentials from `/.env`. A block lasts 5 minutes. If a high-scoring attack fails on the replay server, Bouncer only slows the client down. A suspicious score alone never causes a block.
-5. **Fix** (`agent/fix.py`). For a real attack, Claude writes a small patch for the source file that handles the route. Claude also writes up to four other versions of the attack. The replay server applies the patch, compiles the code, then sends the original attack, the other versions and some normal requests. Bouncer opens a pull request only if EVERY attack fails and normal requests still behave the same.
+4. **Decision**. Bouncer blocks an IP address only when it has proof. Either the attack worked on the replay server, or the same client took the fake `/.env` and then reused its credentials. A block lasts 5 minutes. If a high-scoring attack fails on the replay server, Bouncer only slows the client down. A suspicious score alone never causes a block.
+   - Bait values that show up from a client that never took the bait, or from inside another site's page (`Sec-Fetch-Site: cross-site`), are only logged. This stops a third-party page from getting its visitors blocked.
+   - Repeating an attack that was already proven gets an immediate block, without another replay.
+   - IPv6 clients are grouped by `/64`, so rotating addresses inside one network doesn't escape a block.
+5. **Shield**. When an attack is proven, the proxy shields that route for 24 hours: requests to it that look like an attack get `403` before they reach the shop. Normal requests to the route still work. The agent still replays the refused attack on the unpatched replay server, so the attacker is blocked if it would have worked. Run `./deploy/deploy.sh refresh` after merging a fix to pull it and lift the shields.
+6. **Fix** (`agent/fix.py`). For a real attack, Claude writes a small patch for the source file that handles the route. Claude also writes up to four other versions of the attack. The replay server applies the patch, compiles the code, then sends the original attack, the other versions and some normal requests. Bouncer opens a pull request only if EVERY attack fails and normal requests still behave the same.
 
 ### Terms
 
@@ -22,7 +26,8 @@ The app in this demo is a fork of [OWASP Juice Shop](https://github.com/aotakeda
 | Replay server | The isolated copy of the shop where Bouncer tests attacks and patches. |
 | Honeypot | The fake `/.env` file. It contains fake credentials. |
 | Canary | A fake value that Bouncer watches for, such as the honeypot credentials or the replay server's test account. |
-| Tarpit | A 10-second delay on every request from one IP address. |
+| Tarpit | A 10-second delay on every request from one IP address. A slowed client gets at most 2 delayed requests at a time; extra parallel requests get `429`. |
+| Shield | A route the proxy protects after an attack on it is proven. Attack-shaped requests to it get `403` until the fix is merged. |
 | Block | The proxy refuses every request from one IP address with HTTP `403`. |
 | Dashboard | The page that shows requests, scores, decisions and fixes as they happen. |
 
@@ -85,7 +90,7 @@ What you should see:
 - Step 1 returns a fake `.env` file, and the dashboard shows `tarpit`.
 - From then on, each of your requests takes 10 seconds, for 10 minutes. That's the tarpit (not an outage).
 - Step 3 takes 10 seconds and the shop returns `401`.
-- About 10 seconds later you're blocked. The shop returns `403` for 5 minutes.
+- You're blocked right after that. The shop returns `403` for 5 minutes.
 - The dashboard shows `block` with the reason "reused honeypot credentials".
 
 To keep going, find your IP address in the dashboard's **Blocked right now** panel and click **Unblock**. That clears both the block and the tarpit.
@@ -103,9 +108,9 @@ To keep going, find your IP address in the dashboard's **Blocked right now** pan
 
 What you should see:
 
-- The shop returns `200` with user emails and password hashes in `data`. The attack still works on the live shop because the fix isn't merged yet.
-- The dashboard shows a high Jev score, then `replay`, then `PROVEN`: the attack leaked canary values that the control request didn't.
-- About 20 seconds after the attack you're blocked for 5 minutes.
+- If nobody has proven this hole in the last 24 hours, the shop returns `200` with user emails and password hashes in `data`, because the fix isn't merged yet. Otherwise the route is shielded and the shop returns `403` with "This route is shielded until its security fix is merged".
+- The dashboard shows a high Jev score, then `replay`, then `PROVEN`: the attack leaked canary values that the control request didn't. A shielded attack is still replayed on the replay server, so you see `PROVEN` either way.
+- About 15 seconds after the attack you're blocked for 5 minutes.
 - The fix links to pull request #2 instead of opening a second one for the same file.
 - Pull request #2 shows the patch and the test results from the replay server. A table shows each attack version before and after the patch.
 
@@ -121,18 +126,18 @@ What you should see:
 
 What you should see:
 
-- The shop returns `200` with an admin login token.
+- The shop returns `200` with an admin login token, or `403` if the route is already shielded.
 - The dashboard shows `PROVEN`: the attack solved the Juice Shop "Login Admin" challenge.
 - About 15 seconds after the attack you're blocked.
 - The fix links to [pull request #1](https://github.com/aotakeda/juice-shop/pull/1).
 
 ### Running a test again
 
-Bouncer counts the same request from the same IP address only once every 10 minutes. To repeat test 3 or 4, change the text after `--`, for example from `demo1` to `demo2`.
+If you send a request that was already proven from the same IP address, Bouncer blocks you right away without replaying it again. To see the whole replay again in test 3 or 4, change the text after `--`, for example from `demo1` to `demo2`.
 
 ### If you're the owner
 
-Bouncer never blocks or slows down the IP address in `OWNER_IP` in `.secrets`. For that address, the dashboard shows what would have happened to anyone else, such as `would_block`.
+Bouncer never blocks, slows down or shields the IP address in `OWNER_IP` in `.secrets`. For that address, the dashboard shows what would have happened to anyone else, such as `would_block`.
 
 To get a real block from the owner's address, add `-H 'X-Bouncer-Stranger: 1'` to any test command. To undo it, click **Unblock** on the dashboard or run:
 
@@ -194,10 +199,11 @@ The script creates `.secrets` if it's missing, installs the shop on two Sprites,
 
 | To | Run |
 |---|---|
-| List blocks and tarpits | `./deploy/deploy.sh blocks` |
+| List blocks, tarpits and shields | `./deploy/deploy.sh blocks` |
 | Remove a block and tarpit | `./deploy/deploy.sh unblock 203.0.113.7` |
+| Lift all shields | `./deploy/deploy.sh unshield` |
 | Change the dashboard passphrase | Edit `DASH_PASSPHRASE` in `.secrets`, then `FIX_MODE=pr ./deploy/deploy.sh services` |
-| Pull merged fixes onto the shop and replay server | `./deploy/deploy.sh refresh` |
+| Pull merged fixes onto the shop and replay server, then lift the shields | `./deploy/deploy.sh refresh` |
 | Change the block length (default 300 seconds) | `BLOCK_SECONDS=600 FIX_MODE=pr ./deploy/deploy.sh services` |
 
 ### Limits
