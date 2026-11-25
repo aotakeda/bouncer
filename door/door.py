@@ -538,9 +538,18 @@ def make_handler(door: Door):
             return self.send_json(door.lists.put(req.kind, entries, cfg.allowlist))
 
         def admin_delete(self, req: AdminRequest) -> int:
-            if not req.target:
+            target = req.target
+            if not target and req.body:
+                try:
+                    payload = json.loads(req.body)
+                except ValueError:
+                    return self.send(400, b"bad json")
+                target = payload.get("target") if isinstance(payload, dict) else None
+                if not isinstance(target, str):
+                    return self.send(400, b"bad json")
+            if not target:
                 return self.method_not_allowed()
-            existed = door.lists.delete(req.kind, req.target)
+            existed = door.lists.delete(req.kind, target)
             return self.send_json({"ok": True, "existed": existed})
 
         ADMIN_ACTIONS = {

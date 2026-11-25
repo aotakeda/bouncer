@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -273,6 +274,43 @@ class EndToEnd(unittest.TestCase):
         with urllib.request.urlopen(unblock_req) as r:
             self.assertTrue(json.loads(r.read())["ok"])
         self.assertEqual(call(self.door + "/", OWNER, extra=stranger)[0], 200)
+
+    def test_dashboard_lists_and_removes_shields(self):
+        agent = f"http://127.0.0.1:{self.p['agent']}"
+        route = "GET /shield-test"
+        admin = {"Authorization": "Bearer door-secret", "Content-Type": "application/json"}
+        put = urllib.request.Request(self.door + "/_bouncer/shield", data=json.dumps({route: {"until": time.time() + 600, "reason": "test"}}).encode(), method="PUT", headers=admin)
+        urllib.request.urlopen(put).read()
+        attack = "/shield-test?q=" + urllib.parse.quote("../../etc/passwd")
+        self.assertEqual(call(self.door + attack, "4.3.2.1")[0], 403)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        login_req = urllib.request.Request(agent + "/login", data=b"passphrase=let+me+in", method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.build_opener(NoRedirect).open(login_req)
+        cookie = ctx.exception.headers.get("Set-Cookie", "").split(";", 1)[0]
+        with urllib.request.urlopen(urllib.request.Request(agent + "/api/state", headers={"Cookie": cookie})) as r:
+            state = json.loads(r.read())
+        self.assertEqual([x["route"] for x in state["shields"]], [route])
+
+        bad = urllib.request.Request(agent + "/api/unshield", data=json.dumps({"route": "GET /x\r\nHost: y"}).encode(), method="POST", headers={"Cookie": cookie, "Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(bad)
+        self.assertEqual(ctx.exception.code, 400)
+        anonymous = urllib.request.Request(agent + "/api/unshield", data=json.dumps({"route": route}).encode(), method="POST", headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(anonymous)
+        self.assertEqual(ctx.exception.code, 401)
+
+        remove = urllib.request.Request(agent + "/api/unshield", data=json.dumps({"route": route}).encode(), method="POST", headers={"Cookie": cookie, "Content-Type": "application/json"})
+        with urllib.request.urlopen(remove) as r:
+            self.assertTrue(json.loads(r.read())["ok"])
+        with urllib.request.urlopen(urllib.request.Request(agent + "/api/state", headers={"Cookie": cookie})) as r:
+            self.assertEqual(json.loads(r.read())["shields"], [])
+        self.assertNotEqual(call(self.door + attack, "4.3.2.1")[0], 403)
 
     def test_door_rejects_bad_length_and_decodes_chunked(self):
         import http.client

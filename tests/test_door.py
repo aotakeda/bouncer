@@ -159,6 +159,18 @@ class DoorTests(unittest.TestCase):
         self.assertEqual(self.call("/", "2001:db8:1:2:aaaa::1")[0], 403)
         self.assertEqual(self.call("/", "2001:db8:1:3::1")[0], 200)
 
+    def test_admin_delete_takes_targets_with_slashes_from_the_body(self):
+        route = "GET /rest/products/search"
+        self.admin("PUT", "shield", {route: {"until": time.time() + 60, "reason": "proven"}})
+        self.admin("PUT", "blocklist", {"2001:db8:9:9::/64": {"until": time.time() + 60, "reason": "test"}})
+        attack = "/rest/products/search?q=" + urllib.parse.quote("zz')) UNION SELECT 1--")
+        self.assertEqual(self.call(attack, "1.1.1.2")[0], 403)
+        self.assertEqual(self.admin("DELETE", "shield", {"target": route}), 200)
+        self.assertEqual(self.call(attack, "1.1.1.2")[0], 200)
+        self.assertEqual(self.admin("DELETE", "blocklist", {"target": "2001:db8:9:9::/64"}), 200)
+        self.assertEqual(self.call("/", "2001:db8:9:9::1")[0], 200)
+        self.assertEqual(self.admin("DELETE", "blocklist", {"target": 5}), 400)
+
     def test_raw_non_ascii_path_is_forwarded_percent_encoded(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
             s.sendall(b"GET /caf\xc3\xa9 HTTP/1.1\r\nHost: x\r\nSprite-Client-Ip: 5.5.5.5\r\nConnection: close\r\n\r\n")

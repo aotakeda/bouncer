@@ -62,7 +62,9 @@ LINES = {
 
 
 SHAME_CAPTIONS = (
-    (lambda bare: "wp-" in bare or bare.endswith(".php"), "{count}x tried to log into WordPress. This is a juice shop."),
+    (lambda bare: "phpmyadmin" in bare.lower(), "{count}x looking for phpMyAdmin. No database panel here."),
+    (lambda bare: "wp-" in bare or bare.endswith("xmlrpc.php"), "{count}x tried to log into WordPress. This is a juice shop."),
+    (lambda bare: bare.endswith(".php"), "{count}x asked for a PHP page. We don't serve PHP."),
     (lambda bare: ".git" in bare, "{count}x asked for our git history. Bold."),
     (lambda bare: ".env" in bare, "{count}x went straight for the secrets drawer."),
     (lambda bare: "admin" in bare, "{count}x looking for the manager."),

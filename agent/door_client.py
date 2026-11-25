@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import time
-from urllib.parse import quote
 
 from . import net
 from .labels import Decision
 
 ENDPOINTS = {Decision.BLOCK: "blocklist", Decision.TARPIT: "tarpit"}
 SHIELD_ENDPOINT = "shield"
+EMPTY_SNAPSHOT = {"block": {}, "tarpit": {}, "shield": {}}
 
 
 class DoorClient:
@@ -43,7 +43,7 @@ class DoorClient:
 
     def snapshot(self, timeout: float = 3) -> dict:
         if not self.enabled:
-            return {"block": {}, "tarpit": {}}
+            return dict(EMPTY_SNAPSHOT)
         status, body, _ = net.request(
             f"{self.url}/_bouncer/blocklist",
             "GET",
@@ -51,19 +51,26 @@ class DoorClient:
             headers=self.headers,
         )
         if status == 200 and isinstance(body, dict):
-            return {"block": body.get("block") or {}, "tarpit": body.get("tarpit") or {}}
-        return {"block": {}, "tarpit": {}}
+            return {kind: body.get(kind) or {} for kind in EMPTY_SNAPSHOT}
+        return dict(EMPTY_SNAPSHOT)
 
-    def delete(self, kind: Decision, ip: str) -> bool:
-        if not self.enabled or not ip:
+    def _delete(self, endpoint: str, target: str) -> bool:
+        if not self.enabled or not target:
             return False
-        status, _, _ = net.request(
-            f"{self.url}/_bouncer/{ENDPOINTS[kind]}/{quote(ip, safe='')}",
+        status, body, _ = net.request(
+            f"{self.url}/_bouncer/{endpoint}",
             "DELETE",
+            {"target": target},
             timeout=10,
             headers=self.headers,
         )
-        return status == 200
+        return status == 200 and isinstance(body, dict) and body.get("ok") is True
+
+    def delete(self, kind: Decision, ip: str) -> bool:
+        return self._delete(ENDPOINTS[kind], ip)
+
+    def delete_shield(self, route: str) -> bool:
+        return self._delete(SHIELD_ENDPOINT, route)
 
     def unblock(self, ip: str) -> bool:
         if not self.enabled or not ip:

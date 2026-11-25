@@ -430,6 +430,26 @@ class JudgeFindings(unittest.TestCase):
         self.assertTrue(row(Verdict.NOT_REPRODUCED, Verdict.NOT_REPRODUCED).endswith("| no effect | no effect |"))
         self.assertTrue(row(Verdict.MINOR, Verdict.NOT_REPRODUCED).endswith("| minor only | no effect |"))
 
+    def test_probe_captions_name_the_right_target(self):
+        from agent.persona import shame_caption
+
+        self.assertIn("phpMyAdmin", shame_caption("/phpmyadmin/index.php", 1))
+        self.assertIn("WordPress", shame_caption("/wp-login.php", 2))
+        self.assertIn("WordPress", shame_caption("/xmlrpc.php", 1))
+        self.assertNotIn("WordPress", shame_caption("/shell.php", 1))
+
+    def test_shielded_route_shows_on_its_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            event = {"ts": 1.0, "ip": "5.5.5.5", "method": "GET", "path": "/rest/products/search?q=x"}
+            brain.store.incidents.append({"ts": 1.0, "ip": "5.5.5.5", "event": event, "replay": {"why": "leaked"}, "jev": {}, "blocked": True})
+            snapshot = {"block": {}, "tarpit": {}, "shield": {"GET /rest/products/search": {"until": time.time() + 60, "reason": "proven"}, "POST /gone": {"until": time.time() - 1}}}
+            state = brain.views.state([], snapshot, "", False)
+        self.assertEqual([s["route"] for s in state["shields"]], ["GET /rest/products/search"])
+        signal = state["signals"][0]
+        self.assertEqual(signal["shield"]["route"], "GET /rest/products/search")
+        self.assertIn("Route shielded until the fix is merged", [step["label"] for step in signal["steps"]])
+
 
 if __name__ == "__main__":
     unittest.main()

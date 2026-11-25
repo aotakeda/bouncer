@@ -298,6 +298,8 @@ a.chip{transition:border-color 120ms ease,background-color 120ms ease}
 .brow-kind{font-weight:500;min-width:58px}
 .brow-kind.k-block{color:var(--red)}
 .brow-kind.k-tarpit{color:var(--orange)}
+.brow-kind.k-shield{color:var(--green)}
+.brow-route{font-weight:500;color:var(--fg);min-width:0;overflow-wrap:anywhere}
 .brow-meta{color:var(--mute);font-size:12px;min-width:0;overflow-wrap:anywhere}
 
 .totals{display:flex;gap:4px 14px;flex-wrap:wrap;font-size:12px;color:var(--mute)}
@@ -679,12 +681,12 @@ const SEV=['critical','high','medium','low','info'];
 const SEV_LABEL={critical:'Critical',high:'High',medium:'Medium',low:'Low',info:'Info'};
 const STATUS_LABEL={open:'New',reviewing:'In progress',resolved:'Done'};
 const STATUS_ORDER=['open','reviewing','resolved'];
-const STATUS_HINT={open:'New, nobody has looked yet',reviewing:'You are looking into it',resolved:'Handled. Reopens if the attacker comes back'};
+const STATUS_HINT={open:'New, nobody has looked yet',reviewing:'You are looking into it',resolved:'Handled. A proven exploit reopens if someone tries it again'};
 const RANGES=[['15m',900,60],['1h',3600,120],['24h',86400,1800],['7d',604800,21600]];
 const EVT_LABELS={attacks:'Attacks',blocked:'Blocked',slowed:'Slowed',all:'All'};
 const ATTACK=/union\s+(all\s+)?select|'\s*(or|and)\s+[\w'"]+\s*=|'\)+|'\s*--|<\s*script|javascript:|onerror\s*=|onload\s*=|\.\.\/|\.\.\\|;\s*drop\s|sleep\(\d/i;
 const ui={sig:'all',showDone:false,evt:'attacks',range:'1h',live:true,pending:[],open:null,instant:false,loaded:false,scrollTo:null,lastSync:0};
-let S={signals:[],recent:[],traffic:[],lists:[],shame:[],now:Date.now()/1000};
+let S={signals:[],recent:[],traffic:[],lists:[],shields:[],shame:[],now:Date.now()/1000};
 const arrived=new Map();
 const FRESH_MS=900;
 const reduceMotion=()=>window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -768,9 +770,8 @@ function fmtLeft(s){
   s=Math.max(0,Math.round(Number(s)||0));
   if(s===0)return 'Expiring now';
   if(s<60)return `${s} ${plural(s,'second','seconds')} left`;
-  if(s<3600)return `${Math.ceil(s/60)} min left`;
-  if(s<86400){const h=Math.floor(s/3600),m=Math.round((s%3600)/60);return m?`${h}h ${m}m left`:`${h}h left`}
-  const d=Math.floor(s/86400),h=Math.round((s%86400)/3600);
+  if(s<86400){const t=Math.ceil(s/60),h=Math.floor(t/60),m=t%60;if(t<60)return `${t} min left`;return h>=24?'1 day left':m?`${h}h ${m}m left`:`${h}h left`}
+  const t=Math.round(s/3600),d=Math.floor(t/24),h=t%24;
   return h?`${d}d ${h}h left`:`${d}d left`;
 }
 function fmtDur(d){
@@ -862,6 +863,7 @@ const L={
   medium:shield('var(--mute)','<path d="M8 5.2 5.6 6.1v1.7c0 1.5 1 2.6 2.4 3.1 1.4-.5 2.4-1.6 2.4-3.1V6.1Z" fill="var(--mute)"/>'),
   low:shield('var(--subtle)'),
   info:svg16('<path d="M3 8h1.5M7.25 8h1.5M11.5 8H13" stroke="var(--subtle)" stroke-width="1.5" stroke-linecap="round"/>'),
+  guard:shield('var(--green)','<path d="m5.6 8 1.7 1.7 3.1-3.2" stroke="var(--green)" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>'),
   block:svg16('<circle cx="8" cy="8" r="5.75" stroke="var(--red)" stroke-width="1.5"/><path d="m4 12 8-8" stroke="var(--red)" stroke-width="1.5"/>'),
   slow:svg16('<circle cx="8" cy="8" r="5.75" stroke="var(--orange)" stroke-width="1.5"/><path d="M8 5v3.25l2 1.25" stroke="var(--orange)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'),
   pr:svg16('<g stroke="var(--green)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3.5" r="1.6"/><circle cx="4" cy="12.5" r="1.6"/><circle cx="12" cy="12.5" r="1.6"/><path d="M4 5.1v5.8M12 10.9V7a2.5 2.5 0 0 0-2.5-2.5H7.25M8.75 3 7.25 4.5 8.75 6"/></g>'),
@@ -904,6 +906,7 @@ const sigRef=s=>SIG_NUM.get(s.id)||'';
 const prNum=url=>{const m=String(url||'').match(/\/pull\/(\d+)/);return m?'PR #'+m[1]:''};
 const findSignal=id=>(S.signals||[]).find(x=>x.id===id);
 const blockFor=ip=>(S.lists||[]).find(x=>x.ip===ip);
+const activeShields=()=>(S.shields||[]).filter(x=>leftNow(x)>0);
 function fixChip(s){
   if(!s.fix_label)return '';
   const pr=s.fix&&s.fix.pr_url;
@@ -918,19 +921,32 @@ function renderNav(){
   n.textContent=open?fmtN(open):'';
   n.classList.toggle('hot',open>0);
   n.title=open?`${fmtN(open)} open`:'';
-  const blocked=(S.lists||[]).length;
+  const blocked=(S.lists||[]).length+activeShields().length;
   $('nBlocked').textContent=blocked?fmtN(blocked):'';
   document.title=open?`(${open}) Bouncer`:'Bouncer';
 }
 
 const leftNow=x=>Math.max(0,(Number(x.left)||0)-(ui.lastSync?(Date.now()-ui.lastSync)/1000:0));
 let lastBlockedHtml='';
+function shieldRow(x){
+  const meta=[fmtLeft(leftNow(x)),'attack-shaped requests get 403'].join(' · ');
+  return `<div class="brow">
+      ${L.guard}
+      <span class="brow-body">
+        <span class="brow-route mono">${esc(x.route)}</span>
+        <span class="brow-kind k-shield">Shielded</span>
+        <span class="brow-meta">${esc(meta)}</span>
+      </span>
+      <button type="button" class="btn" data-unshield="${esc(x.route)}">Remove shield</button>
+    </div>`;
+}
 function renderBlocked(){
   const rows=S.lists||[];
+  const shields=activeShields();
   let html;
   if(!ui.loaded)html='<div class="empty">Loading…</div>';
-  else if(!rows.length)html='<div class="empty">Nobody is blocked or slowed down right now.</div>';
-  else html=rows.map(x=>{
+  else if(!rows.length&&!shields.length)html='<div class="empty">Nobody is blocked or slowed down right now.</div>';
+  else html=(rows.length?'':'<div class="empty">Nobody is blocked or slowed down right now.</div>')+rows.map(x=>{
     const isBlock=x.kind==='block';
     const meta=[fmtLeft(leftNow(x)),x.reason?x.reason.trim():''].filter(Boolean).join(' · ');
     return `<div class="brow">
@@ -943,7 +959,7 @@ function renderBlocked(){
       </span>
       <button type="button" class="btn" data-unblock="${esc(x.ip)}" data-label="${esc(x.label)}">Unblock</button>
     </div>`;
-  }).join('');
+  }).join('')+shields.map(shieldRow).join('');
   if(html!==lastBlockedHtml){$('blocked').innerHTML=html;lastBlockedHtml=html}
 }
 
@@ -1410,6 +1426,7 @@ function signalDrawer(s){
       <dt>Severity</dt><dd><span class="pv">${sevIcon(s.severity)}${esc(SEV_LABEL[s.severity]||s.severity)}</span></dd>
       <dt>Source</dt><dd><span class="pv mono">${esc(s.ip)}</span>${enforce}</dd>
       <dt>Fix</dt><dd>${fixVal}</dd>
+      ${s.shield&&leftNow(s.shield)>0?`<dt>Shield</dt><dd><span class="chip">${L.guard}On · ${esc(fmtLeft(leftNow(s.shield)).replace(/ left$/,''))}</span><button type="button" class="btn subtle" data-unshield="${esc(s.shield.route)}">Remove shield</button></dd>`:''}
       ${s.jev?`<dt>Classifier</dt><dd><span class="pv">${pct(s.jev.malicious)} attack</span><span class="pv-sub">· suggested ${esc(s.jev.action||'–')} · ${pct(s.jev.confidence)} confident</span></dd>`:''}
       <dt>Seen</dt><dd><span class="pv">${fmtN(s.count)} ${plural(s.count,'time','times')}</span><span class="pv-sub" title="${esc(stamp(s.first))} – ${esc(stamp(s.last))}">· last ${esc(ago(s.last))}</span></dd>
     </dl>
@@ -1757,12 +1774,31 @@ async function unblock(ip,label,btn){
   const orig=btn?btn.textContent:'';
   if(btn){btn.disabled=true;btn.textContent='Unblocking…'}
   try{
-    await api('api/unblock',{ip});
+    const r=await api('api/unblock',{ip});
+    if(!r)return;
+    const res=await r.json().catch(()=>({}));
+    if(!res.ok)throw new Error('not applied');
     toast(`Unblocked ${label}`);
     return sync();
   }catch(e){
     if(btn&&document.contains(btn)){btn.disabled=false;btn.textContent=orig}
     toast(`Couldn't unblock ${label}. Try again.`,{error:true});
+  }
+}
+
+async function unshield(route,btn){
+  const orig=btn?btn.textContent:'';
+  if(btn){btn.disabled=true;btn.textContent='Removing…'}
+  try{
+    const r=await api('api/unshield',{route});
+    if(!r)return;
+    const res=await r.json().catch(()=>({}));
+    if(!res.ok)throw new Error('not applied');
+    toast(`Shield removed from ${route}`);
+    return sync();
+  }catch(e){
+    if(btn&&document.contains(btn)){btn.disabled=false;btn.textContent=orig}
+    toast(`Couldn't remove the shield from ${route}. Try again.`,{error:true});
   }
 }
 
@@ -1808,6 +1844,7 @@ function paletteItems(){
     if(s.fix&&s.fix.pr_url)items.push({group:'This signal',label:`Review ${prNum(s.fix.pr_url)||'pull request'} on GitHub`,icon:L.pr,run:()=>window.open(s.fix.pr_url,'_blank','noopener')});
     if(s.fix&&s.fix.diff)items.push({group:'This signal',label:'View patch',icon:L.go,run:()=>{ui.scrollTo='dPatch';renderDrawer()}});
     if(blockFor(s.raw_ip))items.push({group:'This signal',label:`Unblock ${s.ip}`,icon:L.block,run:()=>unblock(s.raw_ip,s.ip)});
+    if(s.shield&&leftNow(s.shield)>0)items.push({group:'This signal',label:`Remove shield from ${s.shield.route}`,icon:L.guard,run:()=>unshield(s.shield.route)});
     items.push({group:'This signal',label:'Copy link to signal',icon:L.link,run:copyLink});
     K.ctx=grp;
   }else K.ctx='';
@@ -1816,6 +1853,7 @@ function paletteItems(){
   items.push({group:'Go to',label:ui.live?'Pause live updates':'Resume live updates',icon:ui.live?L.pause:L.play,run:toggleLive});
   (S.signals||[]).forEach(x=>items.push({group:'Signals',label:`${sigRef(x)}  ${x.title}`,icon:statusIcon(x.status),hint:[shortAgo(x.last)],plain:true,run:()=>openDrawer({id:x.id})}));
   (S.lists||[]).forEach(x=>items.push({group:'Blocked',label:`Unblock ${x.label}`,icon:x.kind==='block'?L.block:L.slow,run:()=>unblock(x.ip,x.label)}));
+  activeShields().forEach(x=>items.push({group:'Blocked',label:`Remove shield from ${x.route}`,icon:L.guard,run:()=>unshield(x.route)}));
   return items;
 }
 function renderPalette(){
@@ -1912,6 +1950,7 @@ document.addEventListener('click',ev=>{
   }
   if(t.hasAttribute('data-copy-link'))return copyLink();
   if(t.dataset.unblock){ev.stopPropagation();return unblock(t.dataset.unblock,t.dataset.label||t.dataset.unblock,t)}
+  if(t.dataset.unshield){ev.stopPropagation();return unshield(t.dataset.unshield,t)}
   if(t.hasAttribute('data-done-toggle')){ui.showDone=!ui.showDone;return renderSignals()}
   if(t.dataset.sig){ui.sig=t.dataset.sig;return renderSignals()}
   if(t.dataset.evt){ui.evt=t.dataset.evt;return renderTraffic(true)}
@@ -2004,7 +2043,7 @@ setInterval(()=>{if(ui.live){renderSignals();renderTraffic(true)}},30000);
 setInterval(()=>{
   updateLive();
   if(!ui.live||!ui.loaded)return;
-  if((S.lists||[]).some(x=>leftNow(x)<=0))return soon();
+  if((S.lists||[]).some(x=>leftNow(x)<=0)||(S.shields||[]).some(x=>leftNow(x)<=0))return soon();
   renderBlocked();
   renderDrawer();
 },5000);

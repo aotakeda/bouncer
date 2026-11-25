@@ -175,20 +175,30 @@ class Views:
                 })
         return rows
 
+    def shields(self, snapshot: dict) -> list:
+        now = time.time()
+        rows = []
+        for route, entry in (snapshot.get("shield") or {}).items():
+            left = int(entry.get("until", 0) - now)
+            if left > 0:
+                rows.append({"route": route, "left": left, "reason": str(entry.get("reason", ""))[:120]})
+        return sorted(rows, key=lambda r: r["route"])
+
     def blocked_step(self, blocked: bool, ts, unblocked_note: str = "") -> dict:
         if blocked:
             return {"label": f"Client blocked for {self.cfg.block_seconds // 60} min", "state": "done", "ts": ts, "note": ""}
         return {"label": "Client not blocked", "state": "todo", "ts": ts, "note": unblocked_note}
 
-    def proven_signals(self, fixes_on: bool) -> list:
+    def proven_signals(self, fixes_on: bool, shields: dict | None = None) -> list:
         groups: dict = {}
         for incident in self.store.incidents[-KEPT_INCIDENTS:]:
             event = incident.get("event") or {}
             key = f"proven:{event.get('method') or ''} {bare_path(event.get('path') or '')}"
             groups.setdefault(key, []).append(incident)
-        return [self.proven_signal(key, items, fixes_on) for key, items in groups.items()]
+        shields = shields or {}
+        return [self.proven_signal(key, items, fixes_on, shields.get(key.removeprefix("proven:"))) for key, items in groups.items()]
 
-    def proven_signal(self, key: str, items: list, fixes_on: bool) -> dict:
+    def proven_signal(self, key: str, items: list, fixes_on: bool, shield: dict | None = None) -> dict:
         latest = items[-1]
         event = latest.get("event") or {}
         replay = latest.get("replay") or {}
@@ -198,6 +208,7 @@ class Views:
             {"label": "Flagged by classifier", "state": "done" if jev.get("ok") else "todo", "ts": event.get("ts"), "note": f"{round(jev['malicious'] * 100)}% attack" if isinstance(jev.get("malicious"), (int, float)) else ""},
             {"label": "Proven on the stunt double", "state": "bad", "ts": latest["ts"], "note": replay.get("why") or ""},
             self.blocked_step(latest.get("blocked", True), latest["ts"], "Owner or door unavailable"),
+            *([{"label": "Route shielded until the fix is merged", "state": "done", "ts": latest["ts"], "note": "attack-shaped requests get 403"}] if shield else []),
             *fix_steps(fix, fixes_on),
         ]
         pill, pill_state = fix_pill(fix)
@@ -221,6 +232,7 @@ class Views:
             "fix_label": pill,
             "fix_state": pill_state,
             "fix": fix_view(fix),
+            "shield": shield,
             "steps": steps,
         }
 
@@ -254,9 +266,10 @@ class Views:
             "steps": steps,
         }
 
-    def signals(self, fixes_on: bool) -> list:
+    def signals(self, fixes_on: bool, shields: list | None = None) -> list:
+        by_route = {s["route"]: s for s in shields or []}
         with self.store.lock:
-            items = self.proven_signals(fixes_on) + [self.catch_signal(c) for c in self.store.catches]
+            items = self.proven_signals(fixes_on, by_route) + [self.catch_signal(c) for c in self.store.catches]
         rank = {s: i for i, s in enumerate(SIGNAL_STATES)}
         order = {s: i for i, s in enumerate(SEVERITIES)}
         return sorted(items, key=lambda s: (rank[s["status"]], order[s["severity"]], -s["last"]))
@@ -268,14 +281,16 @@ class Views:
             shame = [{"path": p, "count": c, "caption": persona.shame_caption(p, c)} for p, c in store.shame.most_common(10)]
             incidents = [self.incident(i) for i in store.incidents[-KEPT_INCIDENTS:]]
             traffic = sorted([k * 60, *v] for k, v in store.traffic.items())
+        shields = self.shields(door_lists)
         return {
             "stats": stats,
             "recent": recent,
             "shame": shame,
             "incidents": incidents,
-            "signals": self.signals(fixes_on),
+            "signals": self.signals(fixes_on, shields),
             "traffic": traffic,
             "lists": self.lists(door_lists, viewer_ip),
+            "shields": shields,
             "fix_mode": self.cfg.fix_mode if fixes_on else "off",
             "now": time.time(),
         }

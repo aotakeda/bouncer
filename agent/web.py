@@ -148,6 +148,14 @@ def make_handler(brain: Brain):
             ok = brain.unblock(ip)
             return self.reply(200, json.dumps({"ok": ok, "ip": ip}).encode(), JSON)
 
+        def post_unshield(self, data: bytes):
+            payload = self.dash_json(data)
+            route = payload.get("route") if isinstance(payload, dict) else None
+            if not isinstance(route, str) or not route or len(route) > 2000 or any(c in route for c in "\r\n"):
+                return self.reply(400, b"bad route", TEXT)
+            ok = brain.unshield(route)
+            return self.reply(200, json.dumps({"ok": ok, "route": route}).encode(), JSON)
+
         def post_signal(self, data: bytes):
             payload = self.dash_json(data)
             if not isinstance(payload, dict) or not brain.set_signal_status(payload.get("id"), payload.get("status")):
@@ -192,7 +200,7 @@ def make_handler(brain: Brain):
 
         PUBLIC_GET_ROUTES = {"/healthz": healthz}
         PRIVATE_GET_ROUTES = {"/": dashboard, "/api/state": api_state, "/stream": stream}
-        POST_ROUTES = {"/events": post_events, "/login": post_login, "/api/unblock": post_unblock, "/api/signal": post_signal}
+        POST_ROUTES = {"/events": post_events, "/login": post_login, "/api/unblock": post_unblock, "/api/unshield": post_unshield, "/api/signal": post_signal}
 
         def do_POST(self):
             try:

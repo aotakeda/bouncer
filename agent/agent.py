@@ -283,6 +283,8 @@ class Brain:
         route = f"{record.get('method')} {bare_path(record['path'])}"
         ok = self.door.put_shield(route, self.cfg.shield_seconds, "proven exploit: " + why[:120])
         self.store.count("shield_sent" if ok else "shield_failed")
+        if ok:
+            self._forget_lists()
 
     def _on_proven(self, event: dict, record: dict, triage: dict) -> Decision:
         ip, result = record["ip"], record["replay"]
@@ -359,6 +361,16 @@ class Brain:
         ok = self.door.unblock(ip)
         if ok:
             self.store.count("unblocked")
+            self._forget_lists()
+            self.feed.notify({"kind": "state", "what": "lists"})
+        return ok
+
+    def unshield(self, route: str) -> bool:
+        if not self.door.enabled or not route:
+            return False
+        ok = self.door.delete_shield(route)
+        if ok:
+            self.store.count("unshielded")
             self._forget_lists()
             self.feed.notify({"kind": "state", "what": "lists"})
         return ok
