@@ -70,6 +70,10 @@ class Feed:
     def publish(self, item: dict) -> None:
         with self.lock:
             self.recent.append(item)
+        self.notify(item)
+
+    def notify(self, item: dict) -> None:
+        with self.lock:
             listeners = list(self.listeners)
         for q in listeners:
             try:

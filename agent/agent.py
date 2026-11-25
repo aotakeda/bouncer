@@ -289,6 +289,13 @@ class Brain:
         if ok:
             self.store.count("unblocked")
             self._forget_lists()
+            self.feed.notify({"kind": "state", "what": "lists"})
+        return ok
+
+    def set_signal_status(self, key: str, status: str) -> bool:
+        ok = self.store.set_signal_status(key, status)
+        if ok:
+            self.feed.notify({"kind": "state", "what": "signal", "id": key})
         return ok
 
     def decide(self, record: dict, decision: Decision, line: str) -> Decision:

@@ -4,3 +4,4 @@ agent-data/
 door-data/
 .env
 .secrets
+video/

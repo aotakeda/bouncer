@@ -147,7 +147,7 @@ def make_handler(brain: Brain):
 
         def post_signal(self, data: bytes):
             payload = self.dash_json(data)
-            if not isinstance(payload, dict) or not brain.store.set_signal_status(payload.get("id"), payload.get("status")):
+            if not isinstance(payload, dict) or not brain.set_signal_status(payload.get("id"), payload.get("status")):
                 return self.reply(400, b"bad signal update", TEXT)
             return self.reply(200, json.dumps({"ok": True}).encode(), JSON)
 
