@@ -17,7 +17,8 @@ from .claude import Claude
 from .github import GitHub
 from .labels import FixStatus, Verdict
 from .net import ERROR_DETAIL_CHARS, bare_path, clip
-from .pr_text import pr_body
+from .policy import JWT, unsigned_jwt
+from .pr_text import pr_body, pr_title
 from .replay import build_control, build_request, interpret
 from .route_finder import locate_route
 
@@ -27,6 +28,8 @@ KNOWN_RESULT_FIELDS = ("file", "title", "summary", "diff", "pr_url", "verify")
 MAX_VARIANTS = 4
 VARIANTS_FAILED = "Claude's variant request failed, so only the original attack was replayed."
 VARIANTS_EMPTY = "Claude offered no usable variants, so only the original attack was replayed."
+SECRET_HEADERS = ("authorization", "cookie")
+REQUEST_TAG = re.compile(r"<(\s*/?\s*[\w-]*request)", re.IGNORECASE)
 
 
 def apply_edits(source: str, edits: list) -> tuple:
@@ -73,18 +76,29 @@ def clean_variants(req: dict, raw: list) -> list:
     return out
 
 
+def neutralize(text: str) -> str:
+    return REQUEST_TAG.sub(lambda m: "&lt;" + m.group(1), str(text))
+
+
 def untrusted_block(tag: str, text: str) -> str:
-    safe = re.sub(rf"<(\s*/?\s*){re.escape(tag)}", lambda m: "&lt;" + m.group(1) + tag, text, flags=re.IGNORECASE)
-    return f"<{tag}>\n{safe}\n</{tag}>"
+    return f"<{tag}>\n{neutralize(text)}\n</{tag}>"
+
+
+def redact(name: str, value) -> str:
+    if str(name).lower() not in SECRET_HEADERS:
+        return str(value)
+    text = str(value)
+    note = ", holds an unsigned JWT" if any(unsigned_jwt(t) for t in JWT.findall(text)) else ""
+    return f"[redacted, {len(text)} chars{note}]"
 
 
 def describe_attack(req: dict, why: str) -> str:
     lines = [f"{req.get('method')} {req.get('path')}"]
-    lines.extend(f"{k}: {v}" for k, v in (req.get("headers") or {}).items())
+    lines.extend(f"{k}: {redact(k, v)}" for k, v in (req.get("headers") or {}).items())
     if req.get("body"):
         lines.append("")
         lines.append(clip(req["body"], 3000))
-    return untrusted_block("untrusted_http_request", "\n".join(lines)) + f"\n\nReplay result: {why}"
+    return untrusted_block("untrusted_http_request", "\n".join(lines)) + f"\n\nReplay result: {neutralize(why)}"
 
 
 def stage_verdict(variant: dict, verify: dict, stage: str, index: int, control: dict) -> Verdict:
@@ -115,7 +129,7 @@ def smoke_diff(before: dict, after: dict) -> list:
 
 def retry_feedback(patch: dict, problem: str) -> str:
     edits = json.dumps(patch.get("edits"), indent=1)[:6000]
-    return f"\n\nYour previous edits were:\n{edits}\n\nThey failed: {problem}\nTry again."
+    return neutralize(f"\n\nYour previous edits were:\n{edits}\n\nThey failed: {problem}\nTry again.")
 
 
 @dataclass
@@ -405,7 +419,7 @@ class Fixer:
             self._set_file(path, FixStatus.READY, result)
             return result
         branch = branch_prefix(path) + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        pr = self.github.open_pr(branch, path, job.original["sha"], new_text, result["title"], result["pr_body"])
+        pr = self.github.open_pr(branch, path, job.original["sha"], new_text, pr_title(result["title"]), result["pr_body"])
         result["pr"] = pr
         if not pr.get("ok"):
             result["status"] = FixStatus.PR_FAILED

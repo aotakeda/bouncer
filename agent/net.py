@@ -4,9 +4,11 @@ import http.client
 import ipaddress
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SPRITE_SOCK = "/.sprite/api.sock"
@@ -16,6 +18,13 @@ ERROR_DETAIL_CHARS = 300
 
 def bare_path(path: str) -> str:
     return path.split("?", 1)[0]
+
+
+def route_path(path: str) -> str:
+    if not path.startswith("/"):
+        path = urllib.parse.urlsplit(path).path or "/"
+    bare = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
+    return re.sub(r"/{2,}", "/", bare).lower().rstrip("/") or "/"
 
 
 def ip_key(ip: str) -> str:

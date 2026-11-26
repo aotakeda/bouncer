@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from . import net
 
 ACTIONS = {
@@ -14,6 +16,9 @@ QUESTIONS = {
     "malicious": {"type": "noul", "instructions": "Is this request an attack attempt against this app?"},
     "action": {"type": "choice", "instructions": "What should a cautious security agent do with this client?", "criteria": ACTIONS},
 }
+
+
+REQUEST_TAG = re.compile(r"<(\s*/?\s*[\w-]*request)", re.IGNORECASE)
 
 
 def one_line(value, limit: int) -> str:
@@ -31,7 +36,7 @@ def describe(event: dict) -> str:
         parts.append(f"content-type={one_line(event['ctype'], 120)}")
     if event.get("body"):
         parts.append(f"body={one_line(event['body'], 1500)}")
-    text = " ".join(parts).replace("<request>", "(request)").replace("</request>", "(/request)")
+    text = REQUEST_TAG.sub(lambda m: "(" + m.group(1), " ".join(parts))
     return f"<request>{text}</request>"
 
 

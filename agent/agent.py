@@ -5,7 +5,6 @@ import json
 import sys
 import threading
 import time
-from http.server import ThreadingHTTPServer
 
 from . import net, persona
 from .claude import Claude
@@ -17,12 +16,12 @@ from .github import GitHub
 from .inbox import FairInbox
 from .jev import Jev
 from .labels import Decision, EventKind, FixStatus, Verdict
-from .net import bare_path
-from .policy import REPEAT_PROVEN, DecisionPolicy, Signals
+from .net import bare_path, route_path
+from .policy import PREFILTERED, REPEAT_PROVEN, DecisionPolicy, Signals
 from .replay import Replayer
 from .store import Store
 from .views import Views
-from .web import make_handler
+from .web import AgentServer, make_handler
 
 COUNTED_ONLY_KINDS = (EventKind.REFUSED, EventKind.TARPITTED)
 QUIET_VERDICT_LINES = {Verdict.INCONCLUSIVE: "inconclusive", Verdict.MINOR: "minor"}
@@ -33,18 +32,25 @@ LISTS_CACHE_SECONDS = 3.0
 NO_LISTS_CACHE: tuple[float, dict] = (0.0, {})
 KIND_OUTCOMES = {EventKind.REFUSED: "blocked", EventKind.TARPITTED: "slowed"}
 DECISION_OUTCOMES = {Decision.BLOCK: "blocked", Decision.TARPIT: "slowed"}
-INBOX_TOTAL = 20000
+DROP_LOG_EVERY = 100
 TRUSTED_FETCH_SITES = ("", "none", "same-origin")
+FOREIGN_FETCH_SITES = ("cross-site", "same-site")
 RETRY_KEY = "__retry__"
 REPEAT_LINE = "Same trick that already worked in the back room. No second test needed. Out."
 SHIELDED_LINE = "The door already turned it away: this route is shielded until the fix is merged. It would have worked, so they're out."
 CROSS_SITE_HONEYPOT_LINE = "Fake .env fetched from inside another site's page. Probably an innocent browser being used as a puppet. Not slowing it down."
 UNTAKEN_BAIT_LINE = "Bait value showed up, but this client never took the bait. Could be someone's browser being used against them. Not blocking."
 FLOOD_LINE = "Too many requests to check at once. Slow lane while I work through the pile."
+FOREIGN_LINE = "Sent from another site's page, so the visitor may not be the attacker. Not blocking or slowing it."
+OWNER_SHIELD_LINE = "Your own traffic, so the route was not shielded."
 
 
 def trusted_fetch(event: dict) -> bool:
     return str(event.get("fetch_site") or "").strip().lower() in TRUSTED_FETCH_SITES
+
+
+def foreign_fetch(event: dict) -> bool:
+    return str(event.get("fetch_site") or "").strip().lower() in FOREIGN_FETCH_SITES
 
 
 def build_fixer(cfg: Config) -> Fixer | None:
@@ -91,7 +97,7 @@ class Brain:
         self.jev = Jev(cfg.jev_url, cfg.app_description) if cfg.jev_url else None
         self.replayer = Replayer(cfg.runner_url, cfg.runner_token) if cfg.runner_url else None
         self.fixer = build_fixer(cfg)
-        self.inbox = FairInbox(cfg.pending_per_ip, INBOX_TOTAL)
+        self.inbox = FairInbox(cfg.pending_per_ip, cfg.pending_total)
         self.flooding: set = set()
         self.flood_lock = threading.Lock()
         self.rids = itertools.count(1)
@@ -133,26 +139,57 @@ class Brain:
                 self.store.count("malformed")
                 continue
             ip = e.get("ip") if isinstance(e.get("ip"), str) else "?"
-            if self.inbox.put(ip, e):
+            if self._count_quietly(e, ip) or self.inbox.put(ip, e):
                 continue
-            self.store.count("dropped")
-            if self.inbox.size < self.inbox.total:
-                with self.flood_lock:
-                    self.flooding.add(ip)
+            self._drop(ip, self.inbox.size < self.inbox.total)
+
+    def _count_quietly(self, event: dict, ip: str) -> bool:
+        kind = EventKind.parse(event.get("kind", EventKind.REQUEST), None)
+        if kind in COUNTED_ONLY_KINDS:
+            outcome, name = KIND_OUTCOMES[kind], kind
+        elif kind == EventKind.REQUEST and self._plain(event, ip):
+            outcome, name = "allowed", PREFILTERED
+        else:
+            return False
+        self.store.count("events")
+        self.store.count(name)
+        self.store.count_traffic(event_time(event.get("ts")), outcome)
+        return True
+
+    def _plain(self, event: dict, ip: str) -> bool:
+        try:
+            return self.policy.plain(event, ip)
+        except Exception:
+            return False
+
+    def _drop(self, ip: str, per_ip: bool):
+        self.store.count("dropped")
+        self.store.count("dropped_per_ip" if per_ip else "dropped_queue_full")
+        if self.store.stats["dropped"] % DROP_LOG_EVERY == 1:
+            print(json.dumps({"agent": "dropped events", "dropped": self.store.stats["dropped"], "reason": "per_ip" if per_ip else "queue_full"}), file=sys.stderr, flush=True)
+        if per_ip:
+            with self.flood_lock:
+                self.flooding.add(ip)
 
     def _work(self):
         while True:
             event = self.inbox.get()
-            net.hold_awake(AWAKE_TASK, 300)
             try:
-                self.handle(event)
-            except Exception as exc:
-                self._report_error(event, exc)
-            if self.inbox.empty():
-                self.store.save_counters()
-                net.release_awake(AWAKE_TASK)
-            elif time.time() - self.store.counters_saved >= SAVE_SECONDS:
-                self.store.save_counters()
+                self._work_one(event)
+            finally:
+                self.inbox.done()
+
+    def _work_one(self, event: dict):
+        net.hold_awake(AWAKE_TASK, 300)
+        try:
+            self.handle(event)
+        except Exception as exc:
+            self._report_error(event, exc)
+        if self.inbox.empty():
+            self.store.save_counters()
+            net.release_awake(AWAKE_TASK)
+        elif time.time() - self.store.counters_saved >= SAVE_SECONDS:
+            self.store.save_counters()
 
     def _report_error(self, event: dict, exc: Exception):
         ip, path = event.get("ip"), event.get("path")
@@ -200,6 +237,7 @@ class Brain:
             "path": event.get("path", ""),
             "kind": EventKind.parse(event.get("kind", EventKind.REQUEST), EventKind.REQUEST),
             "ua": event.get("ua", ""),
+            "foreign": foreign_fetch(event),
         }
 
     def _on_honeypot(self, event: dict, record: dict) -> Decision:
@@ -277,26 +315,39 @@ class Brain:
         handler = self.verdict_handlers.get(result["verdict"], self._on_jammed)
         return handler(event, replayed, triage)
 
-    def _shield(self, record: dict, why: str) -> None:
+    def _shield(self, record: dict, why: str) -> bool:
         if self.cfg.shield_seconds <= 0 or not self.door.enabled:
-            return
-        route = f"{record.get('method')} {bare_path(record['path'])}"
+            return False
+        if self.cfg.is_owner(record.get("ip")):
+            self.store.count("would_shield")
+            return False
+        route = f"{record.get('method')} {route_path(record['path'])}"
         ok = self.door.put_shield(route, self.cfg.shield_seconds, "proven exploit: " + why[:120])
         self.store.count("shield_sent" if ok else "shield_failed")
         if ok:
             self._forget_lists()
+        return ok
 
     def _on_proven(self, event: dict, record: dict, triage: dict) -> Decision:
         ip, result = record["ip"], record["replay"]
         self.policy.mark_proven(event, ip, record["ts"])
         self._shield(record, result["why"])
-        blocked = self.set_list(Decision.BLOCK, ip, "proven exploit: " + result["why"][:120])
+        foreign = bool(record.get("foreign"))
+        blocked = False if foreign else self.set_list(Decision.BLOCK, ip, "proven exploit: " + result["why"][:120])
         incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result, "jev": triage, "blocked": blocked, "rid": record.get("rid")}
+        if foreign:
+            incident["foreign"] = True
+            self.store.count("foreign_proven")
+        if self.cfg.is_owner(ip) and self.cfg.shield_seconds > 0 and self.door.enabled:
+            incident["would_shield"] = True
         if self.fixer:
             incident["fix"] = queued_fix(FixStatus.QUEUED)
         self.store.add_incident(incident)
         line = SHIELDED_LINE if record.get("kind") == EventKind.SHIELDED else persona.line("proven", record["path"])
-        decision = self.decide({k: v for k, v in record.items() if k != "attempt"}, Decision.BLOCK, line=line)
+        if incident.get("would_shield"):
+            line = f"{line} {OWNER_SHIELD_LINE}"
+        base = {k: v for k, v in record.items() if k != "attempt"}
+        decision = self.decide(base, Decision.WATCH, line=f"{line} {FOREIGN_LINE}") if foreign else self.decide(base, Decision.BLOCK, line=line)
         if self.fixer:
             status = self.fixer.submit(incident, self.fix_report)
             if status != FixStatus.QUEUED:
@@ -332,6 +383,9 @@ class Brain:
         return self.decide(record, Decision.WATCH, line=f"Back room is jammed ({record['replay'].get('why')}). Watching instead.")
 
     def _list_and_decide(self, record: dict, decision: Decision, reason: str, line: str) -> Decision:
+        if record.get("foreign"):
+            self.store.count("foreign_not_listed")
+            return self.decide(record, Decision.WATCH, line=f"{line} {FOREIGN_LINE}")
         self.set_list(decision, record["ip"], reason)
         return self.decide(record, decision, line=line)
 
@@ -361,6 +415,10 @@ class Brain:
         ok = self.door.unblock(ip)
         if ok:
             self.store.count("unblocked")
+            if self.store.forget_honeypot(ip):
+                self.store.count("bait_forgotten")
+            with self.flood_lock:
+                self.flooding.discard(ip)
             self._forget_lists()
             self.feed.notify({"kind": "state", "what": "lists"})
         return ok
@@ -416,8 +474,7 @@ class Brain:
 def main():
     cfg = Config()
     brain = Brain(cfg)
-    server = ThreadingHTTPServer(("0.0.0.0", cfg.port), make_handler(brain))
-    server.daemon_threads = True
+    server = AgentServer(("0.0.0.0", cfg.port), make_handler(brain))
     print(json.dumps({"agent": "listening", "port": cfg.port, "jev": bool(cfg.jev_url), "runner": bool(cfg.runner_url), "door": bool(cfg.door_url)}), flush=True)
     server.serve_forever()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 
 
@@ -11,6 +12,7 @@ class FairInbox:
         self.queues: dict = {}
         self.order: deque = deque()
         self.size = 0
+        self.busy = 0
         self.cond = threading.Condition()
 
     def put(self, key: str, item) -> bool:
@@ -23,7 +25,7 @@ class FairInbox:
                 self.order.append(key)
             q.append(item)
             self.size += 1
-            self.cond.notify()
+            self.cond.notify_all()
             return True
 
     def get(self):
@@ -34,12 +36,28 @@ class FairInbox:
             q = self.queues[key]
             item = q.popleft()
             self.size -= 1
+            self.busy += 1
             if q:
                 self.order.append(key)
             else:
                 del self.queues[key]
             return item
 
+    def done(self) -> None:
+        with self.cond:
+            self.busy = max(0, self.busy - 1)
+            self.cond.notify_all()
+
     def empty(self) -> bool:
         with self.cond:
             return not self.size
+
+    def wait_idle(self, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        with self.cond:
+            while self.size or self.busy:
+                left = deadline - time.time()
+                if left <= 0:
+                    return False
+                self.cond.wait(left)
+            return True

@@ -8,10 +8,11 @@ from urllib.parse import unquote_plus
 from . import persona
 from .config import Config
 from .labels import Decision, EventKind, FixStatus, Verdict
-from .net import bare_path
+from .net import route_path
 from .store import KEPT_INCIDENTS, SIGNAL_STATES, Store
 
 TSV_TIME = "%Y-%m-%dT%H:%M:%SZ"
+FOREIGN_NOTE = "Sent from another site's page, so the visitor may not be the attacker"
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 ATTACK_PATTERNS = (
     ("SQL injection", re.compile(r"union\s+(all\s+)?select|'\s*(or|and)\s+[\w'\"]+\s*=|'\)+|'\s*--|;\s*drop\s|sleep\(\d", re.I)),
@@ -193,7 +194,7 @@ class Views:
         groups: dict = {}
         for incident in self.store.incidents[-KEPT_INCIDENTS:]:
             event = incident.get("event") or {}
-            key = f"proven:{event.get('method') or ''} {bare_path(event.get('path') or '')}"
+            key = f"proven:{event.get('method') or ''} {route_path(event.get('path') or '')}"
             groups.setdefault(key, []).append(incident)
         shields = shields or {}
         return [self.proven_signal(key, items, fixes_on, shields.get(key.removeprefix("proven:"))) for key, items in groups.items()]
@@ -207,8 +208,9 @@ class Views:
         steps = [
             {"label": "Flagged by classifier", "state": "done" if jev.get("ok") else "todo", "ts": event.get("ts"), "note": f"{round(jev['malicious'] * 100)}% attack" if isinstance(jev.get("malicious"), (int, float)) else ""},
             {"label": "Proven on the stunt double", "state": "bad", "ts": latest["ts"], "note": replay.get("why") or ""},
-            self.blocked_step(latest.get("blocked", True), latest["ts"], "Owner or door unavailable"),
+            self.blocked_step(latest.get("blocked", True), latest["ts"], FOREIGN_NOTE if latest.get("foreign") else "Owner or door unavailable"),
             *([{"label": "Route shielded until the fix is merged", "state": "done", "ts": latest["ts"], "note": "attack-shaped requests get 403"}] if shield else []),
+            *([{"label": "Route not shielded", "state": "todo", "ts": latest["ts"], "note": "Your own traffic, so it would have been shielded for anyone else"}] if latest.get("would_shield") and not shield else []),
             *fix_steps(fix, fixes_on),
         ]
         pill, pill_state = fix_pill(fix)
@@ -217,7 +219,7 @@ class Views:
             "kind": "proven",
             "severity": "critical",
             "status": self.store.signal_status(key, latest["ts"], "open"),
-            "title": f"{attack_type(event)} on {event.get('method') or ''} {bare_path(event.get('path') or '')}".strip(),
+            "title": f"{attack_type(event)} on {event.get('method') or ''} {route_path(event.get('path') or '')}".strip(),
             "summary": replay.get("why") or "",
             "method": event.get("method"),
             "path": (event.get("path") or "")[:2000],

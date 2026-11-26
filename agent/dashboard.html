@@ -1729,6 +1729,10 @@ async function api(path,body){
   if(!r.ok)throw new Error('HTTP '+r.status);
   return r;
 }
+async function signOut(){
+  try{await fetch('logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){}
+  location.reload();
+}
 let retry=null;
 function showBanner(text){
   const b=$('banner');b.hidden=!text;
@@ -1851,6 +1855,7 @@ function paletteItems(){
   SECTIONS.forEach(([key,,label])=>items.push({group:'Go to',label:`Go to ${label}`,icon:L.go,run:()=>jumpTo(key)}));
   items.push({group:'Go to',label:ui.sideHidden?'Expand sidebar':'Collapse sidebar',icon:L.go,hint:[MOD,'B'],run:toggleSide});
   items.push({group:'Go to',label:ui.live?'Pause live updates':'Resume live updates',icon:ui.live?L.pause:L.play,run:toggleLive});
+  items.push({group:'Go to',label:'Sign out',icon:L.go,run:signOut});
   (S.signals||[]).forEach(x=>items.push({group:'Signals',label:`${sigRef(x)}  ${x.title}`,icon:statusIcon(x.status),hint:[shortAgo(x.last)],plain:true,run:()=>openDrawer({id:x.id})}));
   (S.lists||[]).forEach(x=>items.push({group:'Blocked',label:`Unblock ${x.label}`,icon:x.kind==='block'?L.block:L.slow,run:()=>unblock(x.ip,x.label)}));
   activeShields().forEach(x=>items.push({group:'Blocked',label:`Remove shield from ${x.route}`,icon:L.guard,run:()=>unshield(x.route)}));

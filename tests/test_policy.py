@@ -15,12 +15,13 @@ from agent.agent import Brain, Config
 from agent.event_log import DecisionLog
 from agent.inbox import FairInbox
 from agent.labels import Decision, EventKind, FixStatus, Verdict
-from agent.policy import DEDUPED, MAX_SEEN, PREFILTERED, DecisionPolicy, Signals, Thresholds
+from agent.policy import DEDUPED, MAX_SEEN, PREFILTERED, VARIANT_DEDUPED, DecisionPolicy, Signals, Thresholds
 from agent.replay import build_request, interpret
 
 ROOT = Path(__file__).resolve().parent.parent
 QUIET = Signals(suspicious=True, scanner=False, probe=False, failed=False)
 PROBE = Signals(suspicious=False, scanner=False, probe=True, failed=False)
+OWNER_IP = "9.9.9.9"
 
 
 def load_module(name: str, rel: str):
@@ -402,6 +403,7 @@ class JudgeFindings(unittest.TestCase):
             deadline = time.time() + 5
             while time.time() < deadline and len(listed) < 2:
                 time.sleep(0.02)
+            self.assertTrue(brain.inbox.wait_idle(5))
         self.assertEqual([k for k, _ in listed], [Decision.TARPIT, Decision.BLOCK])
         self.assertEqual(listed[0][1], "waiting for proof")
 
@@ -449,6 +451,221 @@ class JudgeFindings(unittest.TestCase):
         signal = state["signals"][0]
         self.assertEqual(signal["shield"]["route"], "GET /rest/products/search")
         self.assertIn("Route shielded until the fix is merged", [step["label"] for step in signal["steps"]])
+
+
+def jwt(alg: str, signature: str = "c2ln") -> str:
+    import base64
+
+    head = base64.urlsafe_b64encode(json.dumps({"alg": alg}).encode()).decode().rstrip("=")
+    return f"{head}.eyJzdWIiOjF9.{signature}"
+
+
+class Normalized(unittest.TestCase):
+    def screen(self, **event):
+        return DecisionPolicy(Thresholds()).screen({"method": "GET", "status": 200, **event}, "1.2.3.4", 0)
+
+    def test_json_unicode_escapes_are_screened(self):
+        out = self.screen(method="POST", path="/rest/user/login", body='{"email":"\\u0027 or 1=1--","password":"x"}')
+        self.assertEqual(out.skipped, "")
+        self.assertTrue(out.signals.attack)
+
+    def test_nul_bytes_in_path_are_attacks(self):
+        for path in ("/ftp/package.json.bak%2500.md", "/ftp/package.json.bak%00.md"):
+            out = self.screen(path=path)
+            self.assertEqual(out.skipped, "", path)
+            self.assertTrue(out.signals.attack, path)
+
+    def test_repeated_percent_encoding_is_decoded(self):
+        self.assertTrue(self.screen(path="/rest/products/search?q=%2527%2529%2529--").signals.attack)
+        self.assertTrue(self.screen(path="/rest/products/search?q=%252e%252e%252fetc%252fpasswd").signals.attack)
+
+    def test_sql_comments_and_trailing_dashes(self):
+        self.assertTrue(self.screen(path="/rest/products/search?q=x%27/**/UNION/**/SELECT/**/1").signals.attack)
+        self.assertTrue(self.screen(method="POST", path="/rest/user/login", body='{"email":"admin@juice-sh.op--"}').signals.attack)
+
+    def test_event_handlers_javascript_and_nosql_ops(self):
+        self.assertTrue(self.screen(path="/search?q=%3Cimg%20src=x%20onmouseover=alert(1)%3E").signals.attack)
+        self.assertTrue(self.screen(path="/redirect?to=JavaScript:alert(1)").signals.attack)
+        for op in ("$regex", "$nin", "$or", "$in", "$exists", "$elemMatch"):
+            out = self.screen(method="POST", path="/rest/user/login", body=json.dumps({"email": {op: ".*"}}))
+            self.assertTrue(out.signals.attack, op)
+
+    def test_harmless_requests_stay_prefiltered(self):
+        for path in ("/rest/products?only=1", "/rest/products/search?q=apple+juice", "/api/Quantitys/"):
+            self.assertEqual(self.screen(path=path).skipped, PREFILTERED, path)
+
+    def test_door_flags_force_triage(self):
+        for flag in ("truncated", "attack_shaped", "decode_failed"):
+            out = self.screen(method="POST", path="/api/Feedbacks", body="{}", **{flag: True})
+            self.assertEqual(out.skipped, "", flag)
+            self.assertTrue(out.signals.suspicious)
+        self.assertTrue(self.screen(method="POST", path="/api/Feedbacks", body="{}", attack_shaped=True).signals.attack)
+        self.assertEqual(self.screen(path="/socket.io/?EIO=4", truncated=True).skipped, "")
+
+    def test_unsigned_jwts_are_attacks(self):
+        for token in (jwt("none", ""), jwt("None"), jwt("RS256", "")):
+            out = self.screen(path="/rest/basket/1", headers={"Authorization": f"Bearer {token}"})
+            self.assertTrue(out.signals.attack, token)
+        self.assertTrue(self.screen(path="/rest/basket/1", headers={"Cookie": f"token={jwt('none', '')}"}).signals.attack)
+        self.assertEqual(self.screen(path="/rest/basket/1", headers={"Authorization": f"Bearer {jwt('RS256')}"}).skipped, PREFILTERED)
+
+    def test_payload_variations_from_one_client_are_capped(self):
+        policy = DecisionPolicy(Thresholds(max_variants=3))
+        outs = [policy.screen({"method": "GET", "path": f"/rest/products/search?q=%27{c}", "status": 200}, "1.2.3.4", 0).skipped for c in "abcdef"]
+        self.assertEqual(outs, ["", "", "", VARIANT_DEDUPED, VARIANT_DEDUPED, VARIANT_DEDUPED])
+        same_trick = [policy.screen({"method": "GET", "path": f"/rest/items?q=%27+or+{n}={n}", "status": 200}, "1.2.3.4", 0).skipped for n in (1, 2)]
+        self.assertEqual(same_trick, ["", VARIANT_DEDUPED])
+        self.assertEqual(policy.screen({"method": "GET", "path": "/rest/products/search?q=%27z", "status": 200}, "5.6.7.8", 0).skipped, "")
+        self.assertEqual(policy.screen({"method": "GET", "path": "/rest/products/search?q=%27g", "status": 200}, "1.2.3.4", 700).skipped, "")
+
+    def test_plain_matches_screen(self):
+        policy = DecisionPolicy(Thresholds())
+        self.assertTrue(policy.plain({"method": "GET", "path": "/rest/products", "status": 200}, "1.2.3.4"))
+        self.assertFalse(policy.plain({"method": "GET", "path": "/rest/products?q=%27", "status": 200}, "1.2.3.4"))
+        self.assertFalse(policy.plain({"method": "GET", "path": "/x", "status": 200, "truncated": True}, "1.2.3.4"))
+
+
+class FakeDoor:
+    enabled = True
+
+    def __init__(self):
+        self.lists, self.shields, self.unblocked = [], [], []
+
+    def put(self, kind, ip, seconds, reason):
+        self.lists.append((kind, ip))
+        return True
+
+    def put_shield(self, route, seconds, reason):
+        self.shields.append(route)
+        return True
+
+    def unblock(self, ip):
+        self.unblocked.append(ip)
+        return True
+
+    def snapshot(self, timeout=3):
+        return {"block": {}, "tarpit": {}, "shield": {}}
+
+
+class ProvenHandling(unittest.TestCase):
+    proven = {"verdict": Verdict.PROVEN, "why": "solved Login Admin", "evidence": {}}
+    event = {"kind": "request", "method": "POST", "path": "/rest/user/login", "body": "{\"email\":\"' or 1=1--\"}", "status": 200}
+
+    def brain(self, tmp, **env):
+        brain = Brain(Config({"AGENT_DATA_DIR": tmp, "OWNER_IPS": OWNER_IP, **env}))
+        brain.door = FakeDoor()
+        result = dict(self.proven)
+
+        class Replayer:
+            def run(self, event):
+                return dict(result)
+
+        brain.replayer = Replayer()
+        return brain
+
+    def test_cross_site_proof_shields_but_never_lists_the_client(self):
+        for site in ("cross-site", "same-site"):
+            with tempfile.TemporaryDirectory() as tmp:
+                brain = self.brain(tmp)
+                brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=1.0))
+                brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=2.0))
+                self.assertEqual(brain.door.lists, [], site)
+                self.assertEqual(brain.door.shields, ["POST /rest/user/login"])
+                incident = brain.store.incidents[-1]
+                self.assertTrue(incident["foreign"])
+                self.assertFalse(incident["blocked"])
+                step = next(s for s in brain.views.proven_signals(False)[0]["steps"] if s["label"] == "Client not blocked")
+                self.assertIn("another site's page", step["note"])
+                self.assertEqual(brain.store.recent("5.5.5.5", 5)[-1]["decision"], Decision.WATCH)
+
+    def test_same_origin_proof_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle(dict(self.event, ip="5.5.5.6", fetch_site="same-origin", ts=1.0))
+        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "5.5.5.6")])
+
+    def test_owner_proof_would_shield_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle(dict(self.event, ip=OWNER_IP, ts=1.0))
+            self.assertEqual(brain.door.shields, [])
+            self.assertEqual(brain.store.stats["would_shield"], 1)
+            self.assertIn("Route not shielded", [s["label"] for s in brain.views.proven_signals(False)[0]["steps"]])
+            brain.handle(dict(self.event, ip="owner-as-stranger", ts=2.0))
+        self.assertEqual(brain.door.shields, ["POST /rest/user/login"])
+        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "owner-as-stranger")])
+
+    def test_unblock_forgets_bait_taken_by_that_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle({"kind": "honeypot", "ip": "4.4.4.4", "method": "GET", "path": "/.env", "ts": 1.0})
+            self.assertIsNotNone(brain.store.honeypot_visits.get("4.4.4.4"))
+            self.assertTrue(brain.unblock("4.4.4.4"))
+            self.assertNotIn("4.4.4.4", brain.store.honeypot_visits)
+            brain.handle({"kind": "canary_reuse", "ip": "4.4.4.4", "method": "POST", "path": "/rest/user/login", "ts": 2.0})
+        self.assertEqual(brain.door.lists, [(Decision.TARPIT, "4.4.4.4")])
+
+
+class Backlog(unittest.TestCase):
+    def test_plain_and_refused_events_skip_the_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            brain.inbox = FairInbox(5, 500)
+            brain.submit([{"ip": "1.1.1.1", "kind": "request", "method": "GET", "path": f"/rest/products/{i}", "status": 200} for i in range(50)])
+            brain.submit([{"ip": "2.2.2.2", "kind": "refused", "method": "GET", "path": "/"} for _ in range(50)])
+            self.assertTrue(brain.inbox.empty())
+            self.assertEqual((brain.store.stats["prefiltered"], brain.store.stats["refused"], brain.store.stats["events"]), (50, 50, 100))
+            self.assertEqual(brain.flooding, set())
+
+    def test_suspicious_backlog_is_capped_per_ip_and_in_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            self.assertEqual((brain.inbox.per_key, brain.inbox.total), (5, 500))
+            brain.inbox = FairInbox(5, 8)
+            with mock.patch("sys.stderr", io.StringIO()):
+                brain.submit([{"ip": "6.6.6.6", "kind": "request", "path": f"/?q='{i}"} for i in range(7)])
+                brain.submit([{"ip": f"7.7.7.{i}", "kind": "request", "path": "/?q='"} for i in range(5)])
+            self.assertEqual(brain.inbox.size, 8)
+            self.assertEqual((brain.store.stats["dropped_per_ip"], brain.store.stats["dropped_queue_full"]), (2, 2))
+            self.assertEqual(brain.flooding, {"6.6.6.6"})
+
+    def test_wait_idle_covers_the_item_being_worked(self):
+        box = FairInbox(5, 10)
+        box.put("a", 1)
+        box.get()
+        self.assertFalse(box.wait_idle(0.05))
+        box.done()
+        self.assertTrue(box.wait_idle(0.05))
+
+
+class Defaults(unittest.TestCase):
+    def test_defaults_match_the_readme(self):
+        cfg = Config({})
+        self.assertEqual((cfg.block_seconds, cfg.fix_mode), (300, "dry_run"))
+
+    def test_counters_are_bounded(self):
+        from agent.store import MAX_COUNTED_KEYS, Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.shame_path("/hot")
+            store.shame_path("/hot")
+            for i in range(MAX_COUNTED_KEYS * 2):
+                store.shame_path(f"/p{i}")
+                store.visit_honeypot(f"10.0.{i // 256}.{i % 256}", float(i))
+            self.assertLessEqual(len(store.shame), MAX_COUNTED_KEYS)
+            self.assertLessEqual(len(store.honeypot_visits), MAX_COUNTED_KEYS)
+            self.assertIn("/hot", store.shame)
+            self.assertIn(f"10.0.{(MAX_COUNTED_KEYS * 2 - 1) // 256}.{(MAX_COUNTED_KEYS * 2 - 1) % 256}", store.honeypot_visits)
+
+
+class RouteKeys(unittest.TestCase):
+    def test_route_keys_match_the_door(self):
+        from agent.net import route_path
+        door_route_path = load_door().route_path
+        for path in ["/rest/user/LOGIN/", "//rest//user/login?x=1", "http://x/rest/user/login", "/rest/products/%73earch?q=1", "/"]:
+            self.assertEqual(route_path(path), door_route_path(path))
+        self.assertEqual(route_path("/rest/user/LOGIN/"), "/rest/user/login")
 
 
 if __name__ == "__main__":

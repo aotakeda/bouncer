@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import codecs
 import hashlib
 import hmac
 import http.client
@@ -13,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from enum import Enum
@@ -38,9 +41,24 @@ STATIC_PATH = re.compile(
 )
 
 ATTACK = re.compile(
-    r"""(\bunion\b[\s\S]{0,80}\bselect\b|\bor\b\s*['"]?\s*\d+\s*=\s*\d+|'\s*(or|and|\)|;|--|#)|--\s|/\*|\bsleep\s*\(|\bbenchmark\s*\(|\.\./|<script|onerror\s*=|javascript:|\$where|\$ne\b|\$gt\b|etc/passwd)""",
+    r"""(\bunion\b[\s\S]{0,80}\bselect\b|\bor\b\s*['"]?\s*\d+\s*=\s*\d+|'\s*(or|and)\b|'\s*[);#]|['`)]\s*--|\b(select|union|null|sleep|benchmark)\b[\s\S]{0,80}--|\bis\s+not\s+null\b|/\*|\bsleep\s*\(|\bbenchmark\s*\(|\.\.[\\/]|<script|<[a-z]{1,20}[\s/][^<>]{0,200}?\bon[a-z]{2,30}\s*=|["'`]\s*/?\s*on[a-z]{2,30}\s*=|onerror\s*=|j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:|\$(where|ne|gt|gte|lt|lte|regex|nin|or|in|exists|elemmatch|and|nor|not|expr)\b|etc/passwd)""",
     re.IGNORECASE,
 )
+ESCAPED_CHAR = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
+SQL_COMMENT = re.compile(r"/\*[^*]{0,64}\*/")
+CHARSET = re.compile(r"(;\s*charset\s*=\s*)(\"?)([^\";\s]+)\2", re.IGNORECASE)
+CHUNK_SIZE = re.compile(rb"[0-9a-fA-F]{1,16}(;[^\r\n]*)?\r?\n")
+DIGITS = re.compile(r"[0-9]{1,19}")
+GZIP_WBITS = 31
+DEFLATE_WBITS = (15, -15)
+MAX_DECODED_BODY = 1 << 20
+MAX_TRAILERS = 64
+DECODE_ROUNDS = 3
+SECRET_HEADERS = {"authorization", "cookie", "x-user-email"}
+CLIENT_FORWARD_HEADERS = {"x-forwarded-for", "x-real-ip", "forwarded"}
+SECRET_KEY = r"[^\"=&]*(?:password|passwd|pass|secret|token|totp|answer)[^\"=&]*"
+SECRET_JSON_FIELD = re.compile(r'("' + SECRET_KEY + r'"\s*:\s*)("(?:[^"\\]|\\.)*"?|[^,}\]\s]+)', re.IGNORECASE)
+SECRET_FORM_FIELD = re.compile(r"((?:^|&)" + SECRET_KEY + r"=)([^&]*)", re.IGNORECASE)
 TRUSTED_FETCH_SITES = {"", "none", "same-origin"}
 CANARY_SKIP_HEADERS = {"referer", "origin"}
 BAIT_SECONDS = 86400
@@ -49,6 +67,7 @@ QUIET_PATHS = {"/", "/socket.io/", "/rest/admin/application-version", "/rest/adm
 SOCKET_IO_PATH = "/socket.io/"
 REPLAY_HEADERS = {"authorization", "cookie", "accept", "x-user-email"}
 MAX_STORED_BODY = 65536
+MAX_LIST_ENTRIES = 20000
 MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_BATCH_BODY = 1048576
 PUSH_RETRY_DELAYS = (1.0, 3.0)
@@ -100,6 +119,13 @@ class PayloadTooLarge(Exception):
     pass
 
 
+class Seen(NamedTuple):
+    text: str = ""
+    decoded_from: dict | None = None
+    decode_failed: bool = False
+    attack: bool = False
+
+
 LogFn = Callable[[dict], None]
 
 
@@ -127,9 +153,125 @@ def route_key(method: str, path: str) -> str:
     return f"{method} {bare_path(path)}"
 
 
-def looks_like_attack(path: str, body: bytes) -> bool:
-    text = unquote_plus(path) + " " + body.decode("utf-8", "replace")
-    return bool(ATTACK.search(text))
+def route_path(path: str) -> str:
+    if not path.startswith("/"):
+        path = urlsplit(path).path or "/"
+    bare = unquote(path.split("?", 1)[0].split("#", 1)[0])
+    return re.sub(r"/{2,}", "/", bare).lower().rstrip("/") or "/"
+
+
+def shield_path(key: str) -> str:
+    return route_path(key.split(" ", 1)[-1])
+
+
+def unescape(text: str) -> str:
+    return ESCAPED_CHAR.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+
+
+def detection_text(text: str) -> str:
+    for _ in range(DECODE_ROUNDS):
+        decoded = unescape(unquote_plus(text))
+        if decoded == text:
+            break
+        text = decoded
+    return text.lower()
+
+
+def looks_like_attack(path: str, body: str | bytes = "") -> bool:
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    norm_path = detection_text(path)
+    if "\x00" in norm_path:
+        return True
+    text = norm_path + " " + detection_text(body)
+    if ATTACK.search(text):
+        return True
+    collapsed = SQL_COMMENT.sub(" ", text)
+    return collapsed != text and bool(ATTACK.search(collapsed))
+
+
+def b64url_json(segment: str):
+    try:
+        return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, TypeError):
+        return None
+
+
+def jwt_unsigned(token: str) -> bool:
+    parts = token.strip().split(".")
+    if len(parts) not in (2, 3):
+        return False
+    header = b64url_json(parts[0])
+    if not isinstance(header, dict) or not ("alg" in header or "typ" in header):
+        return False
+    alg = header.get("alg")
+    return (isinstance(alg, str) and alg.strip().lower() == "none") or len(parts) == 2 or not parts[2]
+
+
+def jwt_tampered(headers) -> bool:
+    auth = headers.get("Authorization") or ""
+    tokens = [auth[len(BEARER):]] if auth[:len(BEARER)].lower() == BEARER.lower() else []
+    tokens += [c.partition("=")[2] for c in (headers.get("Cookie") or "").split(";")]
+    return any(jwt_unsigned(t) for t in tokens if t.strip())
+
+
+def inflate(data: bytes, wbits: int) -> bytes:
+    out = b""
+    while data:
+        d = zlib.decompressobj(wbits)
+        out += d.decompress(data, MAX_DECODED_BODY + 1 - len(out))
+        if len(out) > MAX_DECODED_BODY or d.unconsumed_tail or not d.eof:
+            raise ValueError("bad or oversized encoded body")
+        data = d.unused_data
+    return out
+
+
+def inflate_deflate(data: bytes) -> bytes:
+    try:
+        return inflate(data, DEFLATE_WBITS[0])
+    except zlib.error:
+        return inflate(data, DEFLATE_WBITS[1])
+
+
+DECODERS = {
+    "gzip": lambda data: inflate(data, GZIP_WBITS),
+    "x-gzip": lambda data: inflate(data, GZIP_WBITS),
+    "deflate": inflate_deflate,
+    "identity": lambda data: data,
+}
+
+
+def body_charset(ctype: str) -> str:
+    m = CHARSET.search(ctype or "")
+    return m.group(3) if m else ""
+
+
+def utf8_ctype(ctype: str) -> str:
+    return CHARSET.sub(lambda m: m.group(1) + "utf-8", ctype)
+
+
+def decode_body(headers, body: bytes) -> tuple[str, dict | None]:
+    decoded_from = {}
+    codings = [c.strip().lower() for c in (headers.get("Content-Encoding") or "").split(",") if c.strip()]
+    for coding in reversed(codings):
+        if coding not in DECODERS:
+            raise ValueError("unsupported content-encoding")
+        body = DECODERS[coding](body)
+    if [c for c in codings if c != "identity"]:
+        decoded_from["content_encoding"] = ", ".join(codings)
+    charset = body_charset(headers.get("Content-Type") or "")
+    if not charset or codecs.lookup(charset).name == "utf-8":
+        return body.decode("utf-8", "replace"), decoded_from or None
+    decoded_from["charset"] = charset
+    return body.decode(charset), decoded_from
+
+
+def inspect_request(path: str, headers, body: bytes) -> Seen:
+    try:
+        text, decoded_from = decode_body(headers, body) if body else ("", None)
+    except (ValueError, LookupError, zlib.error):
+        return Seen(body.decode("utf-8", "replace"), None, True, True)
+    return Seen(text, decoded_from, False, looks_like_attack(path, text) or jwt_tampered(headers))
 
 
 def trusted_fetch(headers) -> bool:
@@ -138,7 +280,8 @@ def trusted_fetch(headers) -> bool:
 
 def has_traversal(path: str) -> bool:
     low = path.lower()
-    return ".." in low or "%2e" in low
+    norm = detection_text(path)
+    return ".." in low or "%2e" in low or ".." in norm or "\x00" in norm
 
 
 def read_chunked(stream, limit: int) -> bytes:
@@ -148,19 +291,15 @@ def read_chunked(stream, limit: int) -> bytes:
         line = stream.readline(4096)
         if not line:
             raise BadRequest("truncated chunked body")
-        size_str = line.split(b";", 1)[0].strip()
-        try:
-            size = int(size_str, 16)
-        except ValueError as exc:
-            raise BadRequest("bad chunk size") from exc
-        if size < 0:
-            raise BadRequest("negative chunk size")
+        if not CHUNK_SIZE.fullmatch(line):
+            raise BadRequest("bad chunk size")
+        size = int(line.split(b";", 1)[0].strip(), 16)
         if size == 0:
-            while True:
+            for _ in range(MAX_TRAILERS):
                 trailer = stream.readline(4096)
                 if trailer in (b"", b"\r\n", b"\n"):
-                    break
-            return b"".join(chunks)
+                    return b"".join(chunks)
+            raise BadRequest("too many trailers")
         total += size
         if total > limit:
             raise PayloadTooLarge("chunked body too large")
@@ -182,7 +321,30 @@ def body_size(event: dict) -> int:
 
 
 def retry_after(entry: dict) -> str:
-    return str(max(1, int(entry.get("until", 0) - time.time())))
+    return str(max(1, int(until_of(entry) - time.time())))
+
+
+def redact(value: str) -> str:
+    scheme, sep, rest = value.partition(" ")
+    if not sep or not scheme.isalpha() or len(scheme) > 16:
+        scheme, sep, rest = "", "", value
+    return f"{scheme}{sep}{rest[:6]}...[{len(rest)}]"
+
+
+def redact_body(body: str) -> str:
+    if body.lstrip()[:1] in ("{", "["):
+        return SECRET_JSON_FIELD.sub(lambda m: f'{m.group(1)}"[redacted {len(m.group(2).strip(chr(34)))}]"', body)
+    return SECRET_FORM_FIELD.sub(lambda m: f"{m.group(1)}[redacted {len(m.group(2))}]", body)
+
+
+def disk_record(record: dict) -> dict:
+    out = dict(record)
+    if isinstance(out.get("body"), str):
+        out["body"] = redact_body(out["body"])
+    headers = out.get("headers")
+    if isinstance(headers, dict):
+        out["headers"] = {k: redact(str(v)) if k.lower() in SECRET_HEADERS else v for k, v in headers.items()}
+    return out
 
 
 class Config:
@@ -204,18 +366,36 @@ class Config:
         self.log_max_bytes = int(env.get("DOOR_LOG_MAX_BYTES", str(50 * 1024 * 1024)))
         self.canaries_file = Path(env.get("DOOR_CANARIES", str(self.data_dir / "canaries.json")))
         self.flush_seconds = float(env.get("DOOR_FLUSH_SECONDS", "2"))
+        self.lists_flush_seconds = float(env.get("DOOR_LISTS_FLUSH_SECONDS", "1"))
+        self.list_max = int(env.get("DOOR_LIST_MAX", str(MAX_LIST_ENTRIES)))
+        self.idle_seconds = float(env.get("DOOR_IDLE_SECONDS", "15"))
+        self.max_threads = int(env.get("DOOR_MAX_THREADS", "256"))
 
     @property
     def upstream(self) -> str:
         return f"{self.upstream_host}:{self.upstream_port}"
 
 
+def until_of(entry) -> float:
+    try:
+        return float(entry.get("until", 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
 class Lists:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, flush_seconds: float = 1.0, cap: int = MAX_LIST_ENTRIES):
         self.path = path
+        self.cap = cap
+        self.flush_seconds = flush_seconds
         self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
         self.data = {name: {} for name in LIST_NAMES}
+        self.dirty = False
+        self.shield_index: dict | None = None
+        self.stopped = threading.Event()
         self._load()
+        threading.Thread(target=self._flush_loop, daemon=True).start()
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -227,23 +407,66 @@ class Lists:
         if isinstance(loaded, dict):
             for name in LIST_NAMES:
                 if isinstance(loaded.get(name), dict):
-                    self.data[name] = loaded[name]
+                    self.data[name] = {k: v for k, v in loaded[name].items() if isinstance(v, dict)}
 
-    def _save(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2))
-        tmp.replace(self.path)
+    def _flush_loop(self) -> None:
+        while not self.stopped.wait(self.flush_seconds):
+            self.flush()
+
+    def flush(self) -> None:
+        with self.write_lock:
+            with self.lock:
+                if not self.dirty:
+                    return
+                copy = {k: dict(v) for k, v in self.data.items()}
+                self.dirty = False
+            try:
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(copy, indent=2))
+                tmp.replace(self.path)
+            except OSError:
+                with self.lock:
+                    self.dirty = True
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.flush()
+
+    def _changed(self, kind: str) -> None:
+        self.dirty = True
+        if kind == "shield":
+            self.shield_index = None
+
+    def _trim(self, kind: str) -> None:
+        entries = self.data[kind]
+        if len(entries) <= self.cap:
+            return
+        now = time.time()
+        for key in [k for k, e in entries.items() if until_of(e) < now]:
+            del entries[key]
+        if len(entries) > self.cap:
+            for key in sorted(entries, key=lambda k: until_of(entries[k]))[: len(entries) - int(self.cap * 0.9)]:
+                del entries[key]
 
     def active(self, kind: str, ip: str) -> dict | None:
         with self.lock:
             entry = self.data[kind].get(ip)
             if not entry:
                 return None
-            if entry.get("until", 0) < time.time():
+            if until_of(entry) < time.time():
                 del self.data[kind][ip]
-                self._save()
+                self._changed(kind)
                 return None
             return entry
+
+    def shielded(self, path: str) -> bool:
+        with self.lock:
+            if self.shield_index is None:
+                self.shield_index = {}
+                for key in self.data["shield"]:
+                    self.shield_index.setdefault(shield_path(key), []).append(key)
+            now = time.time()
+            return any(until_of(self.data["shield"].get(k)) >= now for k in self.shield_index.get(route_path(path), ()))
 
     def put(self, kind: str, entries: dict, allowlist: set) -> dict:
         with self.lock:
@@ -251,7 +474,8 @@ class Lists:
             for ip, entry in entries.items():
                 if ip not in allowlist:
                     self.data[kind][ip] = entry
-            self._save()
+            self._trim(kind)
+            self._changed(kind)
             return {"ok": True, "skipped_allowlisted": skipped}
 
     def add(self, kind: str, key: str, seconds: float, reason: str, allowlist: set) -> None:
@@ -261,21 +485,23 @@ class Lists:
             now = time.time()
             current = self.data[kind].get(key)
             until = now + seconds
-            if current and current.get("until", 0) > until:
+            if current and until_of(current) > until:
                 return
             self.data[kind][key] = {"until": until, "reason": reason, "ts": now}
-            self._save()
+            self._trim(kind)
+            self._changed(kind)
 
     def delete(self, kind: str, ip: str) -> bool:
         with self.lock:
             existed = self.data[kind].pop(ip, None) is not None
-            self._save()
+            if existed:
+                self._changed(kind)
             return existed
 
     def snapshot(self) -> dict:
         with self.lock:
             now = time.time()
-            return {k: {ip: e for ip, e in v.items() if e.get("until", 0) >= now} for k, v in self.data.items()}
+            return {k: {ip: e for ip, e in v.items() if until_of(e) >= now} for k, v in self.data.items()}
 
 
 class Pusher:
@@ -345,7 +571,7 @@ class Door:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
-        self.lists = Lists(cfg.data_dir / "lists.json")
+        self.lists = Lists(cfg.data_dir / "lists.json", cfg.lists_flush_seconds, cfg.list_max)
         self.log_path = cfg.data_dir / "access.log"
         self.log_lock = threading.Lock()
         self.tarpit_lock = threading.Lock()
@@ -388,13 +614,18 @@ class Door:
     def block_bait_reuse(self, ip: str) -> None:
         self.lists.add("block", ip, self.cfg.block_seconds, "reused honeypot credentials", self.cfg.allowlist)
 
-    def shielded(self, ip: str, method: str, path: str, body: bytes) -> bool:
-        if ip in self.cfg.allowlist or not self.lists.active("shield", route_key(method, path)):
-            return False
-        return looks_like_attack(path, body)
+    def shielded(self, ip: str, path: str, seen: Seen) -> bool:
+        return seen.attack and ip not in self.cfg.allowlist and self.lists.shielded(path)
+
+    def unblock_extras(self, kind: str, target: str) -> None:
+        if kind == "block":
+            self.lists.delete("bait", target)
+
+    def close(self) -> None:
+        self.lists.close()
 
     def write_log(self, record: dict) -> None:
-        line = json.dumps(record, separators=(",", ":"))
+        line = json.dumps(disk_record(record), separators=(",", ":"))
         with self.log_lock:
             try:
                 if self.log_path.stat().st_size > self.cfg.log_max_bytes:
@@ -461,9 +692,13 @@ def make_handler(door: Door):
         protocol_version = "HTTP/1.1"
         server_version = "bouncer-door"
         sys_version = ""
+        timeout = cfg.idle_seconds
 
         def log_message(self, fmt, *args):
             pass
+
+        def version_string(self) -> str:
+            return self.server_version
 
         def client_ip(self) -> str:
             ip = client_key(self.headers.get("Sprite-Client-Ip") or self.client_address[0])
@@ -472,18 +707,19 @@ def make_handler(door: Door):
             return ip
 
         def read_body(self) -> bytes:
-            te = self.headers.get("Transfer-Encoding", "")
-            if "chunked" in te.lower():
+            te = self.headers.get_all("Transfer-Encoding") or []
+            if te:
+                codings = [c.strip().lower() for v in te for c in v.split(",") if c.strip()]
+                if codings != ["chunked"]:
+                    raise BadRequest("unsupported transfer-encoding")
                 return read_chunked(self.rfile, MAX_REQUEST_BODY)
-            raw = self.headers.get("Content-Length")
-            if not raw:
+            raws = {v.strip() for v in self.headers.get_all("Content-Length") or []}
+            if not raws:
                 return b""
-            try:
-                length = int(raw)
-            except ValueError as exc:
-                raise BadRequest("invalid Content-Length") from exc
-            if length < 0:
-                raise BadRequest("negative Content-Length")
+            raw = raws.pop()
+            if raws or not DIGITS.fullmatch(raw):
+                raise BadRequest("invalid Content-Length")
+            length = int(raw)
             if length > MAX_REQUEST_BODY:
                 raise PayloadTooLarge("body too large")
             return self.rfile.read(length) if length > 0 else b""
@@ -550,6 +786,7 @@ def make_handler(door: Door):
             if not target:
                 return self.method_not_allowed()
             existed = door.lists.delete(req.kind, target)
+            door.unblock_extras(req.kind, target)
             return self.send_json({"ok": True, "existed": existed})
 
         ADMIN_ACTIONS = {
@@ -559,7 +796,7 @@ def make_handler(door: Door):
         }
 
         def upstream_headers(self) -> dict:
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_FORWARD_HEADERS}
             headers["Host"] = cfg.upstream
             headers["X-Forwarded-For"] = self.client_ip()
             return headers
@@ -588,12 +825,12 @@ def make_handler(door: Door):
             if resp.status not in (204, 304):
                 self.write_body(data)
 
-        def canary_haystack(self, body: bytes) -> str:
+        def canary_haystack(self, seen: Seen) -> str:
             headers = " ".join(v for k, v in self.headers.items() if k.lower() not in CANARY_SKIP_HEADERS)
-            return self.path + " " + body.decode("utf-8", "replace") + " " + headers
+            return self.path + " " + seen.text + " " + headers
 
-        def forward(self, ip: str, body: bytes) -> Outcome:
-            reuse = bool(door.canary_hits(self.canary_haystack(body)))
+        def forward(self, ip: str, body: bytes, seen: Seen) -> Outcome:
+            reuse = bool(door.canary_hits(self.canary_haystack(seen)))
             kind = EventKind.CANARY_REUSE if reuse else EventKind.REQUEST
             slow = door.tarpit(ip)
             if slow == Slow.REFUSE:
@@ -610,19 +847,19 @@ def make_handler(door: Door):
             refused = b"You're not on the list. The bouncer remembers faces. Come back later.\n"
             return Outcome(EventKind.REFUSED, 403, self.send(403, refused, extra={"Retry-After": retry_after(block)}))
 
-        def respond(self, ip: str, body: bytes) -> Outcome:
+        def respond(self, ip: str, body: bytes, seen: Seen) -> Outcome:
             if self.headers.get("Upgrade", "").lower() == "websocket":
                 return Outcome(EventKind.REQUEST, 400, self.send(400, b"websocket not supported, use polling"))
             if bare_path(self.path) == "/.env":
                 if trusted_fetch(self.headers):
                     door.mark_bait(ip)
                 return Outcome(EventKind.HONEYPOT, 200, self.send(200, door.honeypot_env().encode()))
-            if door.shielded(ip, self.command, self.path, body):
+            if door.shielded(ip, self.path, seen):
                 shield = b"This route is shielded until its security fix is merged.\n"
                 return Outcome(EventKind.SHIELDED, 403, self.send(403, shield))
-            return self.forward(ip, body)
+            return self.forward(ip, body, seen)
 
-        def build_record(self, started: float, ip: str, body: bytes, outcome: Outcome) -> dict:
+        def build_record(self, started: float, ip: str, body: bytes, outcome: Outcome, seen: Seen = Seen()) -> dict:
             record = {
                 "ts": round(started, 3),
                 "ip": ip,
@@ -635,12 +872,18 @@ def make_handler(door: Door):
                 "kind": outcome.kind,
             }
             if body:
-                record["body"] = body[:MAX_STORED_BODY].decode("utf-8", "replace")
-            if len(body) > MAX_STORED_BODY:
+                record["body"] = seen.text[:MAX_STORED_BODY]
+            if len(seen.text) > MAX_STORED_BODY:
                 record["truncated"] = True
+            if seen.attack:
+                record["attack_shaped"] = True
+            if seen.decoded_from:
+                record["decoded_from"] = seen.decoded_from
+            if seen.decode_failed:
+                record["decode_failed"] = True
             ctype = self.headers.get("Content-Type")
             if ctype:
-                record["ctype"] = ctype
+                record["ctype"] = utf8_ctype(ctype) if seen.decoded_from and "charset" in seen.decoded_from else ctype
             fetch_site = self.headers.get("Sec-Fetch-Site")
             if fetch_site:
                 record["fetch_site"] = fetch_site[:40]
@@ -663,6 +906,9 @@ def make_handler(door: Door):
                 return
             try:
                 body = self.read_body()
+            except OSError:
+                self.close_connection = True
+                return
             except BadRequest:
                 self.close_connection = True
                 self.send(400, b"Bad Request")
@@ -674,8 +920,9 @@ def make_handler(door: Door):
             if self.path.startswith(ADMIN_PREFIX):
                 self.handle_admin(body)
                 return
-            outcome = self.respond(ip, body)
-            record = self.build_record(started, ip, body, outcome)
+            seen = inspect_request(self.path, self.headers, body)
+            outcome = self.respond(ip, body, seen)
+            record = self.build_record(started, ip, body, outcome, seen)
             door.write_log(record)
             if door.should_push(outcome.kind, self.command, self.path):
                 door.pusher.push(record)
@@ -685,11 +932,51 @@ def make_handler(door: Door):
     return Handler
 
 
+class DoorServer(ThreadingHTTPServer):
+    daemon_threads = True
+    busy_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 6\r\nRetry-After: 1\r\nConnection: close\r\n\r\nBusy.\n"
+
+    def __init__(self, address, handler, max_threads: int):
+        self.slots = threading.BoundedSemaphore(max_threads)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.refuse_busy(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], OSError):
+            super().handle_error(request, client_address)
+
+    def refuse_busy(self, request) -> None:
+        try:
+            request.settimeout(1)
+            request.sendall(self.busy_response)
+        except OSError:
+            pass
+        self.shutdown_request(request)
+
+
+def make_server(door: Door, address: tuple) -> DoorServer:
+    return DoorServer(address, make_handler(door), door.cfg.max_threads)
+
+
 def main(argv=None):
     cfg = Config()
     door = Door(cfg)
-    server = ThreadingHTTPServer(("0.0.0.0", cfg.port), make_handler(door))
-    server.daemon_threads = True
+    server = make_server(door, ("0.0.0.0", cfg.port))
     print(json.dumps({"door": "listening", "port": cfg.port, "upstream": cfg.upstream}), flush=True)
     server.serve_forever()
 

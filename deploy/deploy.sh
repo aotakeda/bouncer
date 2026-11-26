@@ -244,8 +244,9 @@ for kind,entries in d.items():
 }
 
 step_unblock() {
-  local ip="${1:?usage: deploy.sh unblock <ip>}" kind
-  for kind in blocklist tarpit; do printf '%s: ' "$kind"; door_admin DELETE "$kind/$ip"; echo; done
+  local ip="${1:?usage: deploy.sh unblock <ip>}" kind key
+  key="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$ip")"
+  for kind in blocklist tarpit; do printf '%s: ' "$kind"; door_admin DELETE "$kind/$key"; echo; done
 }
 
 summary() {

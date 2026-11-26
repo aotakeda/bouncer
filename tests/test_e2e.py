@@ -395,5 +395,180 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn(b"target_ready", data)
 
 
+class StubDoor:
+    enabled = True
+
+    def __init__(self):
+        self.unblocked = []
+
+    def unblock(self, ip):
+        self.unblocked.append(ip)
+        return True
+
+    def snapshot(self, timeout=3):
+        return {"block": {}, "tarpit": {}, "shield": {}}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+class Dashboard(unittest.TestCase):
+    def setUp(self):
+        import threading
+
+        from agent.agent import Brain
+        from agent.config import Config
+        from agent.web import AgentServer, make_handler
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.brain = Brain(Config({"AGENT_DATA_DIR": self.tmp.name, "AGENT_DASH_SHA256": sha("let me in")}))
+        self.brain.door = StubDoor()
+        self.handler = make_handler(self.brain)
+        self.server = AgentServer(("127.0.0.1", 0), self.handler, max_threads=4)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+        self.brain.inbox.wait_idle(5)
+        self.tmp.cleanup()
+
+    def send(self, path, method="GET", data=None, headers=None):
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers or {})
+        try:
+            with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as r:
+                return r.status, dict(r.headers), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+
+    def login(self, passphrase="let me in", ip="203.0.113.5"):
+        return self.send("/login", "POST", urllib.parse.urlencode({"passphrase": passphrase}).encode(), {"Content-Type": "application/x-www-form-urlencoded", "Sprite-Client-Ip": ip})
+
+    def cookie(self, ip="203.0.113.5"):
+        status, headers, _ = self.login(ip=ip)
+        self.assertEqual(status, 303)
+        return headers["Set-Cookie"].split(";", 1)[0]
+
+    def unblock(self, cookie, ip, client="203.0.113.5"):
+        return self.send("/api/unblock", "POST", json.dumps({"ip": ip}).encode(), {"Cookie": cookie, "Content-Type": "application/json", "Sprite-Client-Ip": client})
+
+    def test_sessions_are_random_and_logout_ends_them(self):
+        status, headers, _ = self.login()
+        self.assertEqual(status, 303)
+        for flag in ("HttpOnly", "Secure", "SameSite=Lax", "Max-Age=604800"):
+            self.assertIn(flag, headers["Set-Cookie"])
+        first, second = self.cookie(), self.cookie()
+        self.assertNotEqual(first, second)
+        self.assertGreater(len(first), len("bouncer=") + 30)
+        self.assertEqual(self.send("/api/state", headers={"Cookie": first})[0], 200)
+        static = "bouncer=" + __import__("hmac").new(sha("let me in").encode(), b"bouncer-dashboard", hashlib.sha256).hexdigest()
+        self.assertEqual(self.send("/api/state", headers={"Cookie": static})[0], 401)
+        self.assertEqual(self.send("/logout", "POST", b"{}", {"Cookie": first, "Sec-Fetch-Site": "cross-site"})[0], 403)
+        status, headers, _ = self.send("/logout", "POST", b"{}", {"Cookie": first, "Content-Type": "application/json"})
+        self.assertEqual(status, 303)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+        self.assertEqual(self.send("/api/state", headers={"Cookie": first})[0], 401)
+        self.assertEqual(self.send("/api/state", headers={"Cookie": second})[0], 200)
+
+    def test_sessions_expire(self):
+        cookie = self.cookie()
+        token = cookie.split("=", 1)[1]
+        self.handler.session_store.tokens[token] = time.time() - 1
+        self.assertEqual(self.send("/api/state", headers={"Cookie": cookie})[0], 401)
+
+    def test_failed_logins_are_throttled_per_ip(self):
+        from unittest import mock
+
+        with mock.patch("agent.web.time.sleep"):
+            for _ in range(5):
+                self.assertEqual(self.login("nope")[0], 401)
+            status, headers, _ = self.login("nope")
+            self.assertEqual(status, 429)
+            self.assertGreater(int(headers["Retry-After"]), 500)
+            self.assertEqual(self.login()[0], 429)
+            self.assertEqual(self.login(ip="198.51.100.7")[0], 303)
+
+    def test_parallel_logins_share_a_small_number_of_slots(self):
+        from unittest import mock
+
+        slots = self.handler.logins.slots
+        self.assertTrue(slots.acquire(blocking=False))
+        self.assertTrue(slots.acquire(blocking=False))
+        try:
+            self.assertFalse(slots.acquire(blocking=False))
+            with mock.patch("agent.web.LOGIN_WAIT_SECONDS", 0.1):
+                self.assertEqual(self.login("nope")[0], 429)
+        finally:
+            slots.release()
+            slots.release()
+        self.assertEqual(self.login()[0], 303)
+
+    def test_pages_carry_security_headers_and_a_matching_nonce(self):
+        import re
+
+        cookie = self.cookie()
+        for path, headers in (("/", {}), ("/", {"Cookie": cookie}), ("/api/state", {"Cookie": cookie}), ("/nope", {}), ("/healthz", {})):
+            status, got, body = self.send(path, headers=headers)
+            self.assertEqual(got["X-Frame-Options"], "DENY", path)
+            self.assertEqual(got["X-Content-Type-Options"], "nosniff", path)
+            self.assertEqual(got["Referrer-Policy"], "no-referrer", path)
+            self.assertIn("frame-ancestors 'none'", got["Content-Security-Policy"], path)
+        _, got, body = self.send("/", headers={"Cookie": cookie})
+        csp = got["Content-Security-Policy"]
+        nonce = re.search(r"'nonce-([^']+)'", csp).group(1)
+        self.assertNotIn("unsafe-inline", re.search(r"script-src[^;]*", csp).group(0))
+        self.assertIn(f'<script nonce="{nonce}">'.encode(), body)
+        self.assertIn(f'<style nonce="{nonce}">'.encode(), body)
+        self.assertNotIn(b"<script>", body)
+        _, again, _ = self.send("/", headers={"Cookie": cookie})
+        self.assertNotEqual(again["Content-Security-Policy"], csp)
+        _, login_headers, login_body = self.send("/")
+        login_nonce = re.search(r"'nonce-([^']+)'", login_headers["Content-Security-Policy"]).group(1)
+        self.assertIn(f'<style nonce="{login_nonce}">'.encode(), login_body)
+
+    def test_head_matches_get_without_a_body(self):
+        cookie = self.cookie()
+        for path, headers in (("/healthz", {}), ("/", {}), ("/api/state", {"Cookie": cookie}), ("/stream", {"Cookie": cookie})):
+            status, got, body = self.send(path, "HEAD", headers=headers)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(body, b"", path)
+            self.assertIn("Content-Security-Policy", got)
+        get_status, get_headers, get_body = self.send("/healthz")
+        _, head_headers, _ = self.send("/healthz", "HEAD")
+        self.assertEqual(head_headers["Content-Length"], str(len(get_body)))
+        self.assertEqual(self.send("/api/state", "HEAD")[0], 401)
+
+    def test_unblock_accepts_ipv4_ipv6_and_ipv6_networks_only(self):
+        cookie = self.cookie()
+        for given, key in (("1.2.3.4", "1.2.3.4"), ("2001:db8:1:2::/64", "2001:db8:1:2::/64"), ("2001:db8:1:2::5", "2001:db8:1:2::/64"), ("owner-as-stranger", "owner-as-stranger")):
+            status, _, body = self.unblock(cookie, given)
+            self.assertEqual(status, 200, given)
+            self.assertEqual(json.loads(body)["ip"], key)
+        for bad in ("10.0.0.0/8", "2001:db8::/48", "2001:db8:1:2::5/64", "1.2.3.4 ", "evil", "../x"):
+            self.assertEqual(self.unblock(cookie, bad)[0], 400, bad)
+        status, _, body = self.unblock(cookie, "self", client="2001:db8:9:9::42")
+        self.assertEqual(json.loads(body)["ip"], "2001:db8:9:9::/64")
+        self.assertEqual(self.brain.door.unblocked, ["1.2.3.4", "2001:db8:1:2::/64", "2001:db8:1:2::/64", "owner-as-stranger", "2001:db8:9:9::/64"])
+
+    def test_server_is_bounded_and_idle_connections_time_out(self):
+        from agent.web import IDLE_SECONDS
+
+        self.assertEqual(self.handler.timeout, IDLE_SECONDS)
+        idle = [socket.create_connection(self.server.server_address) for _ in range(4)]
+        try:
+            time.sleep(0.2)
+            with socket.create_connection(self.server.server_address, timeout=5) as extra:
+                extra.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+                self.assertIn(b"503", extra.recv(4096).split(b"\r\n", 1)[0])
+        finally:
+            for s in idle:
+                s.close()
+
+
 if __name__ == "__main__":
     unittest.main()

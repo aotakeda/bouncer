@@ -15,6 +15,7 @@ KEPT_IPS = 2000
 KEPT_PER_IP = 20
 KEPT_CATCHES = 20
 KEPT_SIGNAL_STATES = 500
+MAX_COUNTED_KEYS = 2000
 TRAFFIC_KEEP_MINUTES = 7 * 24 * 60
 OUTCOME_SLOTS = ("allowed", "slowed", "blocked")
 SIGNAL_STATES = ("open", "reviewing", "resolved")
@@ -162,6 +163,8 @@ class Store:
 
     def shame_path(self, path: str):
         with self.lock:
+            if path not in self.shame and len(self.shame) >= MAX_COUNTED_KEYS:
+                self.shame = Counter(dict(self.shame.most_common(MAX_COUNTED_KEYS // 2)))
             self.shame[path] += 1
 
     def count_traffic(self, ts, outcome: str):
@@ -177,7 +180,13 @@ class Store:
 
     def visit_honeypot(self, ip: str, ts):
         with self.lock:
+            if ip not in self.honeypot_visits and len(self.honeypot_visits) >= MAX_COUNTED_KEYS:
+                self.honeypot_visits = dict(sorted(self.honeypot_visits.items(), key=lambda kv: kv[1])[-(MAX_COUNTED_KEYS // 2):])
             self.honeypot_visits[ip] = ts
+
+    def forget_honeypot(self, ip: str) -> bool:
+        with self.lock:
+            return self.honeypot_visits.pop(ip, None) is not None
 
     def honeypot_origin(self, ip: str) -> tuple | None:
         with self.lock:
