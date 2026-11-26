@@ -4,9 +4,9 @@ Bouncer is a personal security agent for small side projects that can't afford a
 
 It watches every request going to your app. When one looks like an attack, Bouncer sends it again to an isolated copy of the app. If the attack works there, Bouncer blocks the attacker, writes a fix, tests the fix on the copy and opens a pull request for you to review. It never blocks on a guess.
 
-[![Bouncer demo: an attack is replayed on an isolated copy, proven and blocked](assets/bouncer-demo.gif)](VIDEO_URL)
+[![Bouncer demo: an attack is replayed on an isolated copy, proven and blocked](assets/bouncer-demo.gif)](https://youtu.be/XLYzAESbNAQ)
 
-**[Watch the 80-second demo](VIDEO_URL)**
+**[Watch the 80-second demo](https://youtu.be/hoPfVTCOYbQ)**
 
 The video is a scripted re-creation of the dashboard and the pull request, not a screen recording. The live demo below is the real thing. Music: "Happiness" and "Nightfall" by Scott Buckley ([www.scottbuckley.com.au](https://www.scottbuckley.com.au)), released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Both are excerpted, and the opening of "Happiness" is distorted.
 
