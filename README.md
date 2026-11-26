@@ -4,7 +4,7 @@ Bouncer is a personal security agent for small side projects that can't afford a
 
 It watches every request going to your app. When one looks like an attack, Bouncer sends it again to an isolated copy of the app. If the attack works there, Bouncer blocks the attacker, writes a fix, tests the fix on the copy and opens a pull request for you to review. It never blocks on a guess.
 
-[![Bouncer demo: an attack is replayed on an isolated copy, proven and blocked](assets/bouncer-demo.gif)](https://youtu.be/XLYzAESbNAQ)
+[![Bouncer demo: an attack is replayed on an isolated copy, proven and blocked](assets/bouncer-demo.gif)](https://youtu.be/hoPfVTCOYbQ)
 
 **[Watch the 80-second demo](https://youtu.be/hoPfVTCOYbQ)**
 
