@@ -965,6 +965,8 @@ def make_handler(door: Door):
         def read_framed_body(self) -> bytes:
             te = self.headers.get_all("Transfer-Encoding") or []
             if te:
+                if self.headers.get_all("Content-Length"):
+                    raise BadRequest("both Transfer-Encoding and Content-Length")
                 codings = [c.strip().lower() for v in te for c in v.split(",") if c.strip()]
                 if codings != ["chunked"]:
                     raise BadRequest("unsupported transfer-encoding")

@@ -407,6 +407,9 @@ class DoorTests(unittest.TestCase):
             self.assertIn(b"400", data.split(b"\r\n", 1)[0], cl)
         data = self.raw(head + b"Content-Length: 5\r\nContent-Length: 6\r\n\r\nhello!")
         self.assertIn(b"400", data.split(b"\r\n", 1)[0])
+        for order in (b"Content-Length: 4\r\nTransfer-Encoding: chunked\r\n", b"Transfer-Encoding: chunked\r\nContent-Length: 0\r\n"):
+            data = self.raw(head + order + b"\r\n0\r\n\r\n")
+            self.assertIn(b"400", data.split(b"\r\n", 1)[0], order)
         data = self.raw(head + b"Transfer-Encoding: Chunked\r\n\r\n5;ext=1\r\nhello\r\n0\r\n\r\n")
         self.assertIn(b"200", data.split(b"\r\n", 1)[0])
         self.assertEqual(Upstream.seen[-1][2], b"hello")
