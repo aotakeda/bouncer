@@ -26,6 +26,7 @@ check_tools() {
   need node "install Node.js 22 or newer"
   need npm "install Node.js 22 or newer"
   need python3 "install Python 3.9 or newer"
+  need curl "install curl"
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || { echo "Python 3.9 or newer is required" >&2; exit 1; }
 }
 
@@ -76,9 +77,33 @@ step_install() {
   fi
 }
 
+running() {
+  [ -f "$RUN/pids/$1.pid" ] && kill -0 "$(cat "$RUN/pids/$1.pid")" 2>/dev/null
+}
+
+port_taken() {
+  python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) == 0 else 1)" "$1"
+}
+
+check_ports() {
+  local pair name port busy="" i
+  local pairs="app:$APP_PORT jev:$JEV_PORT runner:$RUNNER_PORT agent:$AGENT_PORT door:$DOOR_PORT"
+  for i in $(seq 0 $((REPLAY_COPIES - 1))); do pairs="$pairs runner:$((REPLAY_PORT + i))"; done
+  for pair in $pairs; do
+    name="${pair%%:*}"; port="${pair#*:}"
+    running "$name" && continue
+    if port_taken "$port"; then busy="$busy $port (for $name)"; fi
+  done
+  if [ -n "$busy" ]; then
+    echo "port already in use by something else:$busy" >&2
+    echo "stop whatever holds it, or pick free ports with DOOR_PORT, AGENT_PORT, RUNNER_PORT, JEV_PORT, APP_PORT and REPLAY_PORT" >&2
+    exit 1
+  fi
+}
+
 start() {
   local name="$1"; shift
-  if [ -f "$RUN/pids/$name.pid" ] && kill -0 "$(cat "$RUN/pids/$name.pid")" 2>/dev/null; then
+  if running "$name"; then
     echo "$name already running"
     return
   fi
@@ -86,23 +111,29 @@ start() {
   echo $! > "$RUN/pids/$name.pid"
 }
 
-wait_port() {
-  local port="$1" name="$2" i
+probe() {
+  local path="$1" name="$2" port="$3" expect="$4" i; shift 4
   for i in $(seq 1 120); do
-    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(s.connect_ex(('127.0.0.1', int(sys.argv[1]))))" "$port"; then
+    if curl -s -m 2 "$@" "http://127.0.0.1:$port$path" 2>/dev/null | grep -q -- "$expect"; then
       return 0
+    fi
+    if ! running "$name"; then
+      echo "$name exited before it was ready on port $port, see $RUN/logs/$name.log" >&2
+      return 1
     fi
     sleep 1
   done
-  echo "$name never opened port $port, see $RUN/logs/$name.log" >&2
+  echo "$name never answered as expected on port $port, see $RUN/logs/$name.log" >&2
   return 1
 }
 
 step_up() {
+  local i
   step_install
   write_helpers
   write_secrets
   set -a; . "$RUN/secrets.env"; set +a
+  check_ports
   say "starting Juice Shop, Jev stand-in, runner with $REPLAY_COPIES replay copies, agent and door"
   (cd "$RUN/juice" && PORT=$APP_PORT NODE_ENV=production start app node --require "$RUN/loopback.js" build/app)
   start jev python3 "$ROOT/deploy/local_jev.py" "$JEV_PORT"
@@ -117,11 +148,14 @@ step_up() {
   (cd "$ROOT" && DOOR_HOST=127.0.0.1 DOOR_PORT=$DOOR_PORT DOOR_UPSTREAM=http://127.0.0.1:$APP_PORT DOOR_DATA_DIR="$RUN/door-data" \
     DOOR_ADMIN_SHA256="$(sha "$DOOR_SECRET")" DOOR_EVENTS_URL=http://127.0.0.1:$AGENT_PORT/events DOOR_EVENTS_TOKEN="$EVENTS_SECRET" \
     start door python3 door/door.py)
-  wait_port "$APP_PORT" app
-  wait_port "$REPLAY_PORT" runner
-  wait_port "$RUNNER_PORT" runner
-  wait_port "$AGENT_PORT" agent
-  wait_port "$DOOR_PORT" door
+  probe /rest/admin/application-version app "$APP_PORT" '"version"'
+  probe / jev "$JEV_PORT" '"answers"' -X POST -H 'Content-Type: application/json' -d '{"state":"<request>GET /</request>"}'
+  for i in $(seq 0 $((REPLAY_COPIES - 1))); do
+    probe /rest/admin/application-version runner "$((REPLAY_PORT + i))" '"version"'
+  done
+  probe /health runner "$RUNNER_PORT" '"ok": *true' -H "Authorization: Bearer $RUNNER_SECRET"
+  probe /healthz agent "$AGENT_PORT" '^ok$'
+  probe /_bouncer/blocklist door "$DOOR_PORT" '"shield"' -H "Authorization: Bearer $DOOR_SECRET"
   say "ready"
   echo "shop (send attacks here): http://127.0.0.1:$DOOR_PORT"
   echo "dashboard:                http://127.0.0.1:$AGENT_PORT  (passphrase: $DASH_PASSPHRASE)"

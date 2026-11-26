@@ -1,12 +1,14 @@
 <h1><img src="assets/bouncer-mark.svg" alt="" width="28" height="28" align="absmiddle">&nbsp;Bouncer</h1>
 
-Bouncer is a personal security agent for small side projects that can't afford a dedicated Security Engineer. I built it on Fly.io Sprites for the [Fly.io Hacksgiving](https://fly.io/hacksgiving).
+Bouncer is a personal security agent for small side projects that can't afford a dedicated Security Engineer. I built it on Fly.io Sprites for the [Fly.io Hacksgiving](https://fly.io/hacksgiving). It runs on three Sprites and uses three Sprites connectors: **TypeSafe** for Jev, **Anthropic** for Claude, and **GitHub** for the pull requests.
 
 It watches every request going to your app. When one looks like an attack, Bouncer sends it again to an isolated copy of the app. If the attack works there, Bouncer blocks the attacker, writes a fix, tests the fix on the copy and opens a pull request for you to review. It never blocks on a guess.
 
 [![Bouncer demo: an attack is replayed on an isolated copy, proven and blocked](assets/bouncer-demo.gif)](VIDEO_URL)
 
 **[Watch the 80-second demo](VIDEO_URL)**
+
+The video is a scripted re-creation of the dashboard and the pull request, not a screen recording. The live demo below is the real thing. Music: "Happiness" and "Nightfall" by Scott Buckley ([www.scottbuckley.com.au](https://www.scottbuckley.com.au)), released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Both are excerpted, and the opening of "Happiness" is distorted.
 
 | Part | Runs on |
 |---|---|
@@ -25,8 +27,8 @@ The app in this demo is a fork of [OWASP Juice Shop](https://github.com/aotakeda
 |---|---|
 | Shop (send the attacks here) | https://bh-app-ykmo.sprites.app |
 | Dashboard | https://bh-bouncer-ykmo.sprites.app |
-| Fix for the login hole | https://github.com/aotakeda/juice-shop/pull/1 |
-| Fix for the search hole | https://github.com/aotakeda/juice-shop/pull/2 |
+| Fix for the login hole | https://github.com/aotakeda/juice-shop/pull/3 |
+| Fix for the search hole | https://github.com/aotakeda/juice-shop/pull/4 |
 
 1. Open the dashboard and log in. **The passphrase is in the Hacksgiving submission form**, in the answer to "Is there anything else you'd like the judges to know?".
 2. Keep the dashboard open while you run the tests below in order. You only need `curl`.
@@ -37,6 +39,10 @@ The app in this demo is a fork of [OWASP Juice Shop](https://github.com/aotakeda
 
 The Sprites go to sleep when nobody uses them, so your first request can take around 10 seconds, and the first replay after a quiet spell can take around 20 seconds while the replay server wakes up.
 
+On the Sprites a block lands about 10 to 20 seconds after the attack (about 3 seconds locally). If the dashboard stops updating or asks for the passphrase again, log in again.
+
+The dashboard shows each request's outcome as **Allowed**, **Testing**, **Slowed** or **Blocked**. The agent's decisions behind them are `ignore` or `watch`, `replay`, `tarpit` and `block`.
+
 ### Test 1: Send a scanner request
 
 ```bash
@@ -46,8 +52,8 @@ curl -s -A 'zgrab/0.x' https://bh-app-ykmo.sprites.app/wp-login.php
 What you should see:
 
 - The shop returns its normal page.
-- The dashboard shows the request as `ignore`, and `/wp-login.php` appears under **Probed paths**. The count doesn't go up for repeats from the same client.
-- You are not blocked or slowed down. A single probe is always `ignore`, whatever Jev says. A client that probes 5 different paths within 10 minutes gets slowed down.
+- The dashboard shows the request as **Allowed** (`ignore`), and `/wp-login.php` appears under **Probed paths**. The count doesn't go up for repeats from the same client.
+- You are not blocked or slowed down. A single probe is always allowed, whatever Jev says. A client that probes 5 different paths within 10 minutes gets slowed down.
 
 ### Test 2: Take the bait, then use it
 
@@ -65,11 +71,11 @@ What you should see:
 
 What you should see:
 
-- Step 1 returns a fake `.env` file, and the dashboard shows `tarpit`. Fetching it again doesn't add more rows.
+- Step 1 returns a fake `.env` file, and the dashboard shows it as **Slowed** (`tarpit`). Fetching it again doesn't add more rows.
 - From then on, each of your requests takes 10 seconds, for 10 minutes. That's the slowdown, not an outage. Bouncer still checks everything you send while you're slowed down, so an attack that works still gets you blocked.
 - Step 2 takes 10 seconds and the shop returns `401`.
 - You're blocked right after that. The shop returns `403` for 5 minutes.
-- The dashboard shows `block` with the reason "reused honeypot credentials".
+- The dashboard shows **Blocked**, and the **Blocked** panel gives the reason "reused honeypot credentials".
 
 To keep going, find your IP address in the dashboard's **Blocked** panel and click **Unblock**. That clears the block, the slowdown and the record that you took the bait.
 
@@ -79,15 +85,15 @@ To keep going, find your IP address in the dashboard's **Blocked** panel and cli
 curl -s -A 'sqlmap/1.8' "https://bh-app-ykmo.sprites.app/rest/products/search?q=zz%27%29%29%20UNION%20SELECT%20id%2Cemail%2Cpassword%2C%274%27%2C%275%27%2C%276%27%2C%277%27%2C%278%27%2C%279%27%2C%2710%27%20FROM%20Users--%20demo1"
 ```
 
-Then open [pull request #2](https://github.com/aotakeda/juice-shop/pull/2) and click **Unblock** on the dashboard.
+Then open [pull request #4](https://github.com/aotakeda/juice-shop/pull/4) and click **Unblock** on the dashboard.
 
 What you should see:
 
 - The shop returns `200` with user emails and password hashes in `data`, because the fix isn't merged yet. If someone else proved this hole in the last 24 hours, the route is shielded instead and the shop returns `403` with "This route is shielded until its security fix is merged". Both are expected.
-- The dashboard shows a high Jev score, then `replay`, then `PROVEN`: the attack leaked test-account values that a harmless control request didn't. A shielded attack is still replayed on the unpatched copy, so you see `PROVEN` either way.
-- Within about 10 seconds of the attack you're blocked for 5 minutes.
-- The fix links to pull request #2 instead of opening a second one for the same file.
-- Pull request #2 shows the patch, the test results from the replay server, and a table of attack versions before and after the patch.
+- The dashboard shows a high Jev score and **Testing** while the attack is replayed, then **Blocked**. The request's replay result is **proven**, and the signal says "Proven on the stunt double": the attack leaked test-account values that a harmless control request didn't. A shielded attack is still replayed on the unpatched copy, so you see it proven either way.
+- Within about 10 to 20 seconds of the attack you're blocked for 5 minutes, and the route is shielded.
+- The fix links to pull request #4 instead of opening a second one for the same file.
+- Pull request #4 shows the patch, the test results from the replay server, and a table of attack versions before and after the patch.
 
 ### Test 4: Log in as admin without a password
 
@@ -100,9 +106,9 @@ Then click **Unblock** on the dashboard.
 What you should see:
 
 - The shop returns `200` with an admin login token, or `403` if the route is already shielded.
-- The dashboard shows `PROVEN`: the attack solved the Juice Shop "Login Admin" challenge.
-- Within about 10 seconds of the attack you're blocked.
-- The fix links to [pull request #1](https://github.com/aotakeda/juice-shop/pull/1).
+- The dashboard shows **Blocked**, with the replay result **proven**: the attack solved the Juice Shop "Login Admin" challenge.
+- Within about 10 to 20 seconds of the attack you're blocked, and the route is shielded.
+- The fix links to [pull request #3](https://github.com/aotakeda/juice-shop/pull/3).
 
 ### Running a test again
 
@@ -116,7 +122,7 @@ Bouncer remembers proven attacks for 24 hours, also across restarts.
 ## How it works
 
 1. **Proxy** (`door/`). Every request to the shop goes through the proxy, which logs it with tokens, passwords and secret query parameters redacted. The proxy serves a fake `/.env` file as bait, slows down some clients and refuses blocked ones. It slows a client down the moment it takes the bait, and blocks it the moment it reuses the bait, without waiting for the agent. Before checking a request, it undoes the tricks attackers use to hide one: repeated URL encoding, `\'`-style escapes, SQL comments, null bytes, and gzip or UTF-16 bodies.
-   - The client's address comes from the `Sprite-Client-Ip` header, which the Sprites edge sets. A value sent by the client is overwritten, so it can't be forged, and anything that isn't a valid IP address is ignored.
+   - The client's address comes from the `Sprite-Client-Ip` header, which the Sprites edge sets. A value sent by the client is overwritten, so it can't be forged. When `TRUSTED_PROXIES` is set, the header is only honoured from those addresses. A value that isn't a valid IP address, or that comes from an untrusted peer, is logged and the connection's own address is used instead.
    - Each client gets at most 32 open connections and 30 seconds to send a request, so one slow client can't tie up the shop for everyone.
 2. **Triage** (`agent/jev.py`). Unusual requests go to TypeSafe's Jev System One model, which scores how malicious they look. The request text is marked as untrusted in the prompt. A request shaped like a known attack (SQL or NoSQL injection, path traversal, script injection, a forged login token) always goes to replay, whatever Jev says.
 3. **Replay** (`runner/`). High-scoring requests go to the replay server. It keeps 4 copies of the shop started and waiting, each with its own fresh database, so a replay doesn't wait for a restart. It takes a fresh copy and sends the attack next to a harmless control request. A used copy restarts in the background. The attack counts as real if it leaks a test account's data or solves a Juice Shop challenge.
@@ -141,11 +147,14 @@ Bouncer remembers proven attacks for 24 hours, also across restarts.
 |---|---|
 | Shop | The live Juice Shop that anyone can open. |
 | Replay server | The isolated copy of the shop where Bouncer tests attacks and patches. |
+| Warm pool | The copies of the shop that the replay server keeps started and waiting, each with a fresh database. Each replay takes a fresh copy from the pool. |
+| Stunt double | The dashboard's name for a replay copy. "Proven on the stunt double" means the attack worked on a fresh copy from the warm pool. |
 | Honeypot | The fake `/.env` file. It contains fake credentials. |
 | Canary | A fake value that Bouncer watches for, such as the honeypot credentials or the replay server's test account. |
 | Tarpit | A 10-second delay on every request from one IP address. A slowed client gets at most 2 delayed requests at a time; extra parallel requests get `429`. |
 | Shield | A route the proxy protects after an attack on it is proven. Attack-shaped requests to it get `403` until the fix is merged. |
 | Block | The proxy refuses every request from one IP address with HTTP `403`. |
+| Allowed, Testing, Slowed, Blocked | The outcomes the dashboard shows for a request. Allowed means it went through (`ignore` or `watch`), Testing means it's being replayed (`replay`), Slowed means the client is tarpitted (`tarpit`), and Blocked means the client is blocked (`block`). A request a shield turned away shows as Refused by shield. |
 | Dashboard | The page that shows requests, scores, decisions and fixes as they happen. |
 
 ## Run your own copy
@@ -195,10 +204,12 @@ The script creates `.secrets` if it's missing, installs the shop on two Sprites,
 - At most 3 new fix attempts per hour.
 - At most 50 slowed requests at once across all clients.
 - Fix results live in memory. After a restart, the agent finds its open pull requests again on GitHub. Before reusing a pull request, it checks that it's still open. If GitHub can't be reached, it opens no pull request and tries again on the next attack.
-- Proven attacks are kept for 24 hours in `agent-data/proven.json`, and dashboard sessions in `agent-data/dash-sessions.json`, so both survive a restart. Only a hash of each session is stored.
+- Proven attacks are kept for 24 hours in `agent-data/proven.json`, so they survive a restart. Dashboard sessions are signed tokens, so they survive a restart too; `agent-data/dash-sessions.json` only holds a hash of signed-out sessions.
 - Requests that get a normal response (status below 400) skip triage unless they contain attack syntax or scanner headers.
 - Shields match the attacked path after normalizing it, not route patterns like `/api/Users/:id`.
-- The owner IP is never locked out of the dashboard login. Other addresses are locked out for 10 minutes after 5 wrong passphrases.
+- Bouncer proves server-side attacks: a replay counts as proof when it leaks a canary or solves a Juice Shop challenge. For reflected XSS, the most it can show is that the payload came back unescaped in an HTML page. It doesn't run JavaScript, so client-side bugs such as DOM XSS are flagged and slowed down, but never proven or blocked.
+- Only attack-shaped requests are triaged. Access-control bugs, such as reading another user's basket (IDOR) or downloading files straight from `/ftp`, look like normal requests, so they pass through untriaged.
+- The owner IP is never locked out of the dashboard login. When `TRUSTED_PROXIES` is set, or the address comes from the connection itself, other addresses are locked out for 10 minutes after 5 wrong passphrases; otherwise they are slowed to one try every 10 seconds. After 20 wrong passphrases in 10 minutes from anyone, every login is slowed.
 
 ### Settings
 
@@ -215,6 +226,8 @@ Every setting has a default that works on Sprites. These are the ones you're mos
 | `DOOR_MAX_CONNS_PER_IP` | proxy | `32` | Open connections per client |
 | `DOOR_REQUEST_SECONDS` | proxy | `30` | Time a client gets to send a whole request |
 | `DOOR_TRUST_CLIENT_IP_HEADER`, `BOUNCER_TRUST_CLIENT_IP_HEADER` | proxy, agent | on | Read the client address from `Sprite-Client-Ip`. Turn it off when nothing in front of Bouncer sets the header |
+| `TRUSTED_PROXIES` (or `DOOR_TRUSTED_PROXIES`, `BOUNCER_TRUSTED_PROXIES`) | proxy, agent | any peer | Comma-separated IPs or CIDRs allowed to set `Sprite-Client-Ip`. Setting it also turns on the hard per-address login lock |
+| `RUNNER_MAX_THREADS` | runner | `32` | Requests the replay server handles at once; extra ones get 503 |
 | `DOOR_HOST`, `BOUNCER_HOST`, `RUNNER_HOST` | all | `0.0.0.0` | Address each part listens on |
 | `REPLAY_COPIES` | deploy, local | `4` on Sprites, `3` locally | Copies of the shop the replay server keeps started. Each one uses about 200 MB |
 

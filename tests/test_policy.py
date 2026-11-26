@@ -136,6 +136,37 @@ class TruncatedReplay(unittest.TestCase):
         self.assertIn("connection reset", out["why"])
 
 
+class ReplayEvidence(unittest.TestCase):
+    clean = {"status": 200, "canary_hits": []}
+
+    def test_unescaped_markup_in_html_is_proven(self):
+        req = build_request({"method": "GET", "path": "/search?q=%3Cimg+src%3Dx+onerror%3Dalert(1)%3E"})
+        result = {"ok": True, "attack": dict(self.clean, reflected=True), "control": dict(self.clean, reflected=False), "attack_solved": {}}
+        out = interpret(req, result)
+        self.assertEqual(out["verdict"], Verdict.PROVEN)
+        self.assertIn("unescaped", out["why"])
+        self.assertEqual(interpret(req, {**result, "attack": dict(self.clean)})["verdict"], Verdict.NOT_REPRODUCED)
+
+    def test_runner_spots_reflection_only_in_html(self):
+        runner = load_runner()
+        req = {"method": "GET", "path": "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"}
+        self.assertTrue(runner.reflected_markup("<p><script>alert(1)</script></p>", {"Content-Type": "text/html; charset=utf-8"}, req))
+        self.assertFalse(runner.reflected_markup("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>", {"Content-Type": "text/html"}, req))
+        self.assertFalse(runner.reflected_markup('{"q":"<script>alert(1)</script>"}', {"Content-Type": "application/json"}, req))
+        self.assertFalse(runner.reflected_markup("<p>apple</p>", {"Content-Type": "text/html"}, {"method": "GET", "path": "/search?q=apple"}))
+
+    def test_dummy_cookie_does_not_make_an_attack_stateful(self):
+        def verdict(headers):
+            req = build_request({"method": "GET", "path": "/rest/products/search?q=%27", "headers": headers})
+            return interpret(req, {"ok": True, "attack": dict(self.clean), "control": dict(self.clean), "attack_solved": {}})["verdict"]
+
+        self.assertEqual(verdict({"Cookie": "a=b"}), Verdict.NOT_REPRODUCED)
+        self.assertEqual(verdict({"Authorization": "x"}), Verdict.NOT_REPRODUCED)
+        self.assertEqual(verdict({"Cookie": "language=en; token=eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOjF9.c2ln"}), Verdict.INCONCLUSIVE)
+        self.assertEqual(verdict({"Cookie": "connect.sid=s%3Aabcdef123456"}), Verdict.INCONCLUSIVE)
+        self.assertEqual(verdict({"Authorization": "Bearer abcdefgh12345678"}), Verdict.INCONCLUSIVE)
+
+
 class Restart(unittest.TestCase):
     def test_feed_survives_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,6 +440,52 @@ class JudgeFindings(unittest.TestCase):
         self.assertEqual([k for k, _ in listed], [Decision.TARPIT, Decision.BLOCK])
         self.assertEqual(listed[0][1], "waiting for proof")
 
+    def test_intake_keeps_the_sprite_awake_before_answering(self):
+        from agent import agent as agent_mod
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agent_mod.net, "hold_awake") as hold, mock.patch.object(agent_mod.net, "release_awake"):
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            brain.inbox = FairInbox(5, 100)
+            brain.submit([{"ip": "5.5.5.8", "kind": "request", "method": "GET", "path": "/rest/products", "status": 200}])
+            hold.assert_not_called()
+            brain.submit([{"ip": "5.5.5.8", "kind": "request", "method": "GET", "path": "/rest/products/search?q=%27))+UNION+SELECT+1--", "status": 200}])
+            hold.assert_called_once_with(agent_mod.AWAKE_TASK, agent_mod.AWAKE_SECONDS)
+            brain.submit([{"ip": "5.5.5.9", "kind": "request", "method": "GET", "path": "/rest/products/search?q=%27))+UNION+SELECT+2--", "status": 200}])
+            hold.assert_called_once()
+
+    def test_pending_busy_retry_keeps_the_sprite_awake(self):
+        from agent import agent as agent_mod
+
+        class Replayer:
+            def run(self, event):
+                return {"verdict": Verdict.ERROR, "why": "back room busy testing a fix", "busy": True}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agent_mod.net, "hold_awake"), mock.patch.object(agent_mod.net, "release_awake") as release:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp, "BUSY_RETRY_SECONDS": "30"}))
+            brain.inbox = FairInbox(5, 100)
+            brain.replayer = Replayer()
+            brain._work_one({"ip": "5.5.5.10", "kind": "request", "method": "GET", "path": "/rest/products/search?q=%27))+UNION+SELECT+1--", "status": 200})
+            self.assertEqual(brain.retries_pending, 1)
+            release.assert_not_called()
+
+    def test_jammed_replay_lets_the_same_request_try_again(self):
+        results = [{"verdict": Verdict.ERROR, "why": "runner failed at reset", "evidence": {}}, {"verdict": Verdict.PROVEN, "why": "leaked 2 canary strings the control did not", "evidence": {}}]
+
+        class Replayer:
+            def run(self, event):
+                return results.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            brain.door = FakeDoor()
+            brain.replayer = Replayer()
+            event = {"ip": "5.5.5.7", "kind": "request", "method": "GET", "path": "/rest/products/search?q=demo1%27))+UNION+SELECT+1--", "status": 200}
+            brain.handle(dict(event, ts=1.0))
+            self.assertEqual(brain.door.lists, [])
+            brain.handle(dict(event, ts=2.0))
+        self.assertEqual(results, [])
+        self.assertIn((Decision.BLOCK, "5.5.5.7"), brain.door.lists)
+
     def test_agent_does_not_resend_lists_the_door_already_applied(self):
         with tempfile.TemporaryDirectory() as tmp:
             brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
@@ -517,10 +594,34 @@ class Normalized(unittest.TestCase):
         policy = DecisionPolicy(Thresholds(max_variants=3))
         outs = [policy.screen({"method": "GET", "path": f"/rest/products/search?q=%27{c}", "status": 200}, "1.2.3.4", 0).skipped for c in "abcdef"]
         self.assertEqual(outs, ["", "", "", VARIANT_DEDUPED, VARIANT_DEDUPED, VARIANT_DEDUPED])
-        same_trick = [policy.screen({"method": "GET", "path": f"/rest/items?q=%27+or+{n}={n}", "status": 200}, "1.2.3.4", 0).skipped for n in (1, 2)]
+        same_trick = [policy.screen({"method": "GET", "path": f"/rest/items?q=%27x{n}", "status": 200}, "1.2.3.4", 0).skipped for n in (1, 2)]
         self.assertEqual(same_trick, ["", VARIANT_DEDUPED])
         self.assertEqual(policy.screen({"method": "GET", "path": "/rest/products/search?q=%27z", "status": 200}, "5.6.7.8", 0).skipped, "")
         self.assertEqual(policy.screen({"method": "GET", "path": "/rest/products/search?q=%27g", "status": 200}, "1.2.3.4", 700).skipped, "")
+
+    def test_attack_shaped_requests_are_never_variant_deduped(self):
+        policy = DecisionPolicy(Thresholds(max_variants=5))
+        primes = [policy.screen({"method": "GET", "path": f"/rest/products/search?q={w}%27", "status": 200}, "1.2.3.4", 0).skipped for w in ("alpha", "beta", "gamma", "delta", "epsilon", "zeta")]
+        self.assertEqual(primes[-1], VARIANT_DEDUPED)
+        union = {"method": "GET", "path": "/rest/products/search?q=qwert%27))+UNION+SELECT+id,email,password,4,5,6,7,8,9+FROM+Users--", "status": 200}
+        out = policy.screen(union, "1.2.3.4", 1)
+        self.assertEqual(out.skipped, "")
+        self.assertTrue(out.signals.attack)
+        tweaked = dict(union, path=union["path"].replace("qwert", "qwerty"))
+        self.assertEqual(policy.screen(tweaked, "1.2.3.4", 2).skipped, "")
+        self.assertEqual(policy.choose({"ok": True, "action": "ignore", "malicious": 0.1, "confidence": 0.9}, out.signals), Decision.REPLAY)
+
+    def test_released_request_can_be_retried(self):
+        policy = DecisionPolicy(Thresholds())
+        attack = {"method": "GET", "path": "/rest/products/search?q=demo1%27))+UNION+SELECT+1--", "status": 200}
+        self.assertEqual(policy.screen(attack, "1.2.3.4", 0).skipped, "")
+        self.assertEqual(policy.screen(attack, "1.2.3.4", 1).skipped, DEDUPED)
+        policy.release(attack, "1.2.3.4")
+        self.assertEqual(policy.screen(attack, "1.2.3.4", 2).skipped, "")
+        probe = {"method": "GET", "path": "/rest/items?q=demo1%27", "status": 200}
+        self.assertEqual(policy.screen(probe, "1.2.3.4", 0).skipped, "")
+        policy.release(probe, "1.2.3.4")
+        self.assertEqual(policy.screen(dict(probe, path="/rest/items?q=demo2%27"), "1.2.3.4", 1).skipped, "")
 
     def test_plain_matches_screen(self):
         policy = DecisionPolicy(Thresholds())
@@ -568,20 +669,22 @@ class ProvenHandling(unittest.TestCase):
         brain.replayer = Replayer()
         return brain
 
-    def test_cross_site_proof_shields_but_never_lists_the_client(self):
+    def test_cross_site_proof_shields_and_slows_but_never_blocks_the_client(self):
         for site in ("cross-site", "same-site"):
             with tempfile.TemporaryDirectory() as tmp:
                 brain = self.brain(tmp)
                 brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=1.0, **self.browser))
                 brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=2.0, **self.browser))
-                self.assertEqual(brain.door.lists, [], site)
+                self.assertEqual(brain.door.lists, [(Decision.TARPIT, "5.5.5.5")] * 2, site)
+                self.assertTrue(brain.store.incidents[-1]["slowed"])
                 self.assertEqual(brain.door.shields, ["POST /rest/user/login"])
                 incident = brain.store.incidents[-1]
                 self.assertTrue(incident["foreign"])
                 self.assertFalse(incident["blocked"])
                 step = next(s for s in brain.views.proven_signals(False)[0]["steps"] if s["label"] == "Client not blocked")
                 self.assertIn("another site's page", step["note"])
-                self.assertEqual(brain.store.recent("5.5.5.5", 5)[-1]["decision"], Decision.WATCH)
+                self.assertIn("Slowed instead", step["note"])
+                self.assertEqual(brain.store.recent("5.5.5.5", 5)[-1]["decision"], Decision.TARPIT)
 
     def test_same_origin_proof_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -773,9 +876,10 @@ class ReviewFixes(unittest.TestCase):
 
     def test_variant_drops_are_counted(self):
         with tempfile.TemporaryDirectory() as tmp:
-            brain = self.brain(tmp, verdicts={SQLI + f"v{c}": Verdict.NOT_REPRODUCED for c in "abcdefg"})
+            quote = "/rest/products/search?q=%27"
+            brain = self.brain(tmp, verdicts={quote + f"v{c}": Verdict.NOT_REPRODUCED for c in "abcdefg"})
             for i, c in enumerate("abcdefg"):
-                brain.handle(self.sqli("6.6.6.8", f"v{c}", float(i)))
+                brain.handle(dict(self.sqli("6.6.6.8", "", float(i)), path=quote + f"v{c}"))
             stats = brain.store.stats
         self.assertEqual(len(brain.runs), 5)
         self.assertEqual(stats[VARIANT_DEDUPED], 2)
@@ -806,10 +910,10 @@ class ReviewFixes(unittest.TestCase):
             rows = brain.store.recent("5.5.5.2", 10)
             incidents = brain.store.incidents
             stats = brain.store.stats
-        self.assertEqual([r["decision"] for r in rows if r["decision"] != Decision.REPLAY], [Decision.WATCH, Decision.WATCH, Decision.BLOCK])
-        self.assertEqual(len(listed), 1)
-        self.assertEqual(listed[0][:2], (Decision.BLOCK, "5.5.5.2"))
-        self.assertIn("other sites' pages", listed[0][2])
+        self.assertEqual([r["decision"] for r in rows if r["decision"] != Decision.REPLAY], [Decision.TARPIT, Decision.TARPIT, Decision.BLOCK])
+        self.assertEqual([entry[:2] for entry in listed], [(Decision.TARPIT, "5.5.5.2"), (Decision.TARPIT, "5.5.5.2"), (Decision.BLOCK, "5.5.5.2")])
+        self.assertIn("another site's page", listed[0][2])
+        self.assertIn("other sites' pages", listed[-1][2])
         self.assertIn("3 times", rows[-1]["line"])
         self.assertEqual([i.get("foreign", False) for i in incidents], [True, True, False])
         self.assertTrue(incidents[-1]["blocked"])
@@ -820,9 +924,9 @@ class ReviewFixes(unittest.TestCase):
             brain = self.brain(tmp, FOREIGN_BLOCK_AFTER="2", FOREIGN_WINDOW_SECONDS="5")
             brain.handle(dict(self.sqli("5.5.5.3", "a", 1.0), **BROWSER))
             brain.handle(dict(self.sqli("5.5.5.3", "b", 100.0), **BROWSER))
-            self.assertEqual(brain.door.lists, [])
+            self.assertEqual(brain.door.lists, [(Decision.TARPIT, "5.5.5.3")] * 2)
             brain.handle(dict(self.sqli("5.5.5.3", "c", 102.0), **BROWSER))
-        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "5.5.5.3")])
+        self.assertEqual(brain.door.lists, [(Decision.TARPIT, "5.5.5.3")] * 2 + [(Decision.BLOCK, "5.5.5.3")])
 
     def test_repeat_proven_from_a_browser_counts_toward_the_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -831,8 +935,8 @@ class ReviewFixes(unittest.TestCase):
                 brain.handle(dict(self.sqli("5.5.5.4", "same", ts), **BROWSER))
             decisions = [r["decision"] for r in brain.store.recent("5.5.5.4", 10)]
         self.assertEqual(brain.runs, [SQLI + "same"])
-        self.assertEqual(decisions, [Decision.REPLAY, Decision.WATCH, Decision.WATCH, Decision.BLOCK])
-        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "5.5.5.4")])
+        self.assertEqual(decisions, [Decision.REPLAY, Decision.TARPIT, Decision.TARPIT, Decision.BLOCK])
+        self.assertEqual(brain.door.lists, [(Decision.TARPIT, "5.5.5.4")] * 2 + [(Decision.BLOCK, "5.5.5.4")])
 
     def test_canary_reuse_needs_coherent_browser_metadata_and_has_a_limit(self):
         reuse = {"kind": "canary_reuse", "method": "POST", "path": "/rest/user/login"}

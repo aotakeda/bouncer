@@ -152,18 +152,40 @@ step_create() {
   APP_URL="$(url_of $APP)"; REPLAY_URL="$(url_of $REPLAY)"; AGENT_URL="$(url_of $AGENT)"
 }
 
+wait_each() {
+  local failed=0 label pid
+  while [ "$#" -ge 2 ]; do
+    label="$1" pid="$2"; shift 2
+    if ! wait "$pid"; then
+      echo "FAILED: $label" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
 step_install() {
+  local app_pid replay_pid
   say "installing Juice Shop on $APP and $REPLAY"
-  install_juice "$APP" &
-  install_juice "$REPLAY" &
-  wait
+  install_juice "$APP" & app_pid=$!
+  install_juice "$REPLAY" & replay_pid=$!
+  if ! wait_each "install on $APP" "$app_pid" "install on $REPLAY" "$replay_pid"; then
+    step_lock || echo "lock after failed install also failed, check network policies" >&2
+    echo "Juice Shop install failed; see /tmp/npm-install.log on the failing Sprite" >&2
+    exit 1
+  fi
 }
 
 step_refresh() {
+  local app_pid replay_pid
   say "refreshing Juice Shop on $APP and $REPLAY"
-  refresh_juice "$APP" juice &
-  refresh_juice "$REPLAY" runner &
-  wait
+  refresh_juice "$APP" juice & app_pid=$!
+  refresh_juice "$REPLAY" runner & replay_pid=$!
+  if ! wait_each "refresh on $APP" "$app_pid" "refresh on $REPLAY" "$replay_pid"; then
+    step_lock || echo "lock after failed refresh also failed, check network policies" >&2
+    echo "Juice Shop refresh failed (git pull, tsc in /tmp/tsc.log, or restart); shields stay up" >&2
+    exit 1
+  fi
   step_lock
   clear_shields
 }

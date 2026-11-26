@@ -471,7 +471,10 @@ class Dashboard(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.brain = Brain(Config({"AGENT_DATA_DIR": self.tmp.name, "AGENT_DASH_SHA256": sha("let me in")}))
         self.brain.door = StubDoor()
-        self.handler = make_handler(self.brain)
+        from unittest import mock
+
+        with mock.patch.dict("os.environ", {"BOUNCER_TRUSTED_PROXIES": "127.0.0.1"}):
+            self.handler = make_handler(self.brain)
         self.server = AgentServer(("127.0.0.1", 0), self.handler, max_threads=4)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -526,10 +529,10 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(self.send("/api/state", headers={"Cookie": second})[0], 200)
 
     def test_sessions_expire(self):
-        cookie = self.cookie()
-        token = cookie.split("=", 1)[1]
+        from agent import web
+
         store = self.handler.session_store
-        store.tokens[store.digest(token)] = time.time() - 1
+        cookie = "bouncer=" + store.new(now=time.time() - web.SESSION_SECONDS - 1)
         self.assertEqual(self.send("/api/state", headers={"Cookie": cookie})[0], 401)
 
     def test_failed_logins_are_throttled_per_ip(self):

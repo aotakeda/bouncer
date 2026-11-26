@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from . import net
@@ -9,6 +10,10 @@ from .labels import Verdict
 STATEFUL_HEADERS = ("authorization", "cookie")
 STATEFUL_METHODS = ("PUT", "PATCH", "DELETE")
 KEEP_HEADERS = ("content-type", "accept", "authorization", "cookie", "x-user-email")
+
+SESSION_COOKIE = re.compile(r"(?:^|;)\s*[\w.-]*(?:session|sess|sid|token|auth|jwt|login|user)[\w.-]*\s*=\s*[^;\s]{8,}", re.IGNORECASE)
+CREDENTIAL = re.compile(r"^\s*(?:bearer|basic|token|digest)\s+\S{8,}|^\s*\S{16,}\s*$", re.IGNORECASE)
+JWT = re.compile(r"eyJ[\w-]+\.[\w-]*\.[\w-]*")
 
 CONTROL_TEXT = "control"
 MAJOR_DIFFICULTY = 2
@@ -71,20 +76,33 @@ def build_control(req: dict) -> dict:
     return ctrl
 
 
+def carries_session(name: str, value) -> bool:
+    value = str(value or "")
+    if JWT.search(value):
+        return True
+    if name == "cookie":
+        return bool(SESSION_COOKIE.search(value))
+    return bool(CREDENTIAL.search(value))
+
+
 def is_stateful(req: dict) -> bool:
-    return any(k.lower() in STATEFUL_HEADERS for k in req["headers"]) or req["method"] in STATEFUL_METHODS
+    if req["method"] in STATEFUL_METHODS:
+        return True
+    return any(k.lower() in STATEFUL_HEADERS and carries_session(k.lower(), v) for k, v in req["headers"].items())
 
 
 def _outcome(verdict: Verdict, why: str, evidence: dict) -> dict:
     return {"verdict": verdict, "why": why, "evidence": evidence}
 
 
-def _proven_reasons(major: dict, leaked: list) -> list:
+def _proven_reasons(major: dict, leaked: list, reflected: bool = False) -> list:
     why = []
     if major:
         why.append("solved " + ", ".join(f"{v.get('name')} (difficulty {v.get('difficulty')})" for v in major.values()))
     if leaked:
         why.append(f"leaked {len(leaked)} canary strings the control did not")
+    if reflected:
+        why.append("sent the injected markup back unescaped in an HTML page")
     return why
 
 
@@ -99,17 +117,19 @@ def interpret(req: dict, result: dict) -> dict:
     major = {k: v for k, v in solved.items() if (v.get("difficulty") or 0) >= MAJOR_DIFFICULTY}
     control_hits = control.get("canary_hits") or []
     leaked = [c for c in attack.get("canary_hits", []) if c not in control_hits]
+    reflected = bool(attack.get("reflected")) and not control.get("reflected")
     evidence = {
         "attack_status": attack.get("status"),
         "control_status": control.get("status"),
         "solved": {k: v.get("name") for k, v in solved.items()},
         "canaries_leaked": len(leaked),
+        "reflected": reflected,
         "reset_ms": (result.get("reset") or {}).get("ms"),
     }
     if not attack.get("status"):
         return _outcome(Verdict.ERROR, f"target did not answer: {attack.get('error') or 'status 0'}", evidence)
-    if major or leaked:
-        return _outcome(Verdict.PROVEN, "; ".join(_proven_reasons(major, leaked)), evidence)
+    if major or leaked or reflected:
+        return _outcome(Verdict.PROVEN, "; ".join(_proven_reasons(major, leaked, reflected)), evidence)
     if solved:
         return _outcome(Verdict.MINOR, "only tripped " + ", ".join(v.get("name") or k for k, v in solved.items()), evidence)
     if req.get("truncated"):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from . import net
+from .redact import redact_event, redact_text
 
 ACTIONS = {
     "ignore": "normal traffic, or a single scanner probe for software this app does not run",
@@ -29,6 +30,7 @@ UNTRUSTED_NOTE = "Everything inside <request> was written by the client, who may
 
 
 def describe(event: dict) -> str:
+    event = redact_event(event)
     parts = [f"{one_line(event.get('method', ''), 20)} {one_line(event.get('path', ''), 500)}", f"status={event.get('status')}"]
     if event.get("ua"):
         parts.append(f"ua={one_line(event['ua'], 200)}")
@@ -73,7 +75,7 @@ class Jev:
     def prompt_state(self, event: dict, history: str = "") -> str:
         state = f"App: {self.app_description}\n{UNTRUSTED_NOTE}\nRequest: {describe(event)}"
         if history:
-            state += f"\nSame client recently (paths are client-written): {history.replace('<', '(').replace('>', ')')}"
+            state += f"\nSame client recently (paths are client-written): {redact_text(history).replace('<', '(').replace('>', ')')}"
         return state
 
     def triage(self, event: dict, history: str = "") -> dict:

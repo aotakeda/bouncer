@@ -242,6 +242,14 @@ class DecisionPolicy:
             self.probes.pop(ip, None)
             self.foreign.pop(ip, None)
 
+    def release(self, event: dict, ip: str) -> None:
+        sig = skeleton(event)
+        with self.lock:
+            self.seen.pop(self.key(event, ip), None)
+            entry = self.variants.get((ip, shape(event)))
+            if entry:
+                entry["shapes"].discard(sig)
+
     def foreign_strike(self, ip: str, ts: float) -> int:
         cutoff = ts - self.thresholds.foreign_seconds
         with self.lock:
@@ -285,7 +293,7 @@ class DecisionPolicy:
                 return Screening(DEDUPED, None)
             if not signals.interesting:
                 return Screening(PREFILTERED, None)
-            if signals.suspicious and not self._proven_ip(ip, ts) and self._is_variant(event, ip, ts):
+            if signals.suspicious and not signals.attack and not self._proven_ip(ip, ts) and self._is_variant(event, ip, ts):
                 return Screening(VARIANT_DEDUPED, None)
             probes = self._count_probe(event, ip, ts) if signals.probe else 0
             if len(self.seen) >= MAX_SEEN:

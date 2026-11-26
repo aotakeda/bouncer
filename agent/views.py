@@ -64,6 +64,10 @@ def severity(kind, decision, verdict, malicious) -> str:
     return "info"
 
 
+def foreign_note(incident: dict) -> str:
+    return f"{FOREIGN_NOTE}. Slowed instead" if incident.get("slowed") else FOREIGN_NOTE
+
+
 def foreign_strikes_note(incident: dict) -> str:
     strikes = incident.get("foreign_strikes")
     if isinstance(strikes, bool) or not isinstance(strikes, int) or strikes <= 0:
@@ -217,7 +221,7 @@ class Views:
         steps = [
             {"label": f"Flagged by {JEV_NAME}", "state": "done" if jev.get("ok") else "todo", "ts": event.get("ts"), "note": f"{round(jev['malicious'] * 100)}% attack" if isinstance(jev.get("malicious"), (int, float)) else ""},
             {"label": "Proven on the stunt double", "state": "bad", "ts": latest["ts"], "note": replay.get("why") or ""},
-            self.blocked_step(latest.get("blocked", True), latest["ts"], FOREIGN_NOTE if latest.get("foreign") else "Owner or door unavailable", foreign_strikes_note(latest)),
+            self.blocked_step(latest.get("blocked", True), latest["ts"], foreign_note(latest) if latest.get("foreign") else "Owner or door unavailable", foreign_strikes_note(latest)),
             *([{"label": "Route shielded until the fix is merged", "state": "done", "ts": latest["ts"], "note": "attack-shaped requests get 403"}] if shield else []),
             *([{"label": "Route not shielded", "state": "todo", "ts": latest["ts"], "note": "Your own traffic, so it would have been shielded for anyone else"}] if latest.get("would_shield") and not shield else []),
             *fix_steps(fix, fixes_on),

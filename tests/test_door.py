@@ -10,6 +10,9 @@ import threading
 import time
 import unittest
 import urllib.parse
+from contextlib import redirect_stderr
+from io import StringIO
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -661,6 +664,87 @@ class DoorTests(unittest.TestCase):
         self.assertEqual(slowed["path"], path)
         self.assertTrue(slowed["attack_shaped"])
 
+
+    def test_trusted_proxies_parse_into_networks(self):
+        self.assertIsNone(door_mod.Config({}).trusted_proxies)
+        self.assertIsNone(door_mod.proxy_networks(" , "))
+        nets = door_mod.Config({"TRUSTED_PROXIES": "10.0.0.0/8, 2001:db8::/32"}).trusted_proxies
+        self.assertEqual([str(n) for n in nets], ["10.0.0.0/8", "2001:db8::/32"])
+        own = door_mod.Config({"TRUSTED_PROXIES": "10.0.0.0/8", "DOOR_TRUSTED_PROXIES": "192.0.2.1"}).trusted_proxies
+        self.assertEqual([str(n) for n in own], ["192.0.2.1/32"])
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(door_mod.proxy_networks("nonsense"), ())
+        self.assertIn("ignored a trusted proxy", err.getvalue())
+        self.assertTrue(door_mod.peer_trusted("203.0.113.1", None))
+        self.assertTrue(door_mod.peer_trusted("::ffff:10.1.2.3", nets))
+        self.assertTrue(door_mod.peer_trusted("2001:db8::5", nets))
+        self.assertFalse(door_mod.peer_trusted("11.0.0.1", nets))
+        self.assertFalse(door_mod.peer_trusted("10.0.0.1", ()))
+        self.assertFalse(door_mod.peer_trusted("junk", nets))
+
+    def test_client_ip_header_only_counts_from_a_trusted_proxy(self):
+        door, port, pushed = self.start_door("foreign-peer", {"DOOR_TRUSTED_PROXIES": "10.0.0.0/8"})
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(self.call_port(port, "/rest/x", {"Sprite-Client-Ip": "1.2.3.4"}), 200)
+            self.wait_for(lambda: pushed)
+        self.assertEqual(pushed[-1]["ip"], "127.0.0.1")
+        self.assertEqual(Upstream.seen[-1][1]["X-Forwarded-For"], "127.0.0.1")
+        line = json.loads(err.getvalue().strip().splitlines()[-1])
+        self.assertEqual((line["warning"], line["peer"], line["value"]), ("client ip header from an untrusted peer", "127.0.0.1", "1.2.3.4"))
+        door, port, pushed = self.start_door("local-peer", {"DOOR_TRUSTED_PROXIES": "127.0.0.1"})
+        self.assertEqual(self.call_port(port, "/rest/x", {"Sprite-Client-Ip": "1.2.3.4"}), 200)
+        self.wait_for(lambda: pushed)
+        self.assertEqual(pushed[-1]["ip"], "1.2.3.4")
+
+    def test_untrusted_peer_cannot_rotate_out_of_its_block(self):
+        door, port, _ = self.start_door("rotate", {"DOOR_TRUSTED_PROXIES": "10.0.0.0/8"})
+        door.lists.add("block", "127.0.0.1", 60, "test", set())
+        with redirect_stderr(StringIO()):
+            for ip in ("1.1.1.1", "2.2.2.2", "3.3.3.3"):
+                self.assertEqual(self.call_port(port, "/", {"Sprite-Client-Ip": ip}), 403)
+
+    def test_invalid_client_ip_header_is_logged_not_silently_dropped(self):
+        with redirect_stderr(StringIO()) as err:
+            self.call("/rest/x", "not-an-ip")
+            self.last_push(1)
+            self.call("/rest/x", "also-bad")
+            self.last_push(2)
+            self.call("/rest/x", "5.6.7.8")
+            self.last_push(3)
+        lines = [json.loads(line) for line in err.getvalue().strip().splitlines()]
+        self.assertEqual([(l["warning"], l["value"]) for l in lines], [("invalid client ip header", "not-an-ip")])
+        self.assertEqual([e["ip"] for e in self.pushed], ["127.0.0.1", "127.0.0.1", "5.6.7.8"])
+
+    def test_alarm_reports_how_many_repeats_it_held_back(self):
+        alarm = door_mod.Alarm(interval=0.2)
+        with redirect_stderr(StringIO()) as err:
+            self.assertTrue(alarm.sound("x", {}))
+            self.assertFalse(alarm.sound("x", {}))
+            self.assertTrue(alarm.sound("y", {}))
+            time.sleep(0.25)
+            self.assertTrue(alarm.sound("x", {}))
+        lines = [json.loads(line) for line in err.getvalue().strip().splitlines()]
+        self.assertEqual([(l["warning"], l.get("suppressed")) for l in lines], [("x", None), ("y", None), ("x", 1)])
+
+    def test_client_reset_mid_relay_is_still_logged_and_blocked(self):
+        self.assertEqual(self.call("/.env", "5.5.5.5")[0], 200)
+        body = json.dumps({"email": "a@b.c", "password": "BAIT-123"}).encode()
+        with mock.patch.object(self.server.RequestHandlerClass, "relay", side_effect=ConnectionResetError):
+            with self.assertRaises((http.client.HTTPException, OSError)):
+                self.call("/rest/user/login", "5.5.5.5", "POST", body, {"Content-Type": "application/json"})
+        record = self.last_push(2)
+        self.assertEqual((record["kind"], record["status"], record["ip"]), ("canary_reuse", 200, "5.5.5.5"))
+        self.assertEqual(len(self.log_lines(2)), 2)
+        self.assertEqual(self.call("/", "5.5.5.5")[0], 403)
+
+    def test_client_gone_before_a_door_reply_is_still_logged(self):
+        self.shield()
+        attack = "/rest/products/search?q=" + urllib.parse.quote("zz')) UNION SELECT 1--")
+        with mock.patch.object(self.server.RequestHandlerClass, "write_body", side_effect=BrokenPipeError):
+            with self.assertRaises((http.client.HTTPException, OSError)):
+                self.call(attack, "6.6.6.6")
+        record = self.last_push(1)
+        self.assertEqual((record["kind"], record["status"]), ("shielded", 403))
 
 ATTACKS = (
     "zz')) UNION SELECT email FROM Users--",

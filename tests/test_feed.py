@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import stat
 import tempfile
 import unittest
+from pathlib import Path
 
 from agent.agent import Brain, Config
-from agent.event_log import Feed
+from agent.event_log import DecisionLog, Feed
 
 
 class FeedNoticeTests(unittest.TestCase):
@@ -40,6 +42,20 @@ class FeedNoticeTests(unittest.TestCase):
             row = q.get_nowait()
             self.assertEqual(row["kind"], "shielded")
             self.assertEqual(row["decision"], "watch")
+
+
+class DecisionLogTests(unittest.TestCase):
+    def test_log_is_private_and_masks_query_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decisions.tsv"
+            log = DecisionLog(path)
+            log.write({"ts": 0, "ip": "203.0.113.7", "method": "GET", "path": "/rest/products/search?q=' OR 1=1--&token=t-secret", "kind": "request", "decision": "watch", "line": "saw /x?password=l-secret"})
+            text = path.read_text()
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertNotIn("t-secret", text)
+            self.assertNotIn("l-secret", text)
+            self.assertIn("q=' OR 1=1--", text)
+            self.assertEqual(log.tail(1)[0]["path"], "/rest/products/search?q=' OR 1=1--&token=[redacted]")
 
 
 if __name__ == "__main__":

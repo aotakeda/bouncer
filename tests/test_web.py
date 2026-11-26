@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -12,6 +14,8 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -19,7 +23,7 @@ from agent import web
 from agent.agent import Brain
 from agent.config import Config
 from agent.views import Views
-from agent.web import SESSIONS_FILE, AgentServer, Sessions, header_ip, make_handler, trust_client_ip_header
+from agent.web import SESSIONS_FILE, AgentServer, Sessions, header_ip, make_handler, peer_trusted, trust_client_ip_header, trusted_proxies
 
 ROOT = Path(__file__).resolve().parent.parent
 PASS = "a test passphrase"
@@ -56,10 +60,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Server:
-    def __init__(self, brain: Brain, env: dict | None = None):
+    def __init__(self, brain: Brain, env: dict | None = None, **limits):
         with mock.patch.dict("os.environ", env or {}):
             self.handler = make_handler(brain)
-        self.server = AgentServer(("127.0.0.1", 0), self.handler, max_threads=8)
+        self.server = AgentServer(("127.0.0.1", 0), self.handler, **{"max_threads": 8, **limits})
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -106,8 +110,8 @@ class WebCase(unittest.TestCase):
         brain.door = StubDoor()
         return brain
 
-    def start(self, brain=None, env=None) -> Server:
-        server = Server(brain or self.brain, env)
+    def start(self, brain=None, env=None, **limits) -> Server:
+        server = Server(brain or self.brain, env, **limits)
         self.servers.append(server)
         return server
 
@@ -164,7 +168,7 @@ class LoginLockoutTests(WebCase):
             self.assertEqual(server.handler.logins.retry_after(OWNER), 0)
 
     def test_strangers_are_still_locked_out(self):
-        server = self.start()
+        server = self.start(env={"BOUNCER_TRUSTED_PROXIES": "127.0.0.1"})
         with mock.patch("agent.web.time.sleep"):
             for _ in range(5):
                 self.assertEqual(server.login("nope")[0], 401)
@@ -193,6 +197,161 @@ class LoginLockoutTests(WebCase):
         sleep.assert_called_once_with(1)
 
 
+class TrustedProxyTests(WebCase):
+    def test_trusted_proxies_parse_from_either_variable(self):
+        self.assertIsNone(trusted_proxies({}))
+        self.assertEqual([str(n) for n in trusted_proxies({"TRUSTED_PROXIES": "10.0.0.0/8"})], ["10.0.0.0/8"])
+        self.assertEqual([str(n) for n in trusted_proxies({"TRUSTED_PROXIES": "10.0.0.0/8", "BOUNCER_TRUSTED_PROXIES": "::1"})], ["::1/128"])
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(trusted_proxies({"BOUNCER_TRUSTED_PROXIES": "junk"}), ())
+        self.assertIn("ignored a trusted proxy", err.getvalue())
+        nets = trusted_proxies({"TRUSTED_PROXIES": "10.0.0.0/8"})
+        self.assertTrue(peer_trusted("::ffff:10.0.0.9", nets))
+        self.assertFalse(peer_trusted("192.0.2.1", nets))
+        self.assertFalse(peer_trusted("192.0.2.1", ()))
+        self.assertTrue(peer_trusted("192.0.2.1", None))
+
+    def test_header_from_an_untrusted_peer_is_ignored_and_logged(self):
+        server = self.start(env={"BOUNCER_TRUSTED_PROXIES": "10.0.0.0/8"})
+        with redirect_stderr(StringIO()) as err:
+            cookie = server.send("/login", "POST", urllib.parse.urlencode({"passphrase": PASS}).encode(), {"Content-Type": "application/x-www-form-urlencoded"})[1]["Set-Cookie"].split(";", 1)[0]
+            self.assertEqual(server.whoami(cookie, "203.0.113.9"), (200, "127.0.0.1"))
+        line = json.loads(err.getvalue().strip().splitlines()[-1])
+        self.assertEqual((line["warning"], line["peer"], line["value"]), ("client ip header from an untrusted peer", "127.0.0.1", "203.0.113.9"))
+
+    def test_header_from_a_trusted_peer_is_used(self):
+        server = self.start(env={"BOUNCER_TRUSTED_PROXIES": "127.0.0.0/8"})
+        cookie = server.cookie()
+        self.assertEqual(server.whoami(cookie, "203.0.113.9"), (200, "203.0.113.9"))
+
+    def test_invalid_header_is_logged(self):
+        server = self.start()
+        cookie = server.cookie()
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(server.whoami(cookie, "evil"), (200, "127.0.0.1"))
+        self.assertIn("invalid client ip header", err.getvalue())
+
+
+class LoginBudgetTests(WebCase):
+    def test_untrusted_peer_cannot_rotate_past_its_lock(self):
+        server = self.start(env={"BOUNCER_TRUSTED_PROXIES": "10.0.0.0/8"})
+        with mock.patch("agent.web.time.sleep"), redirect_stderr(StringIO()):
+            for i in range(5):
+                self.assertEqual(server.login("nope", ip=f"203.0.113.{i}")[0], 401)
+            self.assertEqual(server.login(ip="203.0.113.200")[0], 429)
+
+    def test_forged_address_cannot_lock_out_the_operator(self):
+        server = self.start()
+        with mock.patch("agent.web.time.sleep") as sleep:
+            for _ in range(5):
+                self.assertEqual(server.login("nope", ip=STRANGER)[0], 401)
+            self.assertGreater(server.handler.logins.retry_after(STRANGER), 0)
+            sleep.reset_mock()
+            self.assertEqual(server.login("nope", ip=STRANGER)[0], 401)
+            sleep.assert_called_once_with(web.LOGIN_SLOW_SECONDS)
+            self.assertEqual(server.login(ip=STRANGER)[0], 303)
+
+    def test_rotating_addresses_runs_into_the_global_budget(self):
+        server = self.start()
+        guard = server.handler.logins
+        with mock.patch("agent.web.time.sleep") as sleep:
+            for i in range(web.LOGIN_GLOBAL_FAILURES):
+                self.assertEqual(server.login("nope", ip=f"203.0.113.{i}")[0], 401)
+            self.assertTrue(guard.over_budget())
+            sleep.reset_mock()
+            self.assertEqual(server.login("nope", ip="198.51.100.1")[0], 401)
+            sleep.assert_called_once_with(web.LOGIN_SLOW_SECONDS)
+            self.assertTrue(guard.slow_slots.acquire(blocking=False))
+            try:
+                with mock.patch("agent.web.LOGIN_SLOW_WAIT_SECONDS", 0.1):
+                    status, headers, _ = server.login("nope", ip="198.51.100.2")
+                    self.assertEqual(status, 429)
+                    self.assertEqual(headers["Retry-After"], str(web.LOGIN_SLOW_SECONDS))
+            finally:
+                guard.slow_slots.release()
+            self.assertEqual(server.login(ip="198.51.100.3")[0], 303)
+
+    def test_owner_failures_count_toward_the_budget_and_are_slowed_past_it(self):
+        server = self.start()
+        guard = server.handler.logins
+        with mock.patch("agent.web.time.sleep") as sleep:
+            for _ in range(web.LOGIN_GLOBAL_FAILURES):
+                self.assertEqual(server.login("nope", ip=OWNER)[0], 401)
+            self.assertTrue(guard.over_budget())
+            sleep.reset_mock()
+            self.assertEqual(server.login("nope", ip=OWNER)[0], 401)
+            sleep.assert_called_once_with(web.LOGIN_SLOW_SECONDS)
+            self.assertEqual(server.login(ip=OWNER)[0], 303)
+        self.assertEqual(guard.retry_after(OWNER), 0)
+
+    def test_budget_forgets_old_failures(self):
+        guard = web.LoginGuard(window=0.2, global_failures=2)
+        guard.failed("a")
+        guard.failed("b")
+        self.assertTrue(guard.over_budget())
+        time.sleep(0.25)
+        self.assertFalse(guard.over_budget())
+
+
+class StreamLimitTests(WebCase):
+    def open_stream(self, server, cookie):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server.server_address[1], timeout=5)
+        conn.request("GET", "/stream", headers={"Cookie": cookie})
+        resp = conn.getresponse()
+        self.addCleanup(conn.close)
+        return resp
+
+    def test_extra_streams_are_refused_without_starving_intake(self):
+        server = self.start(max_threads=2, max_streams=2)
+        cookie = server.cookie()
+        held = [self.open_stream(server, cookie) for _ in range(2)]
+        self.assertEqual([r.status for r in held], [200, 200])
+        refused = self.open_stream(server, cookie)
+        self.assertEqual(refused.status, 503)
+        self.assertEqual(refused.getheader("Retry-After"), str(web.STREAM_RETRY_SECONDS))
+        self.assertEqual(refused.read(), web.TOO_MANY_STREAMS)
+        for _ in range(3):
+            self.assertEqual(server.send("/healthz")[0], 200)
+            self.assertEqual(server.send("/events", "POST", b"{}", {"Authorization": "Bearer x"})[0], 404)
+
+    def test_closed_stream_gives_its_slot_back(self):
+        server = self.start(max_streams=1)
+        cookie = server.cookie()
+        with mock.patch.object(server.handler, "serve_stream", lambda self: self.reply(200, b"", "text/event-stream")):
+            for _ in range(3):
+                resp = self.open_stream(server, cookie)
+                self.assertEqual(resp.status, 200)
+                resp.read()
+
+
+class RequestDeadlineTests(WebCase):
+    def test_trickling_client_is_cut_off(self):
+        server = self.start()
+        with mock.patch("agent.web.REQUEST_SECONDS", 0.5):
+            started = time.time()
+            closed = False
+            with socket.create_connection(("127.0.0.1", server.server.server_address[1]), timeout=5) as s:
+                try:
+                    for byte in b"GET /healthz HTTP/1.1\r\nHost: x\r\nX-Slow: " + b"a" * 100:
+                        s.sendall(bytes([byte]))
+                        time.sleep(0.05)
+                except OSError:
+                    closed = True
+                if not closed:
+                    try:
+                        closed = s.recv(10) == b""
+                    except OSError:
+                        closed = True
+            self.assertTrue(closed)
+            self.assertLess(time.time() - started, 3)
+            with socket.create_connection(("127.0.0.1", server.server.server_address[1]), timeout=5) as s:
+                s.sendall(b"POST /events HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+                started = time.time()
+                self.assertEqual(s.recv(10), b"")
+                self.assertLess(time.time() - started, 2)
+        self.assertEqual(server.send("/healthz")[0], 200)
+
+
 class HeaderTests(WebCase):
     def test_every_response_carries_hsts(self):
         server = self.start()
@@ -208,6 +367,9 @@ class SessionTests(WebCase):
     def stored(self) -> dict:
         return json.loads((Path(self.tmp.name) / SESSIONS_FILE).read_text())
 
+    def token(self, cookie: str) -> str:
+        return cookie.split("=", 1)[1]
+
     def test_sessions_survive_a_restart(self):
         first = self.start()
         cookie = first.cookie()
@@ -218,73 +380,97 @@ class SessionTests(WebCase):
         self.assertEqual(second.send("/api/state", headers={"Cookie": cookie})[0], 200)
         self.assertEqual(second.send("/api/state", headers={"Cookie": "bouncer=forged"})[0], 401)
 
-    def test_only_token_hashes_are_stored(self):
-        server = self.start()
-        token = server.cookie().split("=", 1)[1]
-        path = Path(self.tmp.name) / SESSIONS_FILE
-        raw = path.read_text()
-        self.assertNotIn(token, raw)
-        self.assertNotIn(sha(PASS), raw)
-        data = self.stored()
-        self.assertEqual(len(data["sessions"]), 1)
-        until = next(iter(data["sessions"].values()))
-        self.assertAlmostEqual(until, time.time() + web.SESSION_SECONDS, delta=60)
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+    def test_sessions_survive_losing_the_data_dir(self):
+        cookie = self.start().cookie()
+        shutil.rmtree(self.tmp.name)
+        Path(self.tmp.name).mkdir()
+        again = self.start(self.make_brain())
+        self.assertEqual(again.send("/api/state", headers={"Cookie": cookie})[0], 200)
 
-    def test_logout_removes_the_stored_session(self):
+    def test_cookie_keeps_its_flags(self):
+        server = self.start()
+        status, headers, _ = server.send("/login", "POST", urllib.parse.urlencode({"passphrase": PASS}).encode(), {"Content-Type": "application/x-www-form-urlencoded", "Host": "bouncer.example"})
+        self.assertEqual(status, 303)
+        cookie = headers["Set-Cookie"]
+        for flag in ("HttpOnly;", "Secure;", "SameSite=Lax;", "Path=/;", f"Max-Age={web.SESSION_SECONDS}"):
+            self.assertIn(flag, cookie)
+
+    def test_token_carries_no_secret_and_nothing_is_stored_on_login(self):
+        server = self.start()
+        token = self.token(server.cookie())
+        self.assertNotIn(sha(PASS), token)
+        self.assertNotIn(PASS, token)
+        self.assertFalse((Path(self.tmp.name) / SESSIONS_FILE).exists())
+
+    def test_logout_ends_only_that_session_even_after_a_restart(self):
         server = self.start()
         cookie = server.cookie()
         other = server.cookie()
-        self.assertEqual(len(self.stored()["sessions"]), 2)
         server.send("/logout", "POST", b"{}", {"Cookie": cookie, "Content-Type": "application/json"})
-        self.assertEqual(len(self.stored()["sessions"]), 1)
+        self.assertEqual(server.send("/api/state", headers={"Cookie": cookie})[0], 401)
+        self.assertEqual(server.send("/api/state", headers={"Cookie": other})[0], 200)
+        path = Path(self.tmp.name) / SESSIONS_FILE
+        raw = path.read_text()
+        self.assertNotIn(self.token(cookie), raw)
+        self.assertNotIn(sha(PASS), raw)
+        until = next(iter(self.stored()["revoked"].values()))
+        self.assertAlmostEqual(until, time.time() + web.SESSION_SECONDS, delta=60)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         restarted = self.start(self.make_brain())
         self.assertEqual(restarted.send("/api/state", headers={"Cookie": cookie})[0], 401)
         self.assertEqual(restarted.send("/api/state", headers={"Cookie": other})[0], 200)
 
-    def test_expired_and_tampered_sessions_are_dropped_on_load(self):
-        path = Path(self.tmp.name) / SESSIONS_FILE
-        store = Sessions(path=path, key=sha(PASS))
-        live = store.new()
-        dead = store.new()
-        data = self.stored()
-        data["sessions"][store.digest(dead)] = time.time() - 1
-        data["sessions"]["x" * 64] = time.time() + 10 * web.SESSION_SECONDS
-        data["sessions"]["short"] = time.time() + 60
-        path.write_text(json.dumps(data))
-        again = Sessions(path=path, key=sha(PASS))
-        self.assertTrue(again.valid(live))
-        self.assertFalse(again.valid(dead))
-        self.assertEqual(list(self.stored()["sessions"]), [store.digest(live)])
-
-    def test_session_expires_while_running(self):
+    def test_logout_without_a_valid_session_stores_nothing(self):
         server = self.start()
         cookie = server.cookie()
-        store = server.handler.session_store
-        digest = store.digest(cookie.split("=", 1)[1])
-        store.tokens[digest] = time.time() - 1
-        self.assertEqual(server.send("/api/state", headers={"Cookie": cookie})[0], 401)
-        self.assertNotIn(digest, self.stored()["sessions"])
+        for junk in ("", "bouncer=forged", "bouncer=v1.1.x.y"):
+            server.send("/logout", "POST", b"{}", {"Cookie": junk, "Content-Type": "application/json"})
+        self.assertEqual(server.send("/api/state", headers={"Cookie": cookie})[0], 200)
+        self.assertFalse((Path(self.tmp.name) / SESSIONS_FILE).exists())
 
-    def test_changing_the_passphrase_ends_stored_sessions(self):
+    def test_expired_future_and_tampered_tokens_are_refused(self):
+        store = Sessions(key=sha(PASS))
+        now = time.time()
+        self.assertTrue(store.valid(store.new()))
+        self.assertFalse(store.valid(store.new(now=now - web.SESSION_SECONDS - 1)))
+        self.assertTrue(store.valid(store.new(now=now - web.SESSION_SECONDS + 60)))
+        self.assertFalse(store.valid(store.new(now=now + web.SESSION_SKEW_SECONDS + 60)))
+        good = store.new()
+        version, issued, nonce, mac = good.split(".")
+        flipped = mac[:-1] + ("1" if mac[-1] == "0" else "0")
+        for bad in (f"{version}.{int(issued) + 1}.{nonce}.{mac}", f"{version}.{issued}.{nonce}x.{mac}", f"{version}.{issued}.{nonce}.{flipped}", f"v2.{issued}.{nonce}.{mac}", good + ".x", "", "a" * 300):
+            self.assertFalse(store.valid(bad), bad)
+        self.assertFalse(Sessions(key=sha("other")).valid(good))
+        self.assertFalse(Sessions(key="").valid(good))
+
+    def test_changing_the_passphrase_ends_sessions(self):
         cookie = self.start().cookie()
         changed = self.start(self.make_brain("a different passphrase"))
         self.assertEqual(changed.send("/api/state", headers={"Cookie": cookie})[0], 401)
         self.assertEqual(changed.login()[0], 401)
 
-    def test_unreadable_file_starts_empty(self):
+    def test_revocations_from_junk_or_another_passphrase_are_ignored(self):
         path = Path(self.tmp.name) / SESSIONS_FILE
-        for junk in ("not json", "[]", '{"key": "x", "sessions": {}}', '{"sessions": []}'):
+        other = Sessions(path=path, key=sha("other"))
+        other.drop(other.new())
+        self.assertEqual(Sessions(path=path, key=sha(PASS)).revoked, {})
+        store = Sessions(path=path, key=sha(PASS))
+        live = store.new()
+        far = time.time() + 10 * web.SESSION_SECONDS
+        for junk in ("not json", "[]", '{"key": "x", "revoked": {}}', '{"revoked": []}', json.dumps({"key": store.fingerprint(), "revoked": {"short": far, "y" * 64: far, "z" * 64: True}})):
             path.write_text(junk)
-            self.assertEqual(Sessions(path=path, key=sha(PASS)).tokens, {}, junk)
+            again = Sessions(path=path, key=sha(PASS))
+            self.assertEqual(again.revoked, {}, junk)
+            self.assertTrue(again.valid(live))
 
-    def test_session_limit_still_applies(self):
+    def test_revocation_list_is_capped(self):
         store = Sessions(limit=3, path=Path(self.tmp.name) / SESSIONS_FILE, key=sha(PASS))
         tokens = [store.new() for _ in range(5)]
-        self.assertEqual(len(store.tokens), 3)
-        self.assertFalse(store.valid(tokens[0]))
-        self.assertTrue(store.valid(tokens[-1]))
-        self.assertEqual(len(self.stored()["sessions"]), 3)
+        for token in tokens:
+            store.drop(token)
+        self.assertEqual(len(store.revoked), 3)
+        self.assertEqual(len(self.stored()["revoked"]), 3)
+        self.assertFalse(store.valid(tokens[-1]))
 
 
 class SignalStepTests(unittest.TestCase):

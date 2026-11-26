@@ -71,6 +71,7 @@ CANARY_SKIP_HEADERS = {"referer", "origin"}
 BAIT_SECONDS = 86400
 CLIENT_IP_HEADER = "Sprite-Client-Ip"
 OFF_VALUES = {"0", "false", "no", "off"}
+WARN_INTERVAL = 10.0
 BUSY_RESPONSE = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 6\r\nRetry-After: 1\r\nConnection: close\r\n\r\nBusy.\n"
 
 QUIET_PATHS = {"/", "/socket.io/", "/rest/admin/application-version", "/rest/admin/application-configuration", "/rest/languages"}
@@ -80,7 +81,7 @@ MAX_STORED_BODY = 65536
 MAX_LIST_ENTRIES = 20000
 MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_BATCH_BODY = 1048576
-PUSH_RETRY_DELAYS = (1.0, 3.0)
+PUSH_RETRY_DELAYS = (1.0, 3.0, 10.0, 30.0)
 
 STRANGER = "owner-as-stranger"
 ADMIN_PREFIX = "/_bouncer/"
@@ -153,6 +154,53 @@ def valid_ip(value: str) -> str:
     except ValueError:
         return ""
     return value
+
+
+def proxy_networks(raw: str) -> tuple | None:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+    nets = []
+    for part in parts:
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            print(json.dumps({"door": "warning", "warning": "ignored a trusted proxy that is not an IP network", "value": part[:100]}), file=sys.stderr, flush=True)
+    return tuple(nets)
+
+
+def peer_trusted(peer: str, nets: tuple | None) -> bool:
+    if nets is None:
+        return True
+    try:
+        addr = ipaddress.ip_address(peer.split("%", 1)[0])
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in nets)
+
+
+class Alarm:
+    def __init__(self, interval: float = WARN_INTERVAL):
+        self.interval = interval
+        self.last: dict = {}
+        self.muted: dict = {}
+        self.lock = threading.Lock()
+
+    def sound(self, reason: str, fields: dict) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            if now - self.last.get(reason, -self.interval) < self.interval:
+                self.muted[reason] = self.muted.get(reason, 0) + 1
+                return False
+            self.last[reason] = now
+            muted = self.muted.pop(reason, 0)
+        line = {"door": "warning", "warning": reason, **fields}
+        if muted:
+            line["suppressed"] = muted
+        print(json.dumps(line), file=sys.stderr, flush=True)
+        return True
 
 
 def client_key(ip: str) -> str:
@@ -449,6 +497,7 @@ class Config:
         self.max_conns_per_ip = int(env.get("DOOR_MAX_CONNS_PER_IP", "32"))
         self.listen_backlog = int(env.get("DOOR_LISTEN_BACKLOG", "128"))
         self.trust_client_ip_header = env.get("DOOR_TRUST_CLIENT_IP_HEADER", "1").strip().lower() not in OFF_VALUES
+        self.trusted_proxies = proxy_networks(env.get("DOOR_TRUSTED_PROXIES", env.get("TRUSTED_PROXIES", "")))
         self.honeypot_repeat_seconds = float(env.get("DOOR_HONEYPOT_REPEAT_SECONDS", "600"))
 
     @property
@@ -663,6 +712,7 @@ class Door:
         self.honeypot_pushed: dict = {}
         self.canaries = self._load_canaries()
         self.pusher = Pusher(cfg.events_url, cfg.flush_seconds, self.write_log, cfg.events_token)
+        self.alarm = Alarm()
 
     def _load_canaries(self) -> dict:
         if not self.cfg.canaries_file.exists():
@@ -880,10 +930,25 @@ def make_handler(door: Door):
             self.conn_key = key
             return True
 
+        def header_trusted(self) -> bool:
+            return cfg.trust_client_ip_header and peer_trusted(self.client_address[0], cfg.trusted_proxies)
+
         def claimed_ip(self) -> str:
-            if not cfg.trust_client_ip_header:
+            if not self.header_trusted():
                 return ""
             return valid_ip(self.headers.get(CLIENT_IP_HEADER) or "")
+
+        def check_claim(self) -> None:
+            raw = self.headers.get(CLIENT_IP_HEADER)
+            if raw is None or not cfg.trust_client_ip_header:
+                return
+            if not self.header_trusted():
+                reason = "client ip header from an untrusted peer"
+            elif not valid_ip(raw):
+                reason = "invalid client ip header"
+            else:
+                return
+            door.alarm.sound(reason, {"peer": self.client_address[0], "value": raw[:100], "path": bare_path(self.path)[:200]})
 
         def client_ip(self) -> str:
             ip = client_key(self.claimed_ip() or self.client_address[0])
@@ -928,8 +993,11 @@ def make_handler(door: Door):
             self.send_header("Content-Length", str(len(body)))
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
-            self.end_headers()
-            self.write_body(body)
+            try:
+                self.end_headers()
+                self.write_body(body)
+            except OSError:
+                self.close_connection = True
             return len(body)
 
         def send_json(self, obj) -> int:
@@ -1006,6 +1074,8 @@ def make_handler(door: Door):
                 return 502, self.send(502, b"Bad Gateway")
             try:
                 self.relay(resp, data)
+            except OSError:
+                self.close_connection = True
             finally:
                 conn.close()
             return resp.status, len(data)
@@ -1032,9 +1102,9 @@ def make_handler(door: Door):
             if slow == Slow.REFUSE:
                 wait = str(max(1, int(cfg.tarpit_seconds)))
                 return Outcome(EventKind.TARPITTED, 429, self.send(429, b"Slow down.\n", extra={"Retry-After": wait}))
-            status, size = self.proxy(body)
             if reuse and trusted_fetch(self.headers) and door.took_bait(ip):
                 door.block_bait_reuse(ip)
+            status, size = self.proxy(body)
             if slow == Slow.SLOWED and kind == EventKind.REQUEST:
                 kind = EventKind.TARPITTED
             return Outcome(kind, status, size)
@@ -1095,6 +1165,7 @@ def make_handler(door: Door):
 
         def handle_any(self):
             started = time.time()
+            self.check_claim()
             ip = self.client_ip()
             if not self.hold_connection(ip):
                 self.reading_done()

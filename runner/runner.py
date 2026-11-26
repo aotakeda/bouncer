@@ -47,6 +47,7 @@ NAME_CHARS = 40
 FINGERPRINT_CHARS = 16
 MIN_ECHO = 4
 JSON_LITERALS = ("true", "false", "null")
+MARKUP = re.compile(r"<\s*[a-z!/]|[\s\"'/<]on[a-z]+\s*=|javascript\s*:", re.IGNORECASE)
 VOLATILE_KEYS = {"id", "bid", "uid", "token", "time", "date", "timestamp", "uuid", "nonce", "csrf", "session", "expires", "exp", "iat", "etag"}
 CAMEL_VOLATILE = re.compile(r"[a-z0-9](?:Id|ID|At|Token|Time|Date|Stamp)$")
 SNAKE_VOLATILE = re.compile(r"_(?:id|at|token|time|date)$", re.IGNORECASE)
@@ -71,14 +72,30 @@ net.Server.prototype.listen = function (...args) {
   if ((typeof args[0] === 'number' || /^\\d+$/.test(String(args[0]))) && typeof args[1] !== 'string') args.splice(1, 0, '127.0.0.1')
   return listen.apply(this, args)
 }
+const ownPort = String(process.env.PORT || '')
+const loopback = ['127.0.0.1', 'localhost', '[::1]', '::1']
+const ownAddress = (host, port) => loopback.includes(String(host || 'localhost')) && ownPort !== '' && String(port) === ownPort
+const connect = net.Socket.prototype.connect
+net.Socket.prototype.connect = function (...args) {
+  const first = Array.isArray(args[0]) ? args[0][0] : args[0]
+  const options = first !== null && typeof first === 'object' ? first : { port: first, host: typeof args[1] === 'string' ? args[1] : undefined }
+  if ((options.path === undefined || options.path === null) && !ownAddress(options.host, options.port)) {
+    process.nextTick(() => this.destroy(new Error('replay copies stay offline')))
+    return this
+  }
+  return connect.apply(this, args)
+}
 const localFetch = globalThis.fetch
 if (localFetch) {
   globalThis.fetch = function (input, init) {
     let host = ''
+    let port = ''
     try {
-      host = new URL(typeof input === 'string' || input instanceof URL ? input : input.url).hostname
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+      host = url.hostname
+      port = url.port || (url.protocol === 'https:' ? '443' : '80')
     } catch {}
-    if (!['127.0.0.1', 'localhost', '[::1]'].includes(host)) return Promise.reject(new TypeError('replay copies stay offline'))
+    if (!ownAddress(host, port)) return Promise.reject(new TypeError('replay copies stay offline'))
     return localFetch.call(this, input, init)
   }
 }
@@ -262,6 +279,16 @@ def request_values(req: dict) -> list:
             values.extend(v for _, v in parse_qsl(body, keep_blank_values=True))
     usable = {v for v in values if len(v) >= MIN_ECHO and v.lower() not in JSON_LITERALS}
     return sorted(usable, key=len, reverse=True)
+
+
+def response_type(headers: dict) -> str:
+    return " ".join(str(v) for k, v in (headers or {}).items() if str(k).lower() == "content-type").lower()
+
+
+def reflected_markup(body: str, headers: dict, req: dict) -> bool:
+    if "html" not in response_type(headers):
+        return False
+    return any(MARKUP.search(v) and v in body for v in request_values(req))
 
 
 def normalize_body(text: str, canaries: list, echoes: list) -> str:
@@ -663,6 +690,7 @@ class Runner:
         r = box.target.call(req.get("method", "GET"), req.get("path", "/"), clean_headers(req.get("headers")), data)
         r["canary_hits"] = find_canaries(r["body"] + json.dumps(r["headers"]), box.canary["strings"])
         r["count"] = result_count(r["body"])
+        r["reflected"] = reflected_markup(r["body"], r["headers"], req)
         r["fingerprint"] = fingerprint(r["body"], box.canary_values(), request_values(req))
         r["body"] = r["body"][:PREVIEW]
         return r
@@ -885,6 +913,10 @@ class Runner:
             }
 
 
+SERVER_MAX_THREADS = 32
+SERVER_IDLE_SECONDS = 30
+
+
 def make_handler(runner: Runner):
     cfg = runner.cfg
 
@@ -892,6 +924,7 @@ def make_handler(runner: Runner):
         protocol_version = "HTTP/1.1"
         server_version = "bouncer-runner"
         sys_version = ""
+        timeout = SERVER_IDLE_SECONDS
 
         def log_message(self, fmt, *args):
             pass
@@ -972,6 +1005,44 @@ def make_handler(runner: Runner):
     return Handler
 
 
+class RunnerServer(ThreadingHTTPServer):
+    daemon_threads = True
+    busy_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 17\r\nRetry-After: 1\r\nConnection: close\r\n\r\n{\"error\":\"busy\"}\n"
+
+    def __init__(self, address, handler, max_threads: int = SERVER_MAX_THREADS):
+        self.slots = threading.BoundedSemaphore(max_threads)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(self.busy_response)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], OSError):
+            super().handle_error(request, client_address)
+
+
+def server_threads(env=os.environ) -> int:
+    return max(1, int(env.get("RUNNER_MAX_THREADS", str(SERVER_MAX_THREADS))))
+
+
 def stop_on_signal(signum, frame):
     raise SystemExit(0)
 
@@ -979,8 +1050,7 @@ def stop_on_signal(signum, frame):
 def main():
     cfg = Config()
     runner = Runner(cfg)
-    server = ThreadingHTTPServer((cfg.bind, cfg.port), make_handler(runner))
-    server.daemon_threads = True
+    server = RunnerServer((cfg.bind, cfg.port), make_handler(runner), server_threads())
     signal.signal(signal.SIGTERM, stop_on_signal)
     try:
         runner.start()

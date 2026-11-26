@@ -14,7 +14,7 @@ from typing import Callable, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from . import net
-from .claude import Claude
+from .claude import FRAMING_TAG, Claude
 from .github import GitHub
 from .labels import FixStatus, Verdict
 from .net import ERROR_DETAIL_CHARS, bare_path, clip
@@ -43,7 +43,6 @@ IMPORT_LIKE = re.compile(
     r"""|\bimport\s*\(|\brequire\s*\(|\brequire\.resolve\b"""
 )
 SECRET_HEADERS = ("authorization", "cookie")
-REQUEST_TAG = re.compile(r"<(\s*/?\s*[\w-]*request)", re.IGNORECASE)
 
 
 def apply_edits(source: str, edits: list) -> tuple:
@@ -179,7 +178,7 @@ def dependency_problem(path: str, before: str, after: str) -> str:
 
 
 def neutralize(text: str) -> str:
-    return REQUEST_TAG.sub(lambda m: "&lt;" + m.group(1), str(text))
+    return FRAMING_TAG.sub(lambda m: "&lt;" + m.group(1), str(text))
 
 
 def untrusted_block(tag: str, text: str) -> str:

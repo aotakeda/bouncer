@@ -4,8 +4,10 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -247,6 +249,42 @@ class LegacyMode(unittest.TestCase):
         cfg = runner_mod.Config({"RUNNER_APP_DIR": "/srv/juice"})
         self.assertEqual(cfg.pool_dir, Path("/srv/juice-pool"))
 
+
+class ServerLimits(unittest.TestCase):
+    def start(self, max_threads: int, idle: float):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        runner = runner_mod.Runner(runner_mod.Config({"RUNNER_APP_DIR": tmp.name}), app=object())
+        handler = runner_mod.make_handler(runner)
+        handler.timeout = idle
+        server = runner_mod.RunnerServer(("127.0.0.1", 0), handler, max_threads)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_defaults(self):
+        self.assertEqual(runner_mod.make_handler(runner_mod.Runner(runner_mod.Config({"RUNNER_APP_DIR": "/nonexistent-bouncer"}), app=object())).timeout, runner_mod.SERVER_IDLE_SECONDS)
+        self.assertEqual(runner_mod.server_threads({}), runner_mod.SERVER_MAX_THREADS)
+        self.assertEqual(runner_mod.server_threads({"RUNNER_MAX_THREADS": "3"}), 3)
+        self.assertEqual(runner_mod.server_threads({"RUNNER_MAX_THREADS": "0"}), 1)
+
+    def test_thread_cap_refuses_extra_connections_and_idle_ones_are_dropped(self):
+        port = self.start(max_threads=1, idle=0.5)
+        slow = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(slow.close)
+        slow.sendall(b"GET /health HTTP/1.1\r\n")
+        time.sleep(0.1)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 503"))
+        started = time.time()
+        self.assertEqual(slow.recv(10), b"")
+        self.assertLess(time.time() - started, 3)
+        time.sleep(0.1)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            self.assertTrue(s.recv(100).startswith(b"HTTP/1.1 404"))
 
 if __name__ == "__main__":
     unittest.main()

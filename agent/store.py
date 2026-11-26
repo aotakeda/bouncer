@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import Counter
 from pathlib import Path
 
 from .labels import FixStatus
+from .redact import redact_incident, redact_text
 
 KEPT_INCIDENTS = 20
 KEPT_SHAME = 200
@@ -138,7 +140,9 @@ class Store:
         with self.save_lock:
             try:
                 tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(data, default=str))
+                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                    f.write(json.dumps(data, default=str))
+                tmp.chmod(0o600)
                 tmp.replace(path)
             except Exception:
                 self.count("save_failed")
@@ -147,7 +151,8 @@ class Store:
         with self.lock:
             visits = sorted(self.honeypot_visits.items(), key=lambda kv: kv[1])[-KEPT_VISITS:]
             traffic = {str(k): list(v) for k, v in self.traffic.items()}
-            return {"stats": dict(self.stats), "shame": dict(self.shame.most_common(KEPT_SHAME)), "honeypot_visits": dict(visits), "traffic": traffic}
+            shame = {redact_text(k): v for k, v in self.shame.most_common(KEPT_SHAME)}
+            return {"stats": dict(self.stats), "shame": shame, "honeypot_visits": dict(visits), "traffic": traffic}
 
     def save_counters(self):
         self.counters_saved = time.time()
@@ -155,12 +160,12 @@ class Store:
 
     def save_incidents(self):
         with self.lock:
-            data = [dict(i, fix=dict(i["fix"]) if isinstance(i.get("fix"), dict) else i.get("fix")) for i in self.incidents[-KEPT_INCIDENTS:]]
+            data = [redact_incident(i) for i in self.incidents[-KEPT_INCIDENTS:]]
         self._write_json(self.incidents_path, data)
 
     def _save_catches(self):
         with self.lock:
-            data = [dict(c) for c in self.catches[-KEPT_CATCHES:]]
+            data = [dict(c, path=redact_text(c["path"])) for c in self.catches[-KEPT_CATCHES:]]
         self._write_json(self.catches_path, data)
 
     def _save_signal_states(self):

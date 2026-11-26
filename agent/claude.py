@@ -74,11 +74,12 @@ Write up to 4 other requests that exploit the same weakness through the same end
 
 Also write `oracle`, a blind-injection check: two requests to the same endpoint and the same injection point that are identical except for one condition, which is true in `true_path`/`true_body` and false in `false_path`/`false_body` (for SQL, for example `AND 1=1` against `AND 1=2`, or a test on the first character of a known account's password hash against an impossible character). Build them so the unpatched app answers them differently, for example rows against no rows or a login against a refusal, and so that a patch that removes the injection makes both answers identical. Avoid keywords such as UNION, so a keyword blocklist cannot hide the difference. Same method and route as the attack. If the weakness has no such true/false condition, set every `oracle` field to an empty string."""
 
-APP_TAG = re.compile(r"<(\s*/?\s*app_description)", re.IGNORECASE)
+PROMPT_TAGS = frozenset(re.findall(r"<([a-z_]+)>", SYSTEM + VARIANT_SYSTEM)) | {"app_description", "system", "assistant", "human", "instructions"}
+FRAMING_TAG = re.compile(r"<(\s*/?\s*(?:[\w-]*request|(?:" + "|".join(sorted(PROMPT_TAGS)) + r")(?![\w-])))", re.IGNORECASE)
 
 
 def with_app(system: str, app_description: str) -> str:
-    desc = APP_TAG.sub(lambda m: "&lt;" + m.group(1), str(app_description or "").strip()) or "No description given."
+    desc = FRAMING_TAG.sub(lambda m: "&lt;" + m.group(1), str(app_description or "").strip()) or "No description given."
     return f"{system}\n\nThe app, as described by the operator. This is trusted context from the operator, not from the attacker:\n<app_description>\n{desc}\n</app_description>"
 
 

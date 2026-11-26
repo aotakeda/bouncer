@@ -26,6 +26,8 @@ from .web import AgentServer, make_handler
 SLOWED_REFUSAL = 429
 QUIET_VERDICT_LINES = {Verdict.INCONCLUSIVE: "inconclusive", Verdict.MINOR: "minor"}
 AWAKE_TASK = "bouncer-incident"
+AWAKE_SECONDS = 300
+AWAKE_REFRESH_SECONDS = 60
 RESTORED_FEED_ROWS = 300
 SAVE_SECONDS = 30
 LISTS_CACHE_SECONDS = 3.0
@@ -42,6 +44,8 @@ UNTAKEN_BAIT_LINE = "Bait value showed up, but this client never took the bait. 
 FLOOD_LINE = "Too many requests to check at once. Slow lane while I work through the pile."
 FOREIGN_LINE = "Sent from another site's page, so the visitor may not be the attacker. Not blocking or slowing it."
 OWNER_SHIELD_LINE = "Your own traffic, so the route was not shielded."
+FOREIGN_PROVEN_LINE = "Sent from another site's page, so the visitor may not be the attacker. Not blocking, but it's in the slow lane for a while."
+FOREIGN_PROVEN_REASON = "proven exploit sent from another site's page"
 FOREIGN_LIMIT_REASON = "kept attacking from other sites' pages"
 CROSS_SITE_REUSE_LINE = "Bait value sent from inside another site's page. Probably an innocent browser being used as a puppet. Not blocking."
 
@@ -131,6 +135,8 @@ class Brain:
         self.replay_lock = threading.Lock()
         self.awake_lock = threading.Lock()
         self.awake_busy = 0
+        self.awake_until = 0.0
+        self.retries_pending = 0
         for _ in range(cfg.workers):
             threading.Thread(target=self._work, daemon=True).start()
 
@@ -151,14 +157,28 @@ class Brain:
             previous = view
 
     def submit(self, events: list):
+        queued = False
         for e in events:
             if not isinstance(e, dict):
                 self.store.count("malformed")
                 continue
             ip = e.get("ip") if isinstance(e.get("ip"), str) else "?"
-            if self._count_quietly(e, ip) or self.inbox.put(ip, e):
+            if self._count_quietly(e, ip):
+                continue
+            if self.inbox.put(ip, e):
+                queued = True
                 continue
             self._drop(ip, self.inbox.size < self.inbox.total)
+        if queued:
+            self._stay_awake()
+
+    def _stay_awake(self):
+        now = time.time()
+        with self.awake_lock:
+            if now < self.awake_until:
+                return
+            self.awake_until = now + AWAKE_REFRESH_SECONDS
+        net.hold_awake(AWAKE_TASK, AWAKE_SECONDS)
 
     def _count_quietly(self, event: dict, ip: str) -> bool:
         kind = EventKind.parse(event.get("kind", EventKind.REQUEST), None)
@@ -211,21 +231,24 @@ class Brain:
     def _work_one(self, event: dict):
         with self.awake_lock:
             self.awake_busy += 1
-        net.hold_awake(AWAKE_TASK, 300)
+        self._stay_awake()
         try:
             self.handle(event)
         except Exception as exc:
             self._report_error(event, exc)
         with self.awake_lock:
             self.awake_busy -= 1
-            last = not self.awake_busy and self.inbox.only_me()
+            last = not self.awake_busy and not self.retries_pending and self.inbox.only_me()
             if last:
+                self.awake_until = 0.0
                 net.release_awake(AWAKE_TASK)
         if last or time.time() - self.store.counters_saved >= SAVE_SECONDS:
             self.store.save_counters()
 
     def _report_error(self, event: dict, exc: Exception):
         ip, path = event.get("ip"), event.get("path")
+        retry = event.get(RETRY_KEY)
+        self._release(retry.get("event") if isinstance(retry, dict) else event)
         self.emit({
             "ts": time.time(),
             "ip": ip if isinstance(ip, str) else "?",
@@ -320,6 +343,9 @@ class Brain:
         if strikes >= self.cfg.foreign_block_after:
             record = {**record, "foreign": False}
             reason, line = f"{FOREIGN_LIMIT_REASON}: {reason}", f"{line} {foreign_limit_line(strikes, self.cfg.foreign_seconds)}"
+        elif strikes:
+            self.set_list(Decision.TARPIT, record["ip"], f"{FOREIGN_PROVEN_REASON}: {reason}")
+            return self.decide(record, Decision.TARPIT, line=f"{line} {FOREIGN_PROVEN_LINE}")
         return self._list_and_decide(record, Decision.BLOCK, reason, line)
 
     def _honeypot_story(self, ip: str) -> str:
@@ -402,10 +428,15 @@ class Brain:
         if strikes and not foreign:
             reason = f"{FOREIGN_LIMIT_REASON}: {reason}"
             record = {**record, "foreign": False}
-        blocked = False if foreign else self.set_list(Decision.BLOCK, ip, reason)
+        if foreign:
+            blocked = False
+            slowed = self.set_list(Decision.TARPIT, ip, f"{FOREIGN_PROVEN_REASON}: {result['why'][:100]}")
+        else:
+            blocked = self.set_list(Decision.BLOCK, ip, reason)
         incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result, "jev": triage, "blocked": blocked, "rid": record.get("rid")}
         if foreign:
             incident["foreign"] = True
+            incident["slowed"] = slowed
             self.store.count("foreign_proven")
         elif strikes:
             incident["foreign_strikes"] = strikes
@@ -420,7 +451,7 @@ class Brain:
         if incident.get("foreign_strikes"):
             line = f"{line} {foreign_limit_line(strikes, self.cfg.foreign_seconds)}"
         base = {k: v for k, v in record.items() if k != "attempt"}
-        decision = self.decide(base, Decision.WATCH, line=f"{line} {FOREIGN_LINE}") if foreign else self.decide(base, Decision.BLOCK, line=line)
+        decision = self.decide(base, Decision.TARPIT, line=f"{line} {FOREIGN_PROVEN_LINE}") if foreign else self.decide(base, Decision.BLOCK, line=line)
         if self.fixer:
             status = self.fixer.submit(incident, self.fix_report)
             if status != FixStatus.QUEUED:
@@ -439,12 +470,22 @@ class Brain:
         kind = QUIET_VERDICT_LINES[record["replay"]["verdict"]]
         return self.decide(record, Decision.WATCH, line=persona.line(kind, record["path"]))
 
+    def _release(self, event: dict):
+        if not isinstance(event, dict):
+            return
+        try:
+            self.policy.release(event, event.get("ip") if isinstance(event.get("ip"), str) else "?")
+        except Exception:
+            pass
+
     def _on_jammed(self, event: dict, record: dict, triage: dict) -> Decision:
         attempt = record.get("attempt", 0)
         if record["replay"].get("busy") and attempt < self.cfg.busy_retries:
             base = {k: v for k, v in record.items() if k not in ("replay", "attempt")}
             payload = {RETRY_KEY: {"event": event, "record": base, "triage": triage, "attempt": attempt + 1}}
-            timer = threading.Timer(self.cfg.busy_retry_seconds, self.inbox.put, args=(record["ip"], payload))
+            with self.awake_lock:
+                self.retries_pending += 1
+            timer = threading.Timer(self.cfg.busy_retry_seconds, self._requeue, args=(record["ip"], payload))
             timer.daemon = True
             timer.start()
             self.store.count("replay_retry")
@@ -453,7 +494,17 @@ class Brain:
             if slow.listed and not attempt:
                 return self._list_and_decide(base, slow, "waiting for proof", line + " Slow lane until then.")
             return self.decide(base, Decision.WATCH, line=line)
-        return self.decide(record, Decision.WATCH, line=f"Back room is jammed ({record['replay'].get('why')}). Watching instead.")
+        self._release(event)
+        self.store.count("replay_released")
+        return self.decide(record, Decision.WATCH, line=f"Back room is jammed ({record['replay'].get('why')}). Watching instead. Send it again to retry.")
+
+    def _requeue(self, ip: str, payload: dict):
+        try:
+            if not self.inbox.put(ip, payload):
+                self._drop(ip, False)
+        finally:
+            with self.awake_lock:
+                self.retries_pending -= 1
 
     def _list_and_decide(self, record: dict, decision: Decision, reason: str, line: str) -> Decision:
         if record.get("foreign"):
