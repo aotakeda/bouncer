@@ -32,6 +32,15 @@ class FeedNoticeTests(unittest.TestCase):
             self.assertTrue(q.empty())
             self.assertNotIn("state", [r.get("kind") for r in brain.state()["recent"]])
 
+    def test_shielded_rows_keep_their_kind_for_the_dashboard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp}))
+            q = brain.feed.subscribe()
+            brain.emit({"ts": 1.0, "ip": "203.0.113.9", "method": "GET", "path": "/rest/products/search?q=x", "kind": "shielded", "decision": "watch", "line": "refused"})
+            row = q.get_nowait()
+            self.assertEqual(row["kind"], "shielded")
+            self.assertEqual(row["decision"], "watch")
+
 
 if __name__ == "__main__":
     unittest.main()

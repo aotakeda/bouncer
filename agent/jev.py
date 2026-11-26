@@ -5,9 +5,9 @@ import re
 from . import net
 
 ACTIONS = {
-    "ignore": "normal traffic, or a probe for software this app does not run",
+    "ignore": "normal traffic, or a single scanner probe for software this app does not run",
     "watch": "unusual but probably harmless; keep an eye on this client",
-    "tarpit": "a scanner or bot fishing around; slow it down to waste its time",
+    "tarpit": "a client that keeps probing many different paths or keeps sending hostile requests; slow it down to waste its time",
     "replay": "a real attempt against a route this app has; check in a sandbox whether it works",
     "block": "clearly hostile and persistent; refuse this client for a while",
 }

@@ -81,6 +81,7 @@ class Store:
         self.catches_path = data_dir / "catches.json"
         self.signal_states_path = data_dir / "triage.json"
         self.counters_path = data_dir / "counters.json"
+        self.proven_path = data_dir / "proven.json"
         self._restore_incidents()
         self._restore_catches()
         self._restore_signal_states()
@@ -122,6 +123,16 @@ class Store:
         self.shame.update(shame)
         self.honeypot_visits.update(visits)
         self.traffic.update(traffic)
+
+    def load_proven(self) -> list:
+        try:
+            loaded = json.loads(self.proven_path.read_text())
+        except Exception:
+            return []
+        return loaded if isinstance(loaded, list) else []
+
+    def save_proven(self, rows: list) -> None:
+        self._write_json(self.proven_path, rows)
 
     def _write_json(self, path: Path, data) -> None:
         with self.save_lock:

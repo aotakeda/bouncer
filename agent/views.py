@@ -12,7 +12,9 @@ from .net import route_path
 from .store import KEPT_INCIDENTS, SIGNAL_STATES, Store
 
 TSV_TIME = "%Y-%m-%dT%H:%M:%SZ"
+JEV_NAME = "Jev System One"
 FOREIGN_NOTE = "Sent from another site's page, so the visitor may not be the attacker"
+FOREIGN_STRIKES_NOTE = "after {n} attacks sent from other sites' pages"
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 ATTACK_PATTERNS = (
     ("SQL injection", re.compile(r"union\s+(all\s+)?select|'\s*(or|and)\s+[\w'\"]+\s*=|'\)+|'\s*--|;\s*drop\s|sleep\(\d", re.I)),
@@ -60,6 +62,13 @@ def severity(kind, decision, verdict, malicious) -> str:
     if isinstance(malicious, (int, float)) and malicious >= 0.5:
         return "low"
     return "info"
+
+
+def foreign_strikes_note(incident: dict) -> str:
+    strikes = incident.get("foreign_strikes")
+    if isinstance(strikes, bool) or not isinstance(strikes, int) or strikes <= 0:
+        return ""
+    return FOREIGN_STRIKES_NOTE.format(n=strikes)
 
 
 def fix_view(fix: dict | None) -> dict | None:
@@ -185,9 +194,9 @@ class Views:
                 rows.append({"route": route, "left": left, "reason": str(entry.get("reason", ""))[:120]})
         return sorted(rows, key=lambda r: r["route"])
 
-    def blocked_step(self, blocked: bool, ts, unblocked_note: str = "") -> dict:
+    def blocked_step(self, blocked: bool, ts, unblocked_note: str = "", blocked_note: str = "") -> dict:
         if blocked:
-            return {"label": f"Client blocked for {self.cfg.block_seconds // 60} min", "state": "done", "ts": ts, "note": ""}
+            return {"label": f"Client blocked for {self.cfg.block_seconds // 60} min", "state": "done", "ts": ts, "note": blocked_note}
         return {"label": "Client not blocked", "state": "todo", "ts": ts, "note": unblocked_note}
 
     def proven_signals(self, fixes_on: bool, shields: dict | None = None) -> list:
@@ -206,9 +215,9 @@ class Views:
         jev = latest.get("jev") or {}
         fix = latest.get("fix")
         steps = [
-            {"label": "Flagged by classifier", "state": "done" if jev.get("ok") else "todo", "ts": event.get("ts"), "note": f"{round(jev['malicious'] * 100)}% attack" if isinstance(jev.get("malicious"), (int, float)) else ""},
+            {"label": f"Flagged by {JEV_NAME}", "state": "done" if jev.get("ok") else "todo", "ts": event.get("ts"), "note": f"{round(jev['malicious'] * 100)}% attack" if isinstance(jev.get("malicious"), (int, float)) else ""},
             {"label": "Proven on the stunt double", "state": "bad", "ts": latest["ts"], "note": replay.get("why") or ""},
-            self.blocked_step(latest.get("blocked", True), latest["ts"], FOREIGN_NOTE if latest.get("foreign") else "Owner or door unavailable"),
+            self.blocked_step(latest.get("blocked", True), latest["ts"], FOREIGN_NOTE if latest.get("foreign") else "Owner or door unavailable", foreign_strikes_note(latest)),
             *([{"label": "Route shielded until the fix is merged", "state": "done", "ts": latest["ts"], "note": "attack-shaped requests get 403"}] if shield else []),
             *([{"label": "Route not shielded", "state": "todo", "ts": latest["ts"], "note": "Your own traffic, so it would have been shielded for anyone else"}] if latest.get("would_shield") and not shield else []),
             *fix_steps(fix, fixes_on),

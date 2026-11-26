@@ -23,8 +23,10 @@ def bare_path(path: str) -> str:
 def route_path(path: str) -> str:
     if not path.startswith("/"):
         path = urllib.parse.urlsplit(path).path or "/"
-    bare = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
-    return re.sub(r"/{2,}", "/", bare).lower().rstrip("/") or "/"
+    bare = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0]).lower()
+    segments = [segment.split(";", 1)[0] for segment in bare.split("/")]
+    bare = "/".join(segment.rstrip(".") or segment for segment in segments)
+    return re.sub(r"/{2,}", "/", bare).rstrip("/") or "/"
 
 
 def ip_key(ip: str) -> str:

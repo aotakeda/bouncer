@@ -5,11 +5,13 @@ import codecs
 import hashlib
 import hmac
 import http.client
+import io
 import ipaddress
 import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -53,15 +55,23 @@ GZIP_WBITS = 31
 DEFLATE_WBITS = (15, -15)
 MAX_DECODED_BODY = 1 << 20
 MAX_TRAILERS = 64
-DECODE_ROUNDS = 3
+DECODE_ROUNDS = 8
 SECRET_HEADERS = {"authorization", "cookie", "x-user-email"}
 CLIENT_FORWARD_HEADERS = {"x-forwarded-for", "x-real-ip", "forwarded"}
 SECRET_KEY = r"[^\"=&]*(?:password|passwd|pass|secret|token|totp|answer)[^\"=&]*"
 SECRET_JSON_FIELD = re.compile(r'("' + SECRET_KEY + r'"\s*:\s*)("(?:[^"\\]|\\.)*"?|[^,}\]\s]+)', re.IGNORECASE)
 SECRET_FORM_FIELD = re.compile(r"((?:^|&)" + SECRET_KEY + r"=)([^&]*)", re.IGNORECASE)
-TRUSTED_FETCH_SITES = {"", "none", "same-origin"}
+SECRET_PARAM = re.compile(r"pass|pwd|secret|token|totp|answer|jwt|auth|session|api_?key|credential|signature|(?:^|[_.\[-])(?:key|code|sig|sid)\]?$", re.IGNORECASE)
+FOREIGN_FETCH_SITES = {"cross-site", "same-site"}
+FETCH_FIELDS = (("fetch_site", "Sec-Fetch-Site"), ("fetch_mode", "Sec-Fetch-Mode"), ("fetch_dest", "Sec-Fetch-Dest"))
+FETCH_FIELD_MAX = 40
+BROWSER_UA = re.compile(r"^mozilla/", re.IGNORECASE)
+SCANNER_UA = re.compile(r"sqlmap|nikto|nuclei|zgrab|masscan|nmap|dirbuster|gobuster|ffuf|wpscan|acunetix|python-requests|go-http-client|curl/|wget/|libwww", re.IGNORECASE)
 CANARY_SKIP_HEADERS = {"referer", "origin"}
 BAIT_SECONDS = 86400
+CLIENT_IP_HEADER = "Sprite-Client-Ip"
+OFF_VALUES = {"0", "false", "no", "off"}
+BUSY_RESPONSE = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 6\r\nRetry-After: 1\r\nConnection: close\r\n\r\nBusy.\n"
 
 QUIET_PATHS = {"/", "/socket.io/", "/rest/admin/application-version", "/rest/admin/application-configuration", "/rest/languages"}
 SOCKET_IO_PATH = "/socket.io/"
@@ -103,6 +113,7 @@ class Outcome(NamedTuple):
     kind: EventKind
     status: int
     size: int
+    repeat: bool = False
 
 
 class AdminRequest(NamedTuple):
@@ -133,6 +144,17 @@ def bare_path(path: str) -> str:
     return path.split("?", 1)[0]
 
 
+def valid_ip(value: str) -> str:
+    value = value.strip()
+    if "%" in value:
+        return ""
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return ""
+    return value
+
+
 def client_key(ip: str) -> str:
     try:
         addr = ipaddress.ip_address(ip)
@@ -156,8 +178,10 @@ def route_key(method: str, path: str) -> str:
 def route_path(path: str) -> str:
     if not path.startswith("/"):
         path = urlsplit(path).path or "/"
-    bare = unquote(path.split("?", 1)[0].split("#", 1)[0])
-    return re.sub(r"/{2,}", "/", bare).lower().rstrip("/") or "/"
+    bare = unquote(path.split("?", 1)[0].split("#", 1)[0]).lower()
+    segments = [segment.split(";", 1)[0] for segment in bare.split("/")]
+    bare = "/".join(segment.rstrip(".") or segment for segment in segments)
+    return re.sub(r"/{2,}", "/", bare).rstrip("/") or "/"
 
 
 def shield_path(key: str) -> str:
@@ -274,8 +298,21 @@ def inspect_request(path: str, headers, body: bytes) -> Seen:
     return Seen(text, decoded_from, False, looks_like_attack(path, text) or jwt_tampered(headers))
 
 
+def fetch_value(headers, name: str) -> str:
+    return (headers.get(name) or "")[:FETCH_FIELD_MAX].strip().lower()
+
+
+def browser_fetch(headers) -> bool:
+    if fetch_value(headers, "Sec-Fetch-Site") not in FOREIGN_FETCH_SITES:
+        return False
+    if not fetch_value(headers, "Sec-Fetch-Mode") or not fetch_value(headers, "Sec-Fetch-Dest"):
+        return False
+    ua = headers.get("User-Agent") or ""
+    return bool(BROWSER_UA.search(ua)) and not SCANNER_UA.search(ua)
+
+
 def trusted_fetch(headers) -> bool:
-    return (headers.get("Sec-Fetch-Site") or "").strip().lower() in TRUSTED_FETCH_SITES
+    return not browser_fetch(headers)
 
 
 def has_traversal(path: str) -> bool:
@@ -337,8 +374,23 @@ def redact_body(body: str) -> str:
     return SECRET_FORM_FIELD.sub(lambda m: f"{m.group(1)}[redacted {len(m.group(2))}]", body)
 
 
+def redact_query(path: str) -> str:
+    bare, sep, query = path.partition("?")
+    if not sep:
+        return path
+    pairs = []
+    for pair in query.split("&"):
+        name, eq, value = pair.partition("=")
+        if eq and value and SECRET_PARAM.search(unquote_plus(name)):
+            pair = f"{name}=[redacted {len(value)}]"
+        pairs.append(pair)
+    return bare + sep + "&".join(pairs)
+
+
 def disk_record(record: dict) -> dict:
     out = dict(record)
+    if isinstance(out.get("path"), str):
+        out["path"] = redact_query(out["path"])
     if isinstance(out.get("body"), str):
         out["body"] = redact_body(out["body"])
     headers = out.get("headers")
@@ -347,8 +399,31 @@ def disk_record(record: dict) -> dict:
     return out
 
 
+class DeadlineIO(io.RawIOBase):
+    def __init__(self, inner, sock, window: Callable[[], float | None]):
+        super().__init__()
+        self.inner = inner
+        self.sock = sock
+        self.window = window
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b):
+        timeout = self.window()
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        return self.inner.readinto(b)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.inner.close()
+        super().close()
+
+
 class Config:
     def __init__(self, env=os.environ):
+        self.host = env.get("DOOR_HOST", "0.0.0.0")
         self.port = int(env.get("DOOR_PORT", "8080"))
         up = urlsplit(env.get("DOOR_UPSTREAM", "http://127.0.0.1:3000"))
         self.upstream_host = up.hostname or "127.0.0.1"
@@ -370,6 +445,11 @@ class Config:
         self.list_max = int(env.get("DOOR_LIST_MAX", str(MAX_LIST_ENTRIES)))
         self.idle_seconds = float(env.get("DOOR_IDLE_SECONDS", "15"))
         self.max_threads = int(env.get("DOOR_MAX_THREADS", "256"))
+        self.request_seconds = float(env.get("DOOR_REQUEST_SECONDS", "30"))
+        self.max_conns_per_ip = int(env.get("DOOR_MAX_CONNS_PER_IP", "32"))
+        self.listen_backlog = int(env.get("DOOR_LISTEN_BACKLOG", "128"))
+        self.trust_client_ip_header = env.get("DOOR_TRUST_CLIENT_IP_HEADER", "1").strip().lower() not in OFF_VALUES
+        self.honeypot_repeat_seconds = float(env.get("DOOR_HONEYPOT_REPEAT_SECONDS", "600"))
 
     @property
     def upstream(self) -> str:
@@ -577,6 +657,10 @@ class Door:
         self.tarpit_lock = threading.Lock()
         self.tarpit_busy: dict = {}
         self.tarpit_total = 0
+        self.conn_lock = threading.Lock()
+        self.conns: dict = {}
+        self.honeypot_lock = threading.Lock()
+        self.honeypot_pushed: dict = {}
         self.canaries = self._load_canaries()
         self.pusher = Pusher(cfg.events_url, cfg.flush_seconds, self.write_log, cfg.events_token)
 
@@ -588,6 +672,15 @@ class Door:
     @property
     def honeypot(self) -> dict:
         return self.canaries.get("honeypot", {})
+
+    @property
+    def has_canaries(self) -> bool:
+        return any(isinstance(v, str) and v for v in self.honeypot.values())
+
+    def warnings(self) -> list:
+        if self.has_canaries:
+            return []
+        return [f"no honeypot canaries in {self.cfg.canaries_file}: /.env is proxied like any request and bait reuse is not detected"]
 
     def honeypot_env(self) -> str:
         c = self.honeypot
@@ -610,6 +703,40 @@ class Door:
     def mark_bait(self, ip: str) -> None:
         self.lists.add("bait", ip, BAIT_SECONDS, "took the honeypot .env", self.cfg.allowlist)
         self.lists.add("tarpit", ip, self.cfg.tarpit_list_seconds, "took the honeypot .env", self.cfg.allowlist)
+
+    def honeypot_repeat(self, ip: str, trusted: bool) -> bool:
+        fresh = trusted and ip not in self.cfg.allowlist and not (self.took_bait(ip) and self.is_listed("tarpit", ip))
+        key = (ip, trusted)
+        now = time.time()
+        with self.honeypot_lock:
+            last = self.honeypot_pushed.get(key)
+            if not fresh and last is not None and now - last < self.cfg.honeypot_repeat_seconds:
+                return True
+            if key not in self.honeypot_pushed and len(self.honeypot_pushed) >= self.cfg.list_max:
+                cutoff = now - self.cfg.honeypot_repeat_seconds
+                self.honeypot_pushed = {k: v for k, v in self.honeypot_pushed.items() if v > cutoff}
+                if len(self.honeypot_pushed) >= self.cfg.list_max:
+                    self.honeypot_pushed = dict(sorted(self.honeypot_pushed.items(), key=lambda kv: kv[1])[-(self.cfg.list_max // 2):])
+            self.honeypot_pushed[key] = now
+            return False
+
+    def claim_conn(self, key: str) -> bool:
+        with self.conn_lock:
+            held = self.conns.get(key, 0)
+            if held >= self.cfg.max_conns_per_ip:
+                return False
+            self.conns[key] = held + 1
+            return True
+
+    def release_conn(self, key: str | None) -> None:
+        if key is None:
+            return
+        with self.conn_lock:
+            left = self.conns.get(key, 1) - 1
+            if left > 0:
+                self.conns[key] = left
+            else:
+                self.conns.pop(key, None)
 
     def block_bait_reuse(self, ip: str) -> None:
         self.lists.add("block", ip, self.cfg.block_seconds, "reused honeypot credentials", self.cfg.allowlist)
@@ -700,13 +827,77 @@ def make_handler(door: Door):
         def version_string(self) -> str:
             return self.server_version
 
+        def setup(self):
+            super().setup()
+            self.deadline = None
+            self.conn_key = None
+            self.rfile = io.BufferedReader(DeadlineIO(self.rfile.detach(), self.connection, self.read_window))
+            self.crowded = not cfg.trust_client_ip_header and not self.hold_connection(client_key(self.client_address[0]))
+
+        def handle(self):
+            if self.crowded:
+                self.close_connection = True
+                try:
+                    self.wfile.write(BUSY_RESPONSE)
+                except OSError:
+                    pass
+                return
+            super().handle()
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                door.release_conn(self.conn_key)
+
+        def handle_one_request(self):
+            self.deadline = time.monotonic() + cfg.request_seconds
+            try:
+                super().handle_one_request()
+            finally:
+                if cfg.trust_client_ip_header:
+                    door.release_conn(self.conn_key)
+                    self.conn_key = None
+
+        def read_window(self) -> float | None:
+            if self.deadline is None:
+                return None
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("request took too long to arrive")
+            return min(cfg.idle_seconds, left)
+
+        def reading_done(self) -> None:
+            self.deadline = None
+            self.connection.settimeout(cfg.idle_seconds)
+
+        def hold_connection(self, key: str) -> bool:
+            if key == self.conn_key:
+                return True
+            if not door.claim_conn(key):
+                return False
+            door.release_conn(self.conn_key)
+            self.conn_key = key
+            return True
+
+        def claimed_ip(self) -> str:
+            if not cfg.trust_client_ip_header:
+                return ""
+            return valid_ip(self.headers.get(CLIENT_IP_HEADER) or "")
+
         def client_ip(self) -> str:
-            ip = client_key(self.headers.get("Sprite-Client-Ip") or self.client_address[0])
+            ip = client_key(self.claimed_ip() or self.client_address[0])
             if ip in cfg.allowlist and self.headers.get("X-Bouncer-Stranger"):
                 return STRANGER
             return ip
 
         def read_body(self) -> bytes:
+            try:
+                return self.read_framed_body()
+            finally:
+                self.reading_done()
+
+        def read_framed_body(self) -> bytes:
             te = self.headers.get_all("Transfer-Encoding") or []
             if te:
                 codings = [c.strip().lower() for v in te for c in v.split(",") if c.strip()]
@@ -722,7 +913,10 @@ def make_handler(door: Door):
             length = int(raw)
             if length > MAX_REQUEST_BODY:
                 raise PayloadTooLarge("body too large")
-            return self.rfile.read(length) if length > 0 else b""
+            body = self.rfile.read(length) if length > 0 else b""
+            if len(body) < length:
+                raise BadRequest("truncated body")
+            return body
 
         def write_body(self, body: bytes) -> None:
             if self.command != "HEAD" and body:
@@ -810,8 +1004,10 @@ def make_handler(door: Door):
             except (OSError, http.client.HTTPException, ValueError):
                 conn.close()
                 return 502, self.send(502, b"Bad Gateway")
-            self.relay(resp, data)
-            conn.close()
+            try:
+                self.relay(resp, data)
+            finally:
+                conn.close()
             return resp.status, len(data)
 
         def relay(self, resp: http.client.HTTPResponse, data: bytes) -> None:
@@ -850,10 +1046,12 @@ def make_handler(door: Door):
         def respond(self, ip: str, body: bytes, seen: Seen) -> Outcome:
             if self.headers.get("Upgrade", "").lower() == "websocket":
                 return Outcome(EventKind.REQUEST, 400, self.send(400, b"websocket not supported, use polling"))
-            if bare_path(self.path) == "/.env":
-                if trusted_fetch(self.headers):
+            if bare_path(self.path) == "/.env" and door.has_canaries:
+                trusted = trusted_fetch(self.headers)
+                repeat = door.honeypot_repeat(ip, trusted)
+                if trusted:
                     door.mark_bait(ip)
-                return Outcome(EventKind.HONEYPOT, 200, self.send(200, door.honeypot_env().encode()))
+                return Outcome(EventKind.HONEYPOT, 200, self.send(200, door.honeypot_env().encode()), repeat)
             if door.shielded(ip, self.path, seen):
                 shield = b"This route is shielded until its security fix is merged.\n"
                 return Outcome(EventKind.SHIELDED, 403, self.send(403, shield))
@@ -884,9 +1082,10 @@ def make_handler(door: Door):
             ctype = self.headers.get("Content-Type")
             if ctype:
                 record["ctype"] = utf8_ctype(ctype) if seen.decoded_from and "charset" in seen.decoded_from else ctype
-            fetch_site = self.headers.get("Sec-Fetch-Site")
-            if fetch_site:
-                record["fetch_site"] = fetch_site[:40]
+            for field, name in FETCH_FIELDS:
+                value = self.headers.get(name)
+                if value:
+                    record[field] = value[:FETCH_FIELD_MAX]
             if outcome.kind in (EventKind.CANARY_REUSE, EventKind.HONEYPOT):
                 record["took_bait"] = door.took_bait(ip)
             kept = {k: v for k, v in self.headers.items() if k.lower() in REPLAY_HEADERS}
@@ -897,8 +1096,14 @@ def make_handler(door: Door):
         def handle_any(self):
             started = time.time()
             ip = self.client_ip()
+            if not self.hold_connection(ip):
+                self.reading_done()
+                self.close_connection = True
+                self.send(503, b"Busy.\n", extra={"Retry-After": "1", "Connection": "close"})
+                return
             block = None if self.path.startswith(ADMIN_PREFIX) else door.listed_entry("block", ip)
             if block:
+                self.reading_done()
                 self.close_connection = True
                 record = self.build_record(started, ip, b"", self.refuse_blocked(block))
                 door.write_log(record)
@@ -924,7 +1129,7 @@ def make_handler(door: Door):
             outcome = self.respond(ip, body, seen)
             record = self.build_record(started, ip, body, outcome, seen)
             door.write_log(record)
-            if door.should_push(outcome.kind, self.command, self.path):
+            if not outcome.repeat and door.should_push(outcome.kind, self.command, self.path):
                 door.pusher.push(record)
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = handle_any
@@ -934,10 +1139,11 @@ def make_handler(door: Door):
 
 class DoorServer(ThreadingHTTPServer):
     daemon_threads = True
-    busy_response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 6\r\nRetry-After: 1\r\nConnection: close\r\n\r\nBusy.\n"
+    busy_response = BUSY_RESPONSE
 
-    def __init__(self, address, handler, max_threads: int):
+    def __init__(self, address, handler, max_threads: int, backlog: int = 128):
         self.slots = threading.BoundedSemaphore(max_threads)
+        self.request_queue_size = backlog
         super().__init__(address, handler)
 
     def process_request(self, request, client_address):
@@ -970,14 +1176,16 @@ class DoorServer(ThreadingHTTPServer):
 
 
 def make_server(door: Door, address: tuple) -> DoorServer:
-    return DoorServer(address, make_handler(door), door.cfg.max_threads)
+    return DoorServer(address, make_handler(door), door.cfg.max_threads, door.cfg.listen_backlog)
 
 
 def main(argv=None):
     cfg = Config()
     door = Door(cfg)
-    server = make_server(door, ("0.0.0.0", cfg.port))
-    print(json.dumps({"door": "listening", "port": cfg.port, "upstream": cfg.upstream}), flush=True)
+    for warning in door.warnings():
+        print(json.dumps({"door": "warning", "warning": warning}), file=sys.stderr, flush=True)
+    server = make_server(door, (cfg.host, cfg.port))
+    print(json.dumps({"door": "listening", "host": cfg.host, "port": cfg.port, "upstream": cfg.upstream}), flush=True)
     server.serve_forever()
 
 

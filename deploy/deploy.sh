@@ -6,7 +6,9 @@ SECRETS="$ROOT/.secrets"
 APP=bh-app
 REPLAY=bh-replay
 AGENT=bh-bouncer
-FORK=https://github.com/aotakeda/juice-shop.git
+FORK="${FORK:-https://github.com/aotakeda/juice-shop.git}"
+GITHUB_REPO="${GITHUB_REPO:-$(printf %s "$FORK" | sed -E 's#^(https://github.com/|git@github.com:)##; s#\.git$##')}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
 REMOTE=/home/sprite/bouncer
 STEP="${1:-all}"
 FIX_MODE="${FIX_MODE:-dry_run}"
@@ -30,7 +32,7 @@ if [ ! -f "$SECRETS" ]; then
 fi
 set -a; . "$SECRETS"; set +a
 
-url_of() { sprite info -s "$1" 2>/dev/null | awk '/^URL:/{print $2}'; }
+url_of() { { sprite info -s "$1" 2>/dev/null || true; } | awk '/^URL:/{print $2}'; }
 
 policy() {
   local s="$1" rules="$2"
@@ -116,9 +118,9 @@ install_juice() {
 }
 
 refresh_juice() {
-  local s="$1"
+  local s="$1" owner="$2"
   policy "$s" '[{"include":"defaults"}]'
-  sx "$s" sh -c "cd ~/juice-shop && git pull --ff-only >/dev/null 2>&1 && ./node_modules/.bin/tsc >/tmp/tsc.log 2>&1 && sprite-env services restart juice >/dev/null 2>&1 && echo '$s juice refreshed'"
+  sx "$s" sh -c "cd ~/juice-shop && git pull --ff-only >/dev/null 2>&1 && ./node_modules/.bin/tsc >/tmp/tsc.log 2>&1 && sprite-env services restart $owner >/dev/null 2>&1 && echo '$s juice refreshed'"
 }
 
 service() {
@@ -135,6 +137,21 @@ door_admin() {
   curl -s -X "$1" -H "Authorization: Bearer $DOOR_SECRET" "$APP_URL/_bouncer/$2"
 }
 
+step_create() {
+  local name label existing
+  existing="$(sprite list 2>/dev/null || true)"
+  for pair in "$APP:role:app" "$REPLAY:role:replay" "$AGENT:role:bouncer"; do
+    name="${pair%%:*}"; label="${pair#*:}"
+    if printf '%s\n' "$existing" | grep -qx "$name"; then
+      sprite info -s "$name" 2>/dev/null | grep -q "$label" || echo "$name exists but lacks label $label: run sprite config update -s $name --label $label" >&2
+    else
+      sprite create --skip-console --label "$label" "$name" >/dev/null
+      echo "$name created, labelled $label"
+    fi
+  done
+  APP_URL="$(url_of $APP)"; REPLAY_URL="$(url_of $REPLAY)"; AGENT_URL="$(url_of $AGENT)"
+}
+
 step_install() {
   say "installing Juice Shop on $APP and $REPLAY"
   install_juice "$APP" &
@@ -144,8 +161,8 @@ step_install() {
 
 step_refresh() {
   say "refreshing Juice Shop on $APP and $REPLAY"
-  refresh_juice "$APP" &
-  refresh_juice "$REPLAY" &
+  refresh_juice "$APP" juice &
+  refresh_juice "$REPLAY" runner &
   wait
   step_lock
   clear_shields
@@ -190,17 +207,22 @@ deploy_door() {
 
 deploy_runner() {
   say "runner on $REPLAY"
-  service "$REPLAY" juice --cmd node --args build/app --dir /home/sprite/juice-shop --env "PORT=3000,NODE_ENV=production"
+  sx "$REPLAY" sh -c "sprite-env services delete juice >/dev/null 2>&1 || true"
   service "$REPLAY" runner --cmd python3 --args "$REMOTE/runner/runner.py" --dir "$REMOTE" --http-port 8080 \
-    --env "RUNNER_SECRET_SHA256=$(sha "$RUNNER_SECRET")"
+    --env "RUNNER_SECRET_SHA256=$(sha "$RUNNER_SECRET"),RUNNER_POOL_SIZE=${REPLAY_COPIES:-4},RUNNER_APP_DIR=/home/sprite/juice-shop,RUNNER_POOL_DIR=/tmp/juice-shop-pool"
   sprite config update -s "$REPLAY" --url-auth public >/dev/null
 }
 
 deploy_agent() {
   local replay_id="$1" door_id="$2" jev_id="$3" claude_id="$4" github_id="$5"
   say "agent on $AGENT"
+  if [ -n "${APP_DESCRIPTION:-}" ]; then
+    printf '%s\n' "$APP_DESCRIPTION" | sprite exec -s "$AGENT" -- sh -c "mkdir -p $REMOTE/agent-data && cat > $REMOTE/agent-data/app_description.txt"
+  else
+    sx "$AGENT" rm -f "$REMOTE/agent-data/app_description.txt"
+  fi
   service "$AGENT" agent --cmd python3 --args "-m,agent.agent" --dir "$REMOTE" --http-port 8080 \
-    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$jev_id/v1/systemone,RUNNER_URL=$GW/custom_api/$replay_id,DOOR_URL=$GW/custom_api/$door_id,OWNER_IPS=${OWNER_IP:-},BLOCK_SECONDS=${BLOCK_SECONDS:-300},SHIELD_SECONDS=${SHIELD_SECONDS:-86400},FIX_MODE=$FIX_MODE,ANTHROPIC_URL=$GW/anthropic/$claude_id,GITHUB_URL=$GW/github/$github_id"
+    --env "AGENT_DATA_DIR=$REMOTE/agent-data,AGENT_EVENTS_SHA256=$(sha "$EVENTS_SECRET"),AGENT_DASH_SHA256=$(sha "$DASH_PASSPHRASE"),JEV_URL=$GW/typesafe/$jev_id/v1/systemone,RUNNER_URL=$GW/custom_api/$replay_id,DOOR_URL=$GW/custom_api/$door_id,OWNER_IPS=${OWNER_IP:-},BLOCK_SECONDS=${BLOCK_SECONDS:-300},SHIELD_SECONDS=${SHIELD_SECONDS:-86400},FIX_MODE=$FIX_MODE,GITHUB_REPO=$GITHUB_REPO,GITHUB_BRANCH=$GITHUB_BRANCH,APP_DESCRIPTION_FILE=$REMOTE/agent-data/app_description.txt,ANTHROPIC_URL=$GW/anthropic/$claude_id,GITHUB_URL=$GW/github/$github_id"
   sprite config update -s "$AGENT" --url-auth public >/dev/null
 }
 
@@ -256,10 +278,10 @@ summary() {
 }
 
 case "$STEP" in
-  all) step_install; step_links; step_services; step_lock; summary ;;
-  install|refresh|links|services|lock) "step_$STEP"; summary ;;
+  all) step_create; step_install; step_links; step_services; step_lock; summary ;;
+  create|install|refresh|links|services|lock) "step_$STEP"; summary ;;
   blocks) step_blocks ;;
   unblock) step_unblock "${2:-}" ;;
   unshield) clear_shields ;;
-  *) echo "usage: deploy.sh [all|install|refresh|links|services|lock|blocks|unblock <ip>|unshield]" >&2; exit 1 ;;
+  *) echo "usage: deploy.sh [all|create|install|refresh|links|services|lock|blocks|unblock <ip>|unshield]" >&2; exit 1 ;;
 esac

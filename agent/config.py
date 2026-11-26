@@ -11,8 +11,18 @@ DEFAULT_APP_DESCRIPTION = "OWASP Juice Shop, an Angular + Express + SQLite onlin
 FIX_MODES = ("dry_run", "pr")
 
 
+def read_text(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 class Config:
     def __init__(self, env: Mapping[str, str] = os.environ):
+        self.host = env.get("BOUNCER_HOST", "0.0.0.0")
         self.port = int(env.get("AGENT_PORT", "8080"))
         self.data_dir = Path(env.get("AGENT_DATA_DIR", "./agent-data"))
         self.events_sha256 = env.get("AGENT_EVENTS_SHA256", "")
@@ -31,6 +41,10 @@ class Config:
         self.busy_retries = int(env.get("BUSY_RETRIES", "12"))
         self.pending_per_ip = int(env.get("PENDING_PER_IP", "5"))
         self.pending_total = int(env.get("PENDING_TOTAL", "500"))
+        self.workers = max(1, int(env.get("AGENT_WORKERS", "2")))
+        self.probe_paths = int(env.get("PROBE_TARPIT_PATHS", "5"))
+        self.foreign_block_after = max(1, int(env.get("FOREIGN_BLOCK_AFTER", "3")))
+        self.foreign_seconds = float(env.get("FOREIGN_WINDOW_SECONDS", "600"))
         self.replay_threshold = float(env.get("REPLAY_THRESHOLD", "0.9"))
         self.min_list_confidence = float(env.get("MIN_LIST_CONFIDENCE", "0.5"))
         self.min_list_malicious = float(env.get("MIN_LIST_MALICIOUS", "0.8"))
@@ -42,7 +56,7 @@ class Config:
         self.github_branch = env.get("GITHUB_BRANCH", "master")
         self.fix_model = env.get("FIX_MODEL", "claude-opus-5-5")
         self.fix_per_hour = int(env.get("FIX_PER_HOUR", "3"))
-        self.app_description = env.get("APP_DESCRIPTION", DEFAULT_APP_DESCRIPTION)
+        self.app_description = env.get("APP_DESCRIPTION") or read_text(env.get("APP_DESCRIPTION_FILE", "")) or DEFAULT_APP_DESCRIPTION
 
     @property
     def fixes_enabled(self) -> bool:
@@ -57,6 +71,9 @@ class Config:
             failed_attack_malicious=self.failed_attack_malicious,
             dedupe_seconds=self.dedupe_seconds,
             proven_seconds=max(self.shield_seconds, self.block_seconds),
+            probe_paths=self.probe_paths,
+            foreign_block_after=self.foreign_block_after,
+            foreign_seconds=self.foreign_seconds,
         )
 
     def is_owner(self, ip: str | None) -> bool:

@@ -4,8 +4,10 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import queue
 import secrets
+import sys
 import threading
 import time
 from collections import deque
@@ -24,6 +26,7 @@ TEXT = "text/plain"
 HTML = "text/html; charset=utf-8"
 JSON = "application/json"
 COOKIE_NAME = "bouncer"
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 MAX_BODY = 4 * 1024 * 1024
 DASHBOARD = Path(__file__).with_name("dashboard.html").read_text()
 LOGIN_TEMPLATE = Template(Path(__file__).with_name("login.html").read_text())
@@ -38,14 +41,21 @@ LOGIN_FAILURES = 5
 LOGIN_WINDOW = 600
 LOGIN_LOCK_SECONDS = 600
 LOGIN_SLOTS = 2
+OWNER_LOGIN_SLOTS = 1
 LOGIN_WAIT_SECONDS = 5
 MAX_TRACKED_LOGIN_IPS = 10000
 IDLE_SECONDS = 30
 MAX_THREADS = 64
 PAGE_CSP = "default-src 'self'; script-src 'nonce-{n}'; style-src 'self' 'nonce-{n}' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'"
 DATA_CSP = "default-src 'none'; frame-ancestors 'none'"
-SECURITY_HEADERS = {"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+HSTS = "max-age=31536000"
+SECURITY_HEADERS = {"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Strict-Transport-Security": HSTS}
 TOO_MANY_LOGINS = b"Too many wrong passphrases. Try again later."
+CLIENT_IP_HEADER = "Sprite-Client-Ip"
+TRUST_CLIENT_IP_ENV = "BOUNCER_TRUST_CLIENT_IP_HEADER"
+OFF_VALUES = ("0", "false", "no", "off")
+SESSIONS_FILE = "dash-sessions.json"
+SESSIONS_LABEL = "bouncer-dashboard-sessions"
 
 
 class Rejected(Exception):
@@ -72,6 +82,19 @@ def with_nonce(html: str, nonce: str) -> str:
     return html.replace("<style>", f'<style nonce="{nonce}">').replace("<script>", f'<script nonce="{nonce}">')
 
 
+def trust_client_ip_header(env=os.environ) -> bool:
+    return env.get(TRUST_CLIENT_IP_ENV, "1").strip().lower() not in OFF_VALUES
+
+
+def header_ip(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
 def unblock_key(value: str) -> str | None:
     try:
         if "/" in value:
@@ -83,11 +106,20 @@ def unblock_key(value: str) -> str | None:
 
 
 class Sessions:
-    def __init__(self, seconds: int = SESSION_SECONDS, limit: int = MAX_SESSIONS):
+    def __init__(self, seconds: int = SESSION_SECONDS, limit: int = MAX_SESSIONS, path: Path | None = None, key: str = ""):
         self.seconds = seconds
         self.limit = limit
+        self.path = path
+        self.key = key.encode()
         self.tokens: dict = {}
         self.lock = threading.Lock()
+        self._restore()
+
+    def digest(self, token: str) -> str:
+        return hmac.new(self.key, token.encode(), hashlib.sha256).hexdigest()
+
+    def fingerprint(self) -> str:
+        return self.digest(SESSIONS_LABEL)
 
     def new(self) -> str:
         token = secrets.token_urlsafe(32)
@@ -96,34 +128,76 @@ class Sessions:
             self.tokens = {t: until for t, until in self.tokens.items() if until > now}
             while len(self.tokens) >= self.limit:
                 self.tokens.pop(min(self.tokens, key=self.tokens.get))
-            self.tokens[token] = now + self.seconds
+            self.tokens[self.digest(token)] = now + self.seconds
+            self._save()
         return token
 
     def valid(self, token: str) -> bool:
         if not token:
             return False
+        digest = self.digest(token)
         now = time.time()
         with self.lock:
-            found = next((until for t, until in self.tokens.items() if hmac.compare_digest(t, token)), None)
-        return found is not None and found > now
+            until = self.tokens.get(digest)
+            if until is not None and until <= now:
+                del self.tokens[digest]
+                self._save()
+        return until is not None and until > now
 
     def drop(self, token: str) -> None:
+        if not token:
+            return
         with self.lock:
-            for t in [t for t in self.tokens if hmac.compare_digest(t, token)]:
-                del self.tokens[t]
+            if self.tokens.pop(self.digest(token), None) is not None:
+                self._save()
+
+    def _restore(self) -> None:
+        if not self.path:
+            return
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return
+        stored = data.get("sessions") if isinstance(data, dict) else None
+        if not isinstance(stored, dict) or not hmac.compare_digest(str(data.get("key", "")), self.fingerprint()):
+            return
+        now = time.time()
+        kept = {d: float(u) for d, u in stored.items() if isinstance(d, str) and len(d) == 64 and isinstance(u, (int, float)) and now < u <= now + self.seconds}
+        self.tokens = dict(sorted(kept.items(), key=lambda item: item[1])[-self.limit:])
+        if len(self.tokens) != len(stored):
+            self._save()
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"key": self.fingerprint(), "sessions": self.tokens}, f)
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(json.dumps({"agent": "sessions not saved", "error": str(exc)[:200]}), file=sys.stderr, flush=True)
 
 
 class LoginGuard:
-    def __init__(self, failures: int = LOGIN_FAILURES, window: float = LOGIN_WINDOW, lock_seconds: float = LOGIN_LOCK_SECONDS, slots: int = LOGIN_SLOTS):
+    def __init__(self, failures: int = LOGIN_FAILURES, window: float = LOGIN_WINDOW, lock_seconds: float = LOGIN_LOCK_SECONDS, slots: int = LOGIN_SLOTS, exempt=None):
         self.failures = failures
         self.window = window
         self.lock_seconds = lock_seconds
         self.slots = threading.BoundedSemaphore(slots)
+        self.owner_slots = threading.BoundedSemaphore(OWNER_LOGIN_SLOTS)
+        self.exempt = exempt or (lambda ip: False)
         self.recent: dict = {}
         self.locked: dict = {}
         self.lock = threading.Lock()
 
+    def slots_for(self, ip: str) -> threading.BoundedSemaphore:
+        return self.owner_slots if self.exempt(ip) else self.slots
+
     def retry_after(self, ip: str) -> int:
+        if self.exempt(ip):
+            return 0
         now = time.time()
         with self.lock:
             until = self.locked.get(ip, 0)
@@ -133,6 +207,8 @@ class LoginGuard:
             return int(until - now) + 1
 
     def failed(self, ip: str) -> None:
+        if self.exempt(ip):
+            return
         now = time.time()
         with self.lock:
             if len(self.recent) >= MAX_TRACKED_LOGIN_IPS and ip not in self.recent:
@@ -189,8 +265,9 @@ class AgentServer(ThreadingHTTPServer):
 def make_handler(brain: Brain):
     cfg = brain.cfg
     not_found = (404, b"not found", TEXT)
-    sessions = Sessions()
-    guard = LoginGuard()
+    sessions = Sessions(path=cfg.data_dir / SESSIONS_FILE, key=cfg.dash_sha256)
+    guard = LoginGuard(exempt=cfg.is_owner)
+    trust_header = trust_client_ip_header()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -238,8 +315,15 @@ def make_handler(brain: Brain):
         def dash_ok(self) -> bool:
             return bool(cfg.dash_sha256) and sessions.valid(self.session_token())
 
+        def secure_flag(self) -> str:
+            host = (self.headers.get("Host") or "").strip().lower()
+            name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]", 1)[0] + "]"
+            local = name in LOOPBACK_HOSTS and ipaddress.ip_address(self.client_address[0].split("%", 1)[0]).is_loopback
+            return "" if local else " Secure;"
+
         def client_ip(self) -> str:
-            return ip_key(self.headers.get("Sprite-Client-Ip") or self.client_address[0])
+            given = header_ip(self.headers.get(CLIENT_IP_HEADER)) if trust_header else None
+            return ip_key(given or self.client_address[0])
 
         def body(self) -> bytes:
             raw = self.headers.get("Content-Length")
@@ -285,25 +369,26 @@ def make_handler(brain: Brain):
             wait = guard.retry_after(ip)
             if wait:
                 return self.reply(429, TOO_MANY_LOGINS, TEXT, {"Retry-After": str(wait)})
-            if not guard.slots.acquire(timeout=LOGIN_WAIT_SECONDS):
+            slots = guard.slots_for(ip)
+            if not slots.acquire(timeout=LOGIN_WAIT_SECONDS):
                 return self.reply(429, TOO_MANY_LOGINS, TEXT, {"Retry-After": "5"})
             try:
                 given = parse_qs(data.decode("utf-8", "replace")).get("passphrase", [""])[0]
                 if cfg.dash_sha256 and sha_matches(given, cfg.dash_sha256):
                     guard.passed(ip)
-                    cookie = f"{COOKIE_NAME}={sessions.new()}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={SESSION_SECONDS}"
+                    cookie = f"{COOKIE_NAME}={sessions.new()}; HttpOnly;{self.secure_flag()} SameSite=Lax; Path=/; Max-Age={SESSION_SECONDS}"
                     return self.reply(303, b"", TEXT, {"Location": "./", "Set-Cookie": cookie})
                 guard.failed(ip)
                 time.sleep(1)
             finally:
-                guard.slots.release()
+                slots.release()
             return self.page(401, login_html(error=True))
 
         def post_logout(self, data: bytes):
             if (self.headers.get("Sec-Fetch-Site") or "").lower() in FOREIGN_FETCH_SITES:
                 raise Rejected(403, b"cross-site request refused")
             sessions.drop(self.session_token())
-            cookie = f"{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"
+            cookie = f"{COOKIE_NAME}=; HttpOnly;{self.secure_flag()} SameSite=Lax; Path=/; Max-Age=0"
             return self.reply(303, b"", TEXT, {"Location": "./", "Set-Cookie": cookie})
 
         def post_unblock(self, data: bytes):

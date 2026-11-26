@@ -5,11 +5,13 @@ import binascii
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass
 from typing import NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus
 
 from .labels import Decision
+from .net import bare_path
 
 SUSPICIOUS = re.compile(
     r"""(['`<>;$]|%27|%22|%3c|%3e|\x00|\.\./|\.\.%2f|--|/\*|\bunion\b|\bselect\b|\bsleep\(|\bor\s+1=1|etc/passwd|<script|[\s"'/<]on[a-z]+\s*=|javascript:|\{\{|\$\{)""",
@@ -32,6 +34,8 @@ DIGITS = re.compile(r"\d+")
 SPACES = re.compile(r"\s+")
 SCANNER_UA = re.compile(r"sqlmap|nikto|nuclei|zgrab|masscan|nmap|dirbuster|gobuster|ffuf|wpscan|acunetix|python-requests|go-http-client|curl/|wget/|libwww", re.IGNORECASE)
 PROBE_PATH = re.compile(r"\.(php|asp|aspx|jsp|cgi)\b|/wp-|/\.git|/\.env|/phpmyadmin|/cgi-bin|/actuator|/boaform|/HNAP1|/vendor/", re.IGNORECASE)
+FOREIGN_FETCH_SITES = ("cross-site", "same-site")
+BROWSER_UA = re.compile(r"^mozilla/", re.IGNORECASE)
 
 PREFILTERED = "prefiltered"
 DEDUPED = "deduped"
@@ -51,6 +55,9 @@ class Thresholds:
     dedupe_seconds: float = 600
     max_variants: int = MAX_VARIANTS
     proven_seconds: float = 86400
+    probe_paths: int = 5
+    foreign_block_after: int = 3
+    foreign_seconds: float = 600
 
 
 class Signals(NamedTuple):
@@ -68,6 +75,7 @@ class Signals(NamedTuple):
 class Screening(NamedTuple):
     skipped: str
     signals: Signals | None
+    probes: int = 0
 
 
 def shape(event: dict) -> str:
@@ -147,6 +155,30 @@ def read_signals(event: dict, suspicious: bool) -> Signals:
     )
 
 
+def worth_triage(event: dict) -> bool:
+    return read_signals(event, is_suspicious(event)).suspicious
+
+
+def fetch_header(event: dict, field: str, name: str) -> str:
+    value = event.get(field)
+    return (value if isinstance(value, str) else header(event, name)).strip().lower()
+
+
+def browser_fetch(event: dict) -> bool:
+    if fetch_header(event, "fetch_site", "sec-fetch-site") not in FOREIGN_FETCH_SITES:
+        return False
+    if not fetch_header(event, "fetch_mode", "sec-fetch-mode") or not fetch_header(event, "fetch_dest", "sec-fetch-dest"):
+        return False
+    ua = str(event.get("ua") or "")
+    return bool(BROWSER_UA.search(ua)) and not SCANNER_UA.search(ua)
+
+
+def valid_proven_row(row) -> bool:
+    if not isinstance(row, list) or len(row) != 4 or not all(isinstance(v, str) for v in row[:3]):
+        return False
+    return isinstance(row[3], (int, float)) and not isinstance(row[3], bool)
+
+
 def malicious(triage: dict) -> float:
     value = triage.get("malicious")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -164,9 +196,12 @@ def confidence(triage: dict) -> float:
 class DecisionPolicy:
     def __init__(self, thresholds: Thresholds):
         self.thresholds = thresholds
+        self.lock = threading.RLock()
         self.seen: dict = {}
         self.proven: dict = {}
         self.variants: dict = {}
+        self.probes: dict = {}
+        self.foreign: dict = {}
 
     @staticmethod
     def key(event: dict, ip: str) -> tuple:
@@ -175,12 +210,51 @@ class DecisionPolicy:
         return (ip, shape(event), hashlib.sha256(text.encode()).hexdigest() if forged or is_suspicious(event) else "")
 
     def mark_proven(self, event: dict, ip: str, ts: float) -> None:
-        if len(self.proven) >= MAX_SEEN:
-            cutoff = ts - self.thresholds.proven_seconds
-            self.proven = {k: v for k, v in self.proven.items() if v > cutoff}
+        key = self.key(event, ip)
+        with self.lock:
             if len(self.proven) >= MAX_SEEN:
-                self.proven = dict(sorted(self.proven.items(), key=lambda kv: kv[1])[-(MAX_SEEN // 2):])
-        self.proven[self.key(event, ip)] = ts
+                cutoff = ts - self.thresholds.proven_seconds
+                self.proven = {k: v for k, v in self.proven.items() if v > cutoff}
+                if len(self.proven) >= MAX_SEEN:
+                    self.proven = dict(sorted(self.proven.items(), key=lambda kv: kv[1])[-(MAX_SEEN // 2):])
+            self.proven[key] = ts
+
+    def proven_rows(self, now: float) -> list:
+        cutoff = now - self.thresholds.proven_seconds
+        with self.lock:
+            return [[*key, ts] for key, ts in self.proven.items() if ts > cutoff]
+
+    def restore_proven(self, rows, now: float) -> int:
+        if not isinstance(rows, list):
+            return 0
+        cutoff = now - self.thresholds.proven_seconds
+        kept = {tuple(row[:3]): float(row[3]) for row in rows if valid_proven_row(row) and cutoff < row[3] <= now + 60}
+        kept = dict(sorted(kept.items(), key=lambda kv: kv[1])[-MAX_SEEN:])
+        with self.lock:
+            for key, ts in kept.items():
+                self.proven[key] = max(ts, self.proven.get(key, ts))
+        return len(kept)
+
+    def forget(self, ip: str) -> None:
+        with self.lock:
+            self.seen = {k: v for k, v in self.seen.items() if k[0] != ip}
+            self.variants = {k: v for k, v in self.variants.items() if k[0] != ip}
+            self.probes.pop(ip, None)
+            self.foreign.pop(ip, None)
+
+    def foreign_strike(self, ip: str, ts: float) -> int:
+        cutoff = ts - self.thresholds.foreign_seconds
+        with self.lock:
+            strikes = [t for t in self.foreign.pop(ip, []) if t > cutoff] + [ts]
+            if len(self.foreign) >= MAX_SEEN:
+                self.foreign = {k: v for k, v in self.foreign.items() if v and v[-1] > cutoff}
+                if len(self.foreign) >= MAX_SEEN:
+                    self.foreign = dict(sorted(self.foreign.items(), key=lambda kv: kv[1][-1])[-(MAX_SEEN // 2):])
+            self.foreign[ip] = strikes[-max(1, self.thresholds.foreign_block_after):]
+            return len(strikes)
+
+    def _proven_ip(self, ip: str, ts: float) -> bool:
+        return any(k[0] == ip and ts - v < self.thresholds.proven_seconds for k, v in self.proven.items())
 
     @staticmethod
     def quiet_socket(event: dict) -> bool:
@@ -191,8 +265,10 @@ class DecisionPolicy:
     def plain(self, event: dict, ip: str) -> bool:
         if self.quiet_socket(event):
             return True
-        if self.key(event, ip) in self.proven:
-            return False
+        key = self.key(event, ip)
+        with self.lock:
+            if key in self.proven:
+                return False
         return not read_signals(event, is_suspicious(event)).interesting
 
     def screen(self, event: dict, ip: str, ts: float) -> Screening:
@@ -200,20 +276,35 @@ class DecisionPolicy:
             return Screening(PREFILTERED, None)
         suspicious = is_suspicious(event)
         key = self.key(event, ip)
-        proven_at = self.proven.get(key)
-        if proven_at is not None and ts - proven_at < self.thresholds.proven_seconds:
-            return Screening(REPEAT_PROVEN, read_signals(event, suspicious))
-        if self._is_duplicate(key, ts):
-            return Screening(DEDUPED, None)
         signals = read_signals(event, suspicious)
-        if not signals.interesting:
-            return Screening(PREFILTERED, None)
-        if signals.suspicious and self._is_variant(event, ip, ts):
-            return Screening(VARIANT_DEDUPED, None)
-        if len(self.seen) >= MAX_SEEN:
-            self._prune(ts)
-        self.seen[key] = {"ts": ts, "count": 1}
-        return Screening("", signals)
+        with self.lock:
+            proven_at = self.proven.get(key)
+            if proven_at is not None and ts - proven_at < self.thresholds.proven_seconds:
+                return Screening(REPEAT_PROVEN, signals)
+            if self._is_duplicate(key, ts):
+                return Screening(DEDUPED, None)
+            if not signals.interesting:
+                return Screening(PREFILTERED, None)
+            if signals.suspicious and not self._proven_ip(ip, ts) and self._is_variant(event, ip, ts):
+                return Screening(VARIANT_DEDUPED, None)
+            probes = self._count_probe(event, ip, ts) if signals.probe else 0
+            if len(self.seen) >= MAX_SEEN:
+                self._prune(ts)
+            self.seen[key] = {"ts": ts, "count": 1}
+            return Screening("", signals, probes)
+
+    def _count_probe(self, event: dict, ip: str, ts: float) -> int:
+        entry = self.probes.get(ip)
+        if not entry or ts - entry["ts"] >= self.thresholds.dedupe_seconds:
+            if len(self.probes) >= MAX_SEEN:
+                cutoff = ts - self.thresholds.dedupe_seconds
+                self.probes = {k: v for k, v in self.probes.items() if v["ts"] > cutoff}
+                if len(self.probes) >= MAX_SEEN:
+                    self.probes = dict(sorted(self.probes.items(), key=lambda kv: kv[1]["ts"])[-(MAX_SEEN // 2):])
+            entry = self.probes[ip] = {"ts": ts, "paths": set()}
+        if len(entry["paths"]) < max(self.thresholds.probe_paths, 1) * 4:
+            entry["paths"].add(bare_path(str(event.get("path", ""))).lower())
+        return len(entry["paths"])
 
     def _is_variant(self, event: dict, ip: str, ts: float) -> bool:
         route = (ip, shape(event))
@@ -245,11 +336,20 @@ class DecisionPolicy:
         prior["count"] += 1
         return True
 
-    def choose(self, triage: dict, signals: Signals) -> Decision:
+    def choose(self, triage: dict, signals: Signals, probes: int = 0) -> Decision:
         decision = self._from_jev(triage, signals)
         if signals.attack and not signals.probe and decision in (Decision.IGNORE, Decision.WATCH, Decision.TARPIT):
             return Decision.REPLAY
-        return decision
+        if signals.suspicious or not (signals.probe or signals.scanner):
+            return decision
+        if signals.probe and self.many_probes(probes):
+            return Decision.TARPIT if decision in (Decision.IGNORE, Decision.WATCH, Decision.TARPIT) else decision
+        if signals.probe:
+            return Decision.IGNORE
+        return Decision.WATCH if decision.listed else decision
+
+    def many_probes(self, probes: int) -> bool:
+        return self.thresholds.probe_paths > 0 and probes >= self.thresholds.probe_paths
 
     def _from_jev(self, triage: dict, signals: Signals) -> Decision:
         if not triage.get("ok"):

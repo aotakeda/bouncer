@@ -6,6 +6,9 @@ from urllib.parse import quote
 from . import net
 from .net import ERROR_DETAIL_CHARS, clip
 
+PAGE_SIZE = 100
+MAX_PAGES = 10
+
 
 class GitHub:
     def __init__(self, base_url: str, repo: str, branch: str):
@@ -24,14 +27,25 @@ class GitHub:
             return {}
         return {"path": path, "sha": body["sha"], "text": base64.b64decode(body["content"]).decode("utf-8")}
 
-    def open_pr_url(self, prefix: str) -> str:
-        status, body = self.call("GET", "/pulls?state=open&per_page=100")
-        if status != 200 or not isinstance(body, list):
-            return ""
-        for pr in body:
-            if self._is_own_branch(pr, prefix):
-                return pr.get("html_url") or ""
-        return ""
+    def open_pr_url(self, prefix: str) -> str | None:
+        for page in range(1, MAX_PAGES + 1):
+            status, body = self.call("GET", f"/pulls?state=open&per_page={PAGE_SIZE}&page={page}")
+            if status != 200 or not isinstance(body, list):
+                return None
+            for pr in body:
+                if isinstance(pr, dict) and self._is_own_branch(pr, prefix):
+                    return pr.get("html_url") or f"https://github.com/{self.repo}/pull/{pr.get('number')}"
+            if len(body) < PAGE_SIZE:
+                return ""
+        return None
+
+    def pr_state(self, number) -> str | None:
+        status, body = self.call("GET", f"/pulls/{int(number)}")
+        if status != 200 or not isinstance(body, dict) or "state" not in body:
+            return None
+        if body.get("merged") or body.get("merged_at"):
+            return "merged"
+        return str(body["state"])
 
     def _is_own_branch(self, pr: dict, prefix: str) -> bool:
         head = pr.get("head") or {}
@@ -50,11 +64,16 @@ class GitHub:
         payload = {"message": title, "content": base64.b64encode(content.encode()).decode(), "sha": blob_sha, "branch": branch}
         status, out = self.call("PUT", f"/contents/{quote(path)}", payload)
         if status not in (200, 201):
-            return self._step_failed("commit", status, out)
+            return self._drop_branch(branch, self._step_failed("commit", status, out))
         status, out = self.call("POST", "/pulls", {"title": title, "head": branch, "base": self.branch, "body": body})
         if status != 201:
-            return self._step_failed("pull request", status, out)
+            return self._drop_branch(branch, self._step_failed("pull request", status, out))
         return {"ok": True, "url": out.get("html_url"), "number": out.get("number")}
+
+    def _drop_branch(self, branch: str, failed: dict) -> dict:
+        status, _ = self.call("DELETE", f"/git/refs/heads/{quote(branch)}")
+        failed["branch_deleted"] = status in (200, 204)
+        return failed
 
     @staticmethod
     def _step_failed(step: str, status: int, out) -> dict:

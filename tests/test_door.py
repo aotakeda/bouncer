@@ -158,8 +158,8 @@ class DoorTests(unittest.TestCase):
     def test_bait_values_from_elsewhere_do_not_block(self):
         self.call("/?q=BAIT-123", "3.3.3.3")
         self.call("/", "3.3.3.4", headers={"Referer": "https://evil.example/?k=BAIT-123"})
-        self.call("/.env", "3.3.3.5", headers={"Sec-Fetch-Site": "cross-site"})
-        self.call("/?q=BAIT-123", "3.3.3.5", headers={"Sec-Fetch-Site": "cross-site"})
+        self.call("/.env", "3.3.3.5", headers=BROWSER_CROSS_SITE)
+        self.call("/?q=BAIT-123", "3.3.3.5", headers=BROWSER_CROSS_SITE)
         for ip in ("3.3.3.3", "3.3.3.4", "3.3.3.5"):
             started = time.time()
             self.assertEqual(self.call("/", ip)[0], 200)
@@ -430,6 +430,237 @@ class DoorTests(unittest.TestCase):
         status, _, headers = self.call("/.env", "1.2.3.5")
         self.assertEqual([v for k, v in headers if k.lower() == "server"], ["bouncer-door"])
 
+    def start_door(self, name: str, env: dict, canaries: bool = True) -> tuple:
+        data = self.data / name
+        data.mkdir()
+        if canaries:
+            (data / "canaries.json").write_text(json.dumps({"honeypot": {"admin_password": "BAIT-123"}}))
+        cfg = door_mod.Config({"DOOR_UPSTREAM": f"http://127.0.0.1:{self.upstream.server_address[1]}", "DOOR_DATA_DIR": str(data), **env})
+        door = door_mod.Door(cfg)
+        pushed = []
+        door.pusher.push = pushed.append
+        server = door_mod.make_server(door, ("127.0.0.1", 0))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(door.close)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return door, server.server_address[1], pushed
+
+    def wait_for(self, check) -> None:
+        deadline = time.time() + 3
+        while not check() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(check())
+
+    def call_port(self, port: int, path: str, headers: dict | None = None) -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", path, headers=headers or {})
+        status = conn.getresponse().status
+        conn.close()
+        return status
+
+    def test_client_ip_header_must_be_an_ip_and_can_be_switched_off(self):
+        for value in ("not-an-ip", "1.2.3.4, 5.6.7.8", "", "fe80::1%eth0"):
+            self.call("/rest/x", value)
+        self.last_push(4)
+        self.assertEqual([e["ip"] for e in self.pushed], ["127.0.0.1"] * 4)
+        self.call("/rest/x", " 2001:db8:5:6::7 ")
+        self.assertEqual(self.last_push(5)["ip"], "2001:db8:5:6::/64")
+        self.assertTrue(door_mod.Config({}).trust_client_ip_header)
+        door, port, pushed = self.start_door("untrusted", {"DOOR_TRUST_CLIENT_IP_HEADER": "0"})
+        self.assertFalse(door.cfg.trust_client_ip_header)
+        self.assertEqual(self.call_port(port, "/rest/x", {"Sprite-Client-Ip": "1.2.3.4"}), 200)
+        self.wait_for(lambda: pushed)
+        self.assertEqual(pushed[-1]["ip"], "127.0.0.1")
+        self.assertEqual(Upstream.seen[-1][1]["X-Forwarded-For"], "127.0.0.1")
+
+    def test_whole_request_deadline_cuts_a_trickling_client(self):
+        _, port, _ = self.start_door("deadline", {"DOOR_REQUEST_SECONDS": "0.5", "DOOR_IDLE_SECONDS": "5"})
+        started = time.time()
+        closed = False
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            try:
+                for byte in b"GET / HTTP/1.1\r\nHost: x\r\nX-Slow: " + b"a" * 100:
+                    s.sendall(bytes([byte]))
+                    time.sleep(0.05)
+            except OSError:
+                closed = True
+            if not closed:
+                try:
+                    closed = s.recv(10) == b""
+                except OSError:
+                    closed = True
+        self.assertTrue(closed)
+        self.assertLess(time.time() - started, 3)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+            started = time.time()
+            self.assertEqual(s.recv(10), b"")
+            self.assertLess(time.time() - started, 2)
+        self.assertEqual(self.call_port(port, "/"), 200)
+
+    def test_per_client_connection_cap_spares_other_clients(self):
+        door, port, _ = self.start_door("cap", {"DOOR_MAX_CONNS_PER_IP": "2", "DOOR_REQUEST_SECONDS": "5"})
+        slow = []
+        for _ in range(2):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(b"POST /x HTTP/1.1\r\nHost: x\r\nSprite-Client-Ip: 10.0.0.1\r\nContent-Length: 10\r\n\r\nab")
+            slow.append(s)
+        deadline = time.time() + 3
+        while door.conns.get("10.0.0.1", 0) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        try:
+            self.assertEqual(self.call_port(port, "/", {"Sprite-Client-Ip": "10.0.0.1"}), 503)
+            self.assertEqual(self.call_port(port, "/", {"Sprite-Client-Ip": "10.0.0.2"}), 200)
+        finally:
+            for s in slow:
+                s.close()
+        self.wait_for(lambda: not door.conns.get("10.0.0.1"))
+        self.assertNotIn("/x", Upstream.paths)
+        self.assertEqual(self.call_port(port, "/", {"Sprite-Client-Ip": "10.0.0.1"}), 200)
+        self.wait_for(lambda: door.conns == {})
+
+    def test_idle_keep_alive_connections_do_not_hold_the_cap(self):
+        door, port, _ = self.start_door("idle", {"DOOR_MAX_CONNS_PER_IP": "2"})
+        kept = []
+        try:
+            for _ in range(3):
+                s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nSprite-Client-Ip: 10.0.0.3\r\n\r\n")
+                self.assertIn(b"200", s.recv(4096).split(b"\r\n", 1)[0])
+                kept.append(s)
+            self.wait_for(lambda: not door.conns.get("10.0.0.3"))
+            self.assertEqual(self.call_port(port, "/", {"Sprite-Client-Ip": "10.0.0.3"}), 200)
+        finally:
+            for s in kept:
+                s.close()
+
+    def test_untrusted_mode_caps_connections_per_socket_peer(self):
+        _, port, _ = self.start_door("peer", {"DOOR_TRUST_CLIENT_IP_HEADER": "off", "DOOR_MAX_CONNS_PER_IP": "2"})
+        idle = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(2)]
+        try:
+            time.sleep(0.1)
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+                self.assertIn(b"503", s.recv(4096).split(b"\r\n", 1)[0])
+        finally:
+            for s in idle:
+                s.close()
+
+    def test_listen_backlog_is_raised_and_configurable(self):
+        door = door_mod.Door(door_mod.Config({"DOOR_DATA_DIR": str(self.data / "q")}))
+        self.addCleanup(door.close)
+        server = door_mod.make_server(door, ("127.0.0.1", 0))
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.request_queue_size, 128)
+        self.assertEqual(door_mod.Config({"DOOR_LISTEN_BACKLOG": "512"}).listen_backlog, 512)
+
+    def test_detection_decodes_past_the_agents_rounds(self):
+        payload = "' or 1=1--"
+        for rounds in (4, 5, 6):
+            encoded = payload
+            for _ in range(rounds):
+                encoded = urllib.parse.quote(encoded, safe="")
+            self.assertTrue(door_mod.looks_like_attack("/rest/products/search?q=" + encoded), rounds)
+        self.assertGreaterEqual(door_mod.DECODE_ROUNDS, policy.NORMALIZE_ROUNDS)
+
+    def test_shield_ignores_matrix_params_and_trailing_dots(self):
+        self.shield()
+        q = "?q=" + urllib.parse.quote("')) union select 1--")
+        for path in ("/rest/products/search;a=1", "/rest/products/search.", "/rest;x=1/products/search/", "/REST/products/Search..;jsessionid=1", "/rest/products/search%3Bx"):
+            self.assertEqual(self.call(path + q, "1.1.1.1")[0], 403, path)
+        self.assertEqual(self.call("/rest/products/searchx;a=1" + q, "1.1.1.1")[0], 200)
+        self.assertEqual(door_mod.route_path("/ftp/../x"), "/ftp/../x")
+        self.assertEqual(door_mod.route_path("http://x/Rest/User/Login;a/"), "/rest/user/login")
+
+    def test_access_log_redacts_secret_query_params_but_record_keeps_them(self):
+        path = "/rest/x?q=apple&Token=abc123secret&api_key=k3y&code=zz9&zipcode=12345&session_id=s1d&flag"
+        self.call(path, "1.1.1.1")
+        self.assertEqual(self.last_push(1)["path"], path)
+        logged = json.loads(self.log_lines(1)[-1])["path"]
+        self.assertEqual(logged, "/rest/x?q=apple&Token=[redacted 12]&api_key=[redacted 3]&code=[redacted 3]&zipcode=12345&session_id=[redacted 3]&flag")
+
+    def test_honeypot_fetch_is_pushed_once_per_client(self):
+        for _ in range(3):
+            self.assertEqual(self.call("/.env", "2.2.2.4")[0], 200)
+        self.call("/.env", "2.2.2.5")
+        for _ in range(2):
+            self.call("/.env", "2.2.2.6", headers=BROWSER_CROSS_SITE)
+        self.assertEqual(len(self.log_lines(6)), 6)
+        honeypots = lambda: [e["ip"] for e in self.pushed if e["kind"] == "honeypot"]
+        self.assertEqual(honeypots(), ["2.2.2.4", "2.2.2.5", "2.2.2.6"])
+        self.call("/.env", "2.2.2.4")
+        self.assertEqual(len(self.log_lines(7)), 7)
+        self.assertEqual(self.admin("DELETE", "tarpit", {"target": "2.2.2.4"}), 200)
+        self.call("/.env", "2.2.2.4")
+        self.wait_for(lambda: len(honeypots()) == 4)
+        self.assertEqual(honeypots(), ["2.2.2.4", "2.2.2.5", "2.2.2.6", "2.2.2.4"])
+        self.assertTrue(self.door.is_listed("tarpit", "2.2.2.4"))
+
+    def test_missing_canaries_fail_closed(self):
+        self.assertEqual(self.door.warnings(), [])
+        door, port, pushed = self.start_door("nocanary", {}, canaries=False)
+        self.assertEqual(len(door.warnings()), 1)
+        self.assertIn("canaries", door.warnings()[0])
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", "/.env", headers={"Sprite-Client-Ip": "2.2.2.7"})
+        resp = conn.getresponse()
+        self.assertEqual((resp.status, resp.read()), (200, b"ok"))
+        conn.close()
+        self.assertEqual(Upstream.paths[-1], "/.env")
+        self.wait_for(lambda: pushed)
+        self.assertEqual(pushed[-1]["kind"], "request")
+        self.assertFalse(door.took_bait("2.2.2.7"))
+        self.assertFalse(door.is_listed("tarpit", "2.2.2.7"))
+
+    def test_only_a_full_browser_fetch_from_another_site_dodges_the_bait_trap(self):
+        cases = {
+            "5.1.1.1": ({"Sec-Fetch-Site": "cross-site"}, True),
+            "5.1.1.2": ({**BROWSER_CROSS_SITE, "Sec-Fetch-Dest": ""}, True),
+            "5.1.1.3": ({**BROWSER_CROSS_SITE, "Sec-Fetch-Mode": " "}, True),
+            "5.1.1.4": ({**BROWSER_CROSS_SITE, "User-Agent": "curl/8.4"}, True),
+            "5.1.1.5": ({**BROWSER_CROSS_SITE, "User-Agent": "Mozilla/5.0 sqlmap/1.8"}, True),
+            "5.1.1.6": ({**BROWSER_CROSS_SITE, "Sec-Fetch-Site": "SAME-SITE"}, False),
+            "5.1.1.7": (BROWSER_CROSS_SITE, False),
+            "5.1.1.8": ({**BROWSER_CROSS_SITE, "Sec-Fetch-Site": "cross-site" + " " * 40 + "x"}, False),
+            "5.1.1.9": ({**BROWSER_CROSS_SITE, "Sec-Fetch-Site": "same-origin"}, True),
+        }
+        for ip, (headers, trusted) in cases.items():
+            self.call("/.env", ip, headers=headers)
+            self.assertEqual(self.door.took_bait(ip), trusted, ip)
+        self.wait_for(lambda: len(self.pushed) == len(cases))
+        for record in self.pushed:
+            self.assertEqual(policy.browser_fetch(record), not cases[record["ip"]][1], record["ip"])
+        body = json.dumps({"email": "a@b.c", "password": "BAIT-123"}).encode()
+        self.call("/rest/user/login", "5.1.1.1", "POST", body, {"Content-Type": "application/json", "Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(self.call("/", "5.1.1.1")[0], 403)
+
+    def test_fetch_mode_and_dest_are_recorded(self):
+        self.call("/rest/x", "5.2.2.2", headers={**BROWSER_CROSS_SITE, "Sec-Fetch-Dest": "d" * 60})
+        record = self.last_push(1)
+        self.assertEqual((record["fetch_site"], record["fetch_mode"], record["fetch_dest"]), ("cross-site", "no-cors", "d" * 40))
+        self.call("/rest/x", "5.2.2.3")
+        self.assertFalse({"fetch_site", "fetch_mode", "fetch_dest"} & set(self.last_push(2)))
+
+    def test_bind_host_is_configurable(self):
+        self.assertEqual(door_mod.Config({}).host, "0.0.0.0")
+        self.assertEqual(door_mod.Config({"DOOR_HOST": "127.0.0.1"}).host, "127.0.0.1")
+
+    def test_tarpitted_request_event_carries_the_same_fields_as_a_normal_one(self):
+        body = json.dumps({"email": "' or 1=1--", "password": "x"}).encode()
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer abc", "Sec-Fetch-Site": "none", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document", "User-Agent": "sqlmap/1.8"}
+        path = "/rest/user/login?next=%2F"
+        self.call(path, "4.4.4.5", "POST", body, headers)
+        normal = self.last_push(1)
+        self.door.mark_bait("4.4.4.6")
+        self.call(path, "4.4.4.6", "POST", body, headers)
+        slowed = self.last_push(2)
+        self.assertEqual((normal["kind"], slowed["kind"]), ("request", "tarpitted"))
+        self.assertEqual(set(normal) - {"took_bait"}, set(slowed))
+        for field in ("method", "path", "ua", "status", "body", "attack_shaped", "ctype", "fetch_site", "fetch_mode", "fetch_dest", "headers"):
+            self.assertEqual(normal[field], slowed[field], field)
+        self.assertEqual(slowed["path"], path)
+        self.assertTrue(slowed["attack_shaped"])
+
 
 ATTACKS = (
     "zz')) UNION SELECT email FROM Users--",
@@ -462,6 +693,12 @@ ATTACKS = (
     "1 union/**/select 2",
     "x' -- y",
 )
+BROWSER_CROSS_SITE = {
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Dest": "image",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
+}
 HARMLESS = (
     "O'Neil -- great",
     "kid's juice",

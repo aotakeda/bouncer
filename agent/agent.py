@@ -17,24 +17,23 @@ from .inbox import FairInbox
 from .jev import Jev
 from .labels import Decision, EventKind, FixStatus, Verdict
 from .net import bare_path, route_path
-from .policy import PREFILTERED, REPEAT_PROVEN, DecisionPolicy, Signals
+from .policy import PREFILTERED, REPEAT_PROVEN, DecisionPolicy, Screening, browser_fetch, worth_triage
 from .replay import Replayer
 from .store import Store
 from .views import Views
 from .web import AgentServer, make_handler
 
-COUNTED_ONLY_KINDS = (EventKind.REFUSED, EventKind.TARPITTED)
+SLOWED_REFUSAL = 429
 QUIET_VERDICT_LINES = {Verdict.INCONCLUSIVE: "inconclusive", Verdict.MINOR: "minor"}
 AWAKE_TASK = "bouncer-incident"
 RESTORED_FEED_ROWS = 300
 SAVE_SECONDS = 30
 LISTS_CACHE_SECONDS = 3.0
 NO_LISTS_CACHE: tuple[float, dict] = (0.0, {})
-KIND_OUTCOMES = {EventKind.REFUSED: "blocked", EventKind.TARPITTED: "slowed"}
+KIND_OUTCOMES = {EventKind.REFUSED: "blocked", EventKind.TARPITTED: "slowed", EventKind.SHIELDED: "blocked"}
 DECISION_OUTCOMES = {Decision.BLOCK: "blocked", Decision.TARPIT: "slowed"}
+REFUSED_KINDS = (EventKind.REFUSED, EventKind.SHIELDED)
 DROP_LOG_EVERY = 100
-TRUSTED_FETCH_SITES = ("", "none", "same-origin")
-FOREIGN_FETCH_SITES = ("cross-site", "same-site")
 RETRY_KEY = "__retry__"
 REPEAT_LINE = "Same trick that already worked in the back room. No second test needed. Out."
 SHIELDED_LINE = "The door already turned it away: this route is shielded until the fix is merged. It would have worked, so they're out."
@@ -43,14 +42,26 @@ UNTAKEN_BAIT_LINE = "Bait value showed up, but this client never took the bait. 
 FLOOD_LINE = "Too many requests to check at once. Slow lane while I work through the pile."
 FOREIGN_LINE = "Sent from another site's page, so the visitor may not be the attacker. Not blocking or slowing it."
 OWNER_SHIELD_LINE = "Your own traffic, so the route was not shielded."
+FOREIGN_LIMIT_REASON = "kept attacking from other sites' pages"
+CROSS_SITE_REUSE_LINE = "Bait value sent from inside another site's page. Probably an innocent browser being used as a puppet. Not blocking."
 
 
 def trusted_fetch(event: dict) -> bool:
-    return str(event.get("fetch_site") or "").strip().lower() in TRUSTED_FETCH_SITES
+    return not browser_fetch(event)
 
 
 def foreign_fetch(event: dict) -> bool:
-    return str(event.get("fetch_site") or "").strip().lower() in FOREIGN_FETCH_SITES
+    return browser_fetch(event)
+
+
+def foreign_limit_line(strikes: int, seconds: float) -> str:
+    return f"Another site's page again: {strikes} times from this client in {int(seconds)}s. Puppet or not, it's out."
+
+
+def traffic_outcome(kind: EventKind, decision: Decision | None) -> str:
+    if kind in REFUSED_KINDS:
+        return KIND_OUTCOMES[kind]
+    return DECISION_OUTCOMES.get(decision) or KIND_OUTCOMES.get(kind, "allowed")
 
 
 def build_fixer(cfg: Config) -> Fixer | None:
@@ -58,7 +69,7 @@ def build_fixer(cfg: Config) -> Fixer | None:
         return None
     return Fixer(
         cfg.fix_mode,
-        Claude(cfg.anthropic_url, cfg.fix_model),
+        Claude(cfg.anthropic_url, cfg.fix_model, cfg.app_description),
         GitHub(cfg.github_url, cfg.github_repo, cfg.github_branch),
         cfg.runner_url,
         cfg.runner_token,
@@ -93,6 +104,8 @@ class Brain:
         self.store = Store(cfg.data_dir)
         self.views = Views(cfg, self.store)
         self.policy = DecisionPolicy(cfg.thresholds)
+        self.proven_lock = threading.Lock()
+        self.policy.restore_proven(self.store.load_proven(), time.time())
         self.door = DoorClient(cfg.door_url, cfg.door_token)
         self.jev = Jev(cfg.jev_url, cfg.app_description) if cfg.jev_url else None
         self.replayer = Replayer(cfg.runner_url, cfg.runner_token) if cfg.runner_url else None
@@ -115,7 +128,11 @@ class Brain:
             Verdict.INCONCLUSIVE: self._on_quiet_verdict,
             Verdict.MINOR: self._on_quiet_verdict,
         }
-        threading.Thread(target=self._work, daemon=True).start()
+        self.replay_lock = threading.Lock()
+        self.awake_lock = threading.Lock()
+        self.awake_busy = 0
+        for _ in range(cfg.workers):
+            threading.Thread(target=self._work, daemon=True).start()
 
     def _restore_feed(self):
         try:
@@ -145,7 +162,7 @@ class Brain:
 
     def _count_quietly(self, event: dict, ip: str) -> bool:
         kind = EventKind.parse(event.get("kind", EventKind.REQUEST), None)
-        if kind in COUNTED_ONLY_KINDS:
+        if self._counted_only(kind, event):
             outcome, name = KIND_OUTCOMES[kind], kind
         elif kind == EventKind.REQUEST and self._plain(event, ip):
             outcome, name = "allowed", PREFILTERED
@@ -155,6 +172,18 @@ class Brain:
         self.store.count(name)
         self.store.count_traffic(event_time(event.get("ts")), outcome)
         return True
+
+    def _counted_only(self, kind, event: dict) -> bool:
+        if kind == EventKind.REFUSED:
+            return True
+        if kind != EventKind.TARPITTED:
+            return False
+        if event.get("status") == SLOWED_REFUSAL:
+            return True
+        try:
+            return not worth_triage(event)
+        except Exception:
+            return False
 
     def _plain(self, event: dict, ip: str) -> bool:
         try:
@@ -180,15 +209,19 @@ class Brain:
                 self.inbox.done()
 
     def _work_one(self, event: dict):
+        with self.awake_lock:
+            self.awake_busy += 1
         net.hold_awake(AWAKE_TASK, 300)
         try:
             self.handle(event)
         except Exception as exc:
             self._report_error(event, exc)
-        if self.inbox.empty():
-            self.store.save_counters()
-            net.release_awake(AWAKE_TASK)
-        elif time.time() - self.store.counters_saved >= SAVE_SECONDS:
+        with self.awake_lock:
+            self.awake_busy -= 1
+            last = not self.awake_busy and self.inbox.only_me()
+            if last:
+                net.release_awake(AWAKE_TASK)
+        if last or time.time() - self.store.counters_saved >= SAVE_SECONDS:
             self.store.save_counters()
 
     def _report_error(self, event: dict, exc: Exception):
@@ -213,13 +246,16 @@ class Brain:
         record = self._record(event)
         record["rid"] = f"{self.rid_prefix}-{next(self.rids)}"
         kind = record["kind"]
-        if kind in COUNTED_ONLY_KINDS:
+        if self._counted_only(kind, event):
             self.store.count(kind)
             self.store.count_traffic(record["ts"], KIND_OUTCOMES[kind])
             return
+        if kind == EventKind.TARPITTED:
+            self.store.count(kind)
+            self.store.count("tarpitted_triaged")
         self._slow_flooder(record)
         decision = self.kind_handlers.get(kind, self._on_request)(event, record)
-        self.store.count_traffic(record["ts"], DECISION_OUTCOMES.get(decision, "allowed"))
+        self.store.count_traffic(record["ts"], traffic_outcome(kind, decision))
 
     def _slow_flooder(self, record: dict):
         with self.flood_lock:
@@ -241,13 +277,13 @@ class Brain:
         }
 
     def _on_honeypot(self, event: dict, record: dict) -> Decision:
-        if not trusted_fetch(event):
+        if record.get("foreign"):
             self.store.shame_path(record["path"])
             return self.decide(record, Decision.WATCH, line=CROSS_SITE_HONEYPOT_LINE)
         self.store.visit_honeypot(record["ip"], record["ts"])
         self.store.shame_path(record["path"])
         line = persona.line("honeypot", record["path"])
-        if event.get("took_bait"):
+        if event.get("took_bait") and trusted_fetch(event):
             self.store.count("tarpit_by_door")
             return self.decide(record, Decision.TARPIT, line=line)
         return self._list_and_decide(record, Decision.TARPIT, "took the honeypot .env", line)
@@ -255,16 +291,36 @@ class Brain:
     def _on_canary_reuse(self, event: dict, record: dict) -> Decision:
         origin = self.store.honeypot_origin(record["ip"])
         took = bool(event.get("took_bait")) or bool(origin and origin[0] == record["ip"])
-        if not took or not trusted_fetch(event):
+        reason, line = "reused honeypot credentials", persona.line("canary_reuse", record["path"]) + self._honeypot_story(record["ip"])
+        if not took:
             return self.decide(record, Decision.WATCH, line=UNTAKEN_BAIT_LINE)
-        line = persona.line("canary_reuse", record["path"]) + self._honeypot_story(record["ip"])
-        if event.get("took_bait"):
+        strikes = self._foreign_strikes(record)
+        if strikes and strikes < self.cfg.foreign_block_after:
+            return self.decide(record, Decision.WATCH, line=CROSS_SITE_REUSE_LINE)
+        if strikes:
+            reason, line = f"{FOREIGN_LIMIT_REASON}: {reason}", f"{line} {foreign_limit_line(strikes, self.cfg.foreign_seconds)}"
+        record = {**record, "foreign": False}
+        if event.get("took_bait") and trusted_fetch(event):
             self.store.count("block_by_door")
             blocked = self.door.enabled and not self.cfg.is_owner(record["ip"])
         else:
-            blocked = self.set_list(Decision.BLOCK, record["ip"], "reused honeypot credentials")
+            blocked = self.set_list(Decision.BLOCK, record["ip"], reason)
         self.store.remember_catch(record, blocked)
         return self.decide(record, Decision.BLOCK, line=line)
+
+    def _foreign_strikes(self, record: dict) -> int:
+        if not record.get("foreign"):
+            return 0
+        strikes = self.policy.foreign_strike(record["ip"], record["ts"])
+        self.store.count("foreign_limit" if strikes >= self.cfg.foreign_block_after else "foreign_excused")
+        return strikes
+
+    def _block_on_proof(self, record: dict, reason: str, line: str) -> Decision:
+        strikes = self._foreign_strikes(record)
+        if strikes >= self.cfg.foreign_block_after:
+            record = {**record, "foreign": False}
+            reason, line = f"{FOREIGN_LIMIT_REASON}: {reason}", f"{line} {foreign_limit_line(strikes, self.cfg.foreign_seconds)}"
+        return self._list_and_decide(record, Decision.BLOCK, reason, line)
 
     def _honeypot_story(self, ip: str) -> str:
         origin = self.store.honeypot_origin(ip)
@@ -279,7 +335,7 @@ class Brain:
         screening = self.policy.screen(event, record["ip"], record["ts"])
         if screening.skipped == REPEAT_PROVEN:
             self.store.count(REPEAT_PROVEN)
-            return self._list_and_decide(record, Decision.BLOCK, "repeated a proven exploit", REPEAT_LINE)
+            return self._block_on_proof(record, "repeated a proven exploit", REPEAT_LINE)
         if screening.skipped:
             self.store.count(screening.skipped)
             return None
@@ -288,29 +344,32 @@ class Brain:
             self.store.shame_path(bare_path(record["path"]))
         triage = self._triage(event, record["ip"])
         record["jev"] = triage
-        decision = self.policy.choose(triage, signals)
+        decision = self.policy.choose(triage, signals, screening.probes)
         if decision == Decision.REPLAY and self.replayer:
             return self._replay(event, record, triage)
-        return self._act(record, decision, signals)
+        return self._act(record, decision, screening)
 
     def _triage(self, event: dict, ip: str) -> dict:
         if not self.jev:
             return {"ok": False, "error": "jev not configured"}
         return self.jev.triage(event, self.history(ip))
 
-    def _act(self, record: dict, decision: Decision, signals: Signals) -> Decision:
-        path = record["path"]
+    def _act(self, record: dict, decision: Decision, screening: Screening) -> Decision:
+        path, signals = record["path"], screening.signals
         if decision.listed:
-            return self._list_and_decide(record, decision, f"jev: {decision}", persona.line(decision, path))
+            many = decision == Decision.TARPIT and signals.probe and self.policy.many_probes(screening.probes)
+            reason = f"probed {screening.probes} paths" if many else f"jev: {decision}"
+            return self._list_and_decide(record, decision, reason, persona.line(decision, path))
         if decision == Decision.IGNORE:
-            kind = "ignore_probe" if signals.probe or signals.scanner else "ignore"
+            kind = "ignore_probe" if signals.probe else "ignore"
             return self.decide(record, Decision.IGNORE, line=persona.line(kind, path))
         return self.decide(record, Decision.WATCH, line=persona.line("watch", path))
 
     def _replay(self, event: dict, record: dict, triage: dict, attempt: int = 0) -> Decision:
         if not attempt:
             self.decide(record, Decision.REPLAY, line=persona.line("replay", record["path"]))
-        result = self.replayer.run(event)
+        with self.replay_lock:
+            result = self.replayer.run(event)
         replayed = {**record, "replay": result, "attempt": attempt}
         handler = self.verdict_handlers.get(result["verdict"], self._on_jammed)
         return handler(event, replayed, triage)
@@ -328,16 +387,28 @@ class Brain:
             self._forget_lists()
         return ok
 
+    def _remember_proven(self, event: dict, ip: str, ts: float):
+        with self.proven_lock:
+            self.policy.mark_proven(event, ip, ts)
+            self.store.save_proven(self.policy.proven_rows(time.time()))
+
     def _on_proven(self, event: dict, record: dict, triage: dict) -> Decision:
         ip, result = record["ip"], record["replay"]
-        self.policy.mark_proven(event, ip, record["ts"])
+        self._remember_proven(event, ip, record["ts"])
         self._shield(record, result["why"])
-        foreign = bool(record.get("foreign"))
-        blocked = False if foreign else self.set_list(Decision.BLOCK, ip, "proven exploit: " + result["why"][:120])
+        strikes = self._foreign_strikes(record)
+        foreign = 0 < strikes < self.cfg.foreign_block_after
+        reason = "proven exploit: " + result["why"][:120]
+        if strikes and not foreign:
+            reason = f"{FOREIGN_LIMIT_REASON}: {reason}"
+            record = {**record, "foreign": False}
+        blocked = False if foreign else self.set_list(Decision.BLOCK, ip, reason)
         incident = {"ts": time.time(), "ip": ip, "event": event, "replay": result, "jev": triage, "blocked": blocked, "rid": record.get("rid")}
         if foreign:
             incident["foreign"] = True
             self.store.count("foreign_proven")
+        elif strikes:
+            incident["foreign_strikes"] = strikes
         if self.cfg.is_owner(ip) and self.cfg.shield_seconds > 0 and self.door.enabled:
             incident["would_shield"] = True
         if self.fixer:
@@ -346,6 +417,8 @@ class Brain:
         line = SHIELDED_LINE if record.get("kind") == EventKind.SHIELDED else persona.line("proven", record["path"])
         if incident.get("would_shield"):
             line = f"{line} {OWNER_SHIELD_LINE}"
+        if incident.get("foreign_strikes"):
+            line = f"{line} {foreign_limit_line(strikes, self.cfg.foreign_seconds)}"
         base = {k: v for k, v in record.items() if k != "attempt"}
         decision = self.decide(base, Decision.WATCH, line=f"{line} {FOREIGN_LINE}") if foreign else self.decide(base, Decision.BLOCK, line=line)
         if self.fixer:
@@ -415,6 +488,7 @@ class Brain:
         ok = self.door.unblock(ip)
         if ok:
             self.store.count("unblocked")
+            self.policy.forget(ip)
             if self.store.forget_honeypot(ip):
                 self.store.count("bait_forgotten")
             with self.flood_lock:
@@ -474,8 +548,8 @@ class Brain:
 def main():
     cfg = Config()
     brain = Brain(cfg)
-    server = AgentServer(("0.0.0.0", cfg.port), make_handler(brain))
-    print(json.dumps({"agent": "listening", "port": cfg.port, "jev": bool(cfg.jev_url), "runner": bool(cfg.runner_url), "door": bool(cfg.door_url)}), flush=True)
+    server = AgentServer((cfg.host, cfg.port), make_handler(brain))
+    print(json.dumps({"agent": "listening", "host": cfg.host, "port": cfg.port, "workers": cfg.workers, "jev": bool(cfg.jev_url), "runner": bool(cfg.runner_url), "door": bool(cfg.door_url)}), flush=True)
     server.serve_forever()
 
 

@@ -46,9 +46,13 @@ def triage(action: str, malicious: float, confidence: float = 0.9) -> dict:
 class Choose(unittest.TestCase):
     policy = DecisionPolicy(Thresholds())
 
+    def test_single_probe_is_ignored_whatever_jev_says(self):
+        for action in ("ignore", "watch", "tarpit", "replay", "block"):
+            self.assertEqual(self.policy.choose(triage(action, 0.95), PROBE), Decision.IGNORE)
+
     def test_failed_triage_replays_only_door_matches(self):
         self.assertEqual(self.policy.choose({"ok": False}, QUIET), Decision.REPLAY)
-        self.assertEqual(self.policy.choose({"ok": False}, PROBE), Decision.WATCH)
+        self.assertEqual(self.policy.choose({"ok": False}, PROBE), Decision.IGNORE)
         self.assertEqual(self.policy.choose({"ok": False}, Signals(suspicious=False, scanner=True, probe=False, failed=True)), Decision.WATCH)
         self.assertEqual(self.policy.after_failed_replay({"ok": False}), Decision.WATCH)
 
@@ -61,12 +65,13 @@ class Choose(unittest.TestCase):
 
     def test_confident_attack_is_replayed_unless_probe(self):
         self.assertEqual(self.policy.choose(triage("block", 0.95), QUIET), Decision.REPLAY)
-        self.assertEqual(self.policy.choose(triage("block", 0.95), PROBE), Decision.TARPIT)
+        self.assertEqual(self.policy.choose(triage("block", 0.95), PROBE), Decision.IGNORE)
+        self.assertEqual(self.policy.choose(triage("block", 0.95), PROBE, probes=5), Decision.TARPIT)
 
     def test_non_probe_block_never_skips_proof(self):
         self.assertEqual(self.policy.choose(triage("block", 0.85, confidence=0.9), QUIET), Decision.REPLAY)
         scanner_fail = Signals(suspicious=False, scanner=True, probe=False, failed=True)
-        self.assertEqual(self.policy.choose(triage("block", 0.6, confidence=0.9), scanner_fail), Decision.TARPIT)
+        self.assertEqual(self.policy.choose(triage("block", 0.6, confidence=0.9), scanner_fail), Decision.WATCH)
         self.assertEqual(self.policy.choose(triage("block", 0.85, confidence=0.9), scanner_fail), Decision.REPLAY)
 
     def test_thresholds_come_from_config(self):
@@ -245,15 +250,12 @@ class Dashboard(unittest.TestCase):
                 {"kind": "request", "ip": ["x"], "method": "GET", "path": "/a"},
                 {"kind": "honeypot", "ip": "5.5.5.5", "method": "GET", "path": "/.env"},
             ])
-            deadline = time.time() + 5
+            self.assertTrue(brain.inbox.wait_idle(5))
             state = brain.state()
-            while time.time() < deadline and not any(r["kind"] == EventKind.HONEYPOT for r in state["recent"]):
-                time.sleep(0.02)
-                state = brain.state()
         decisions = [r["decision"] for r in state["recent"]]
         self.assertEqual(state["stats"]["malformed"], 1)
         self.assertIn(Decision.ERROR, decisions)
-        self.assertEqual(decisions[-1], Decision.TARPIT)
+        self.assertEqual([r["decision"] for r in state["recent"] if r["kind"] == EventKind.HONEYPOT], [Decision.TARPIT])
 
 
 class Labels(unittest.TestCase):
@@ -429,8 +431,10 @@ class JudgeFindings(unittest.TestCase):
 
         row = lambda before, after: variant_row({"idea": "i", "request": "/x", "before": before, "after": after})
         self.assertTrue(row(Verdict.PROVEN, Verdict.NOT_REPRODUCED).endswith("| worked | blocked |"))
-        self.assertTrue(row(Verdict.NOT_REPRODUCED, Verdict.NOT_REPRODUCED).endswith("| no effect | no effect |"))
-        self.assertTrue(row(Verdict.MINOR, Verdict.NOT_REPRODUCED).endswith("| minor only | no effect |"))
+        self.assertTrue(row(Verdict.NOT_REPRODUCED, Verdict.NOT_REPRODUCED).startswith("| i | `/x` | no effect |"))
+        self.assertTrue(row(Verdict.MINOR, Verdict.NOT_REPRODUCED).startswith("| i | `/x` | minor only |"))
+        self.assertFalse(row(Verdict.NOT_REPRODUCED, Verdict.NOT_REPRODUCED).endswith("| blocked |"))
+        self.assertFalse(row(Verdict.MINOR, Verdict.NOT_REPRODUCED).endswith("| blocked |"))
 
     def test_probe_captions_name_the_right_target(self):
         from agent.persona import shame_caption
@@ -550,6 +554,7 @@ class FakeDoor:
 class ProvenHandling(unittest.TestCase):
     proven = {"verdict": Verdict.PROVEN, "why": "solved Login Admin", "evidence": {}}
     event = {"kind": "request", "method": "POST", "path": "/rest/user/login", "body": "{\"email\":\"' or 1=1--\"}", "status": 200}
+    browser = {"ua": "Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0", "fetch_mode": "no-cors", "fetch_dest": "empty"}
 
     def brain(self, tmp, **env):
         brain = Brain(Config({"AGENT_DATA_DIR": tmp, "OWNER_IPS": OWNER_IP, **env}))
@@ -567,8 +572,8 @@ class ProvenHandling(unittest.TestCase):
         for site in ("cross-site", "same-site"):
             with tempfile.TemporaryDirectory() as tmp:
                 brain = self.brain(tmp)
-                brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=1.0))
-                brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=2.0))
+                brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=1.0, **self.browser))
+                brain.handle(dict(self.event, ip="5.5.5.5", fetch_site=site, ts=2.0, **self.browser))
                 self.assertEqual(brain.door.lists, [], site)
                 self.assertEqual(brain.door.shields, ["POST /rest/user/login"])
                 incident = brain.store.incidents[-1]
@@ -666,6 +671,324 @@ class RouteKeys(unittest.TestCase):
         for path in ["/rest/user/LOGIN/", "//rest//user/login?x=1", "http://x/rest/user/login", "/rest/products/%73earch?q=1", "/"]:
             self.assertEqual(route_path(path), door_route_path(path))
         self.assertEqual(route_path("/rest/user/LOGIN/"), "/rest/user/login")
+
+    def test_matrix_params_and_trailing_dots_match_the_door(self):
+        from agent.net import route_path
+        door_route_path = load_door().route_path
+        cases = {
+            "/rest/user/login;jsessionid=1": "/rest/user/login",
+            "/rest;x=1/user;y=2/login": "/rest/user/login",
+            "/rest/user/login.": "/rest/user/login",
+            "/rest/user./login..?q=1": "/rest/user/login",
+            "/rest/products/search%3Bx": "/rest/products/search",
+            "/rest/./user/../login": "/rest/./user/../login",
+            "/rest/;x/login": "/rest/login",
+            "/.": "/.",
+        }
+        for path, key in cases.items():
+            self.assertEqual(route_path(path), key, path)
+            self.assertEqual(door_route_path(path), key, path)
+
+
+SQLI = "/rest/products/search?q=" + "zz%27%29%29%20UNION%20SELECT%20id%2Cemail%20FROM%20Users--%20"
+BROWSER = {"ua": "Mozilla/5.0 (Macintosh) Safari/605.1.15", "fetch_site": "cross-site", "fetch_mode": "no-cors", "fetch_dest": "empty"}
+
+
+class ReviewFixes(unittest.TestCase):
+    def brain(self, tmp, verdicts=None, **env):
+        brain = Brain(Config({"AGENT_DATA_DIR": tmp, "OWNER_IPS": OWNER_IP, **env}))
+        brain.door = FakeDoor()
+        runs = []
+
+        class Replayer:
+            def run(self, event):
+                runs.append(event["path"])
+                verdict = (verdicts or {}).get(event["path"], Verdict.PROVEN)
+                return {"verdict": verdict, "why": "leaked 2 canary strings", "evidence": {}}
+
+        brain.replayer = Replayer()
+        brain.runs = runs
+        brain._triage = lambda event, ip: triage("block", 0.97)
+        return brain
+
+    def sqli(self, ip, suffix, ts, **extra):
+        return {"kind": "request", "ip": ip, "method": "GET", "path": SQLI + suffix, "status": 200, "ua": "sqlmap/1.8", "ts": ts, **extra}
+
+    def test_attack_from_a_slowed_client_is_triaged_and_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.inbox = FairInbox(5, 100)
+            brain.submit([
+                {"kind": "honeypot", "ip": "4.4.4.4", "method": "GET", "path": "/.env", "took_bait": True, "ts": 1.0},
+                {"kind": "tarpitted", "ip": "4.4.4.4", "method": "GET", "path": "/rest/products", "status": 200, "ts": 2.0},
+                {"kind": "tarpitted", "ip": "4.4.4.4", "method": "GET", "path": SQLI + "x", "status": 429, "ts": 3.0},
+                self.sqli("4.4.4.4", "slowed", 4.0, kind="tarpitted"),
+            ])
+            self.assertEqual(brain.inbox.size, 2)
+            brain.handle(brain.inbox.get())
+            brain.handle(brain.inbox.get())
+            rows = brain.store.recent("4.4.4.4", 5)
+            stats = brain.store.stats
+        self.assertEqual([r["decision"] for r in rows], [Decision.TARPIT, Decision.REPLAY, Decision.BLOCK])
+        self.assertEqual(rows[-1]["kind"], EventKind.TARPITTED)
+        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "4.4.4.4")])
+        self.assertEqual((stats["tarpitted"], stats["tarpitted_triaged"]), (3, 1))
+
+    def test_plain_and_refused_tarpitted_events_stay_counted_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle({"kind": "tarpitted", "ip": "4.4.4.4", "method": "GET", "path": "/rest/products", "status": 200, "ts": 60.0})
+            brain.handle({"kind": "tarpitted", "ip": "4.4.4.4", "method": "GET", "path": SQLI, "status": 429, "ts": 61.0})
+            self.assertEqual(brain.runs, [])
+            self.assertEqual(brain.store.recent("4.4.4.4", 5), [])
+            self.assertEqual(brain.store.traffic, {1: [0, 2, 0]})
+
+    def test_unblock_lets_a_changed_suffix_replay_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle(self.sqli("6.6.6.6", "demo1", 1.0))
+            self.assertTrue(brain.unblock("6.6.6.6"))
+            brain.handle(self.sqli("6.6.6.6", "demo1", 2.0))
+            brain.handle(self.sqli("6.6.6.6", "demo2", 3.0))
+            decisions = [r["decision"] for r in brain.store.recent("6.6.6.6", 10)]
+        self.assertEqual(brain.runs, [SQLI + "demo1", SQLI + "demo2"])
+        self.assertEqual(decisions, [Decision.REPLAY, Decision.BLOCK, Decision.BLOCK, Decision.REPLAY, Decision.BLOCK])
+
+    def test_unblock_clears_dedupe_and_variant_memory_for_that_ip_only(self):
+        policy = DecisionPolicy(Thresholds(max_variants=1))
+        attack = lambda q: {"method": "GET", "path": f"/rest/products/search?q=%27{q}", "status": 200}
+        self.assertEqual(policy.screen(attack("a"), "1.1.1.1", 0).skipped, "")
+        self.assertEqual(policy.screen(attack("b"), "1.1.1.1", 1).skipped, VARIANT_DEDUPED)
+        self.assertEqual(policy.screen(attack("a"), "2.2.2.2", 1).skipped, "")
+        policy.forget("1.1.1.1")
+        self.assertEqual(policy.screen(attack("a"), "1.1.1.1", 2).skipped, "")
+        self.assertEqual(policy.screen(attack("a"), "2.2.2.2", 2).skipped, DEDUPED)
+
+    def test_proven_client_is_not_variant_deduped_even_when_unblocked_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp, verdicts={SQLI + "demo2": Verdict.NOT_REPRODUCED})
+            brain.handle(self.sqli("6.6.6.7", "demo1", 1.0))
+            brain.handle(self.sqli("6.6.6.7", "demo2", 2.0))
+        self.assertEqual(brain.runs, [SQLI + "demo1", SQLI + "demo2"])
+
+    def test_variant_drops_are_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp, verdicts={SQLI + f"v{c}": Verdict.NOT_REPRODUCED for c in "abcdefg"})
+            for i, c in enumerate("abcdefg"):
+                brain.handle(self.sqli("6.6.6.8", f"v{c}", float(i)))
+            stats = brain.store.stats
+        self.assertEqual(len(brain.runs), 5)
+        self.assertEqual(stats[VARIANT_DEDUPED], 2)
+
+    def test_lone_sec_fetch_site_header_does_not_excuse_a_proven_attack(self):
+        for extra in ({"fetch_site": "cross-site"}, dict(BROWSER, fetch_mode=""), dict(BROWSER, ua="curl/8.4.0"), dict(BROWSER, ua="sqlmap/1.8 Mozilla/5.0"), dict(BROWSER, ua="")):
+            with tempfile.TemporaryDirectory() as tmp:
+                brain = self.brain(tmp)
+                brain.handle(dict(self.sqli("5.5.5.1", "x", 1.0), **extra))
+            self.assertEqual(brain.door.lists, [(Decision.BLOCK, "5.5.5.1")], extra)
+            self.assertNotIn("foreign", brain.store.incidents[-1])
+
+    def test_browser_fetch_metadata_can_come_from_headers(self):
+        from agent.policy import browser_fetch
+
+        headers = {"Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+        self.assertTrue(browser_fetch({"ua": "Mozilla/5.0", "headers": headers}))
+        self.assertFalse(browser_fetch({"ua": "Mozilla/5.0", "headers": dict(headers, **{"Sec-Fetch-Site": "same-origin"})}))
+        self.assertFalse(browser_fetch({"ua": "Mozilla/5.0 python-requests/2.31", "headers": headers}))
+
+    def test_repeated_foreign_proofs_block_the_client_anyway(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            listed = []
+            brain.set_list = lambda kind, ip, reason: listed.append((kind, ip, reason)) or True
+            for i in range(3):
+                brain.handle(dict(self.sqli("5.5.5.2", f"browser{chr(97 + i)}", 10.0 + i), **BROWSER))
+            rows = brain.store.recent("5.5.5.2", 10)
+            incidents = brain.store.incidents
+            stats = brain.store.stats
+        self.assertEqual([r["decision"] for r in rows if r["decision"] != Decision.REPLAY], [Decision.WATCH, Decision.WATCH, Decision.BLOCK])
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0][:2], (Decision.BLOCK, "5.5.5.2"))
+        self.assertIn("other sites' pages", listed[0][2])
+        self.assertIn("3 times", rows[-1]["line"])
+        self.assertEqual([i.get("foreign", False) for i in incidents], [True, True, False])
+        self.assertTrue(incidents[-1]["blocked"])
+        self.assertEqual((stats["foreign_excused"], stats["foreign_limit"]), (2, 1))
+
+    def test_foreign_limit_and_window_come_from_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp, FOREIGN_BLOCK_AFTER="2", FOREIGN_WINDOW_SECONDS="5")
+            brain.handle(dict(self.sqli("5.5.5.3", "a", 1.0), **BROWSER))
+            brain.handle(dict(self.sqli("5.5.5.3", "b", 100.0), **BROWSER))
+            self.assertEqual(brain.door.lists, [])
+            brain.handle(dict(self.sqli("5.5.5.3", "c", 102.0), **BROWSER))
+        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "5.5.5.3")])
+
+    def test_repeat_proven_from_a_browser_counts_toward_the_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            for ts in (1.0, 2.0, 3.0):
+                brain.handle(dict(self.sqli("5.5.5.4", "same", ts), **BROWSER))
+            decisions = [r["decision"] for r in brain.store.recent("5.5.5.4", 10)]
+        self.assertEqual(brain.runs, [SQLI + "same"])
+        self.assertEqual(decisions, [Decision.REPLAY, Decision.WATCH, Decision.WATCH, Decision.BLOCK])
+        self.assertEqual(brain.door.lists, [(Decision.BLOCK, "5.5.5.4")])
+
+    def test_canary_reuse_needs_coherent_browser_metadata_and_has_a_limit(self):
+        reuse = {"kind": "canary_reuse", "method": "POST", "path": "/rest/user/login"}
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle({"kind": "honeypot", "ip": "4.4.4.6", "method": "GET", "path": "/.env", "fetch_site": "cross-site", "ts": 1.0})
+            brain.handle(dict(reuse, ip="4.4.4.6", fetch_site="cross-site", ts=2.0))
+            spoofed = [r["decision"] for r in brain.store.recent("4.4.4.6", 5)]
+            for ts in (3.0, 4.0, 5.0):
+                brain.handle(dict(reuse, ip="4.4.4.7", ts=ts, **BROWSER))
+            innocent = brain.store.recent("4.4.4.7", 5)
+            for ts in (6.0, 7.0, 8.0):
+                brain.handle(dict(reuse, ip="4.4.4.9", ts=ts, took_bait=True, **BROWSER))
+            puppet = brain.store.recent("4.4.4.9", 5)
+        self.assertEqual(spoofed, [Decision.TARPIT, Decision.BLOCK])
+        self.assertEqual([r["decision"] for r in innocent], [Decision.WATCH] * 3)
+        self.assertEqual([r["decision"] for r in puppet], [Decision.WATCH, Decision.WATCH, Decision.BLOCK])
+        self.assertIn("another site's page", puppet[0]["line"])
+        self.assertEqual(brain.door.lists, [(Decision.TARPIT, "4.4.4.6"), (Decision.BLOCK, "4.4.4.6"), (Decision.BLOCK, "4.4.4.9")])
+
+    def test_browser_bait_fetch_is_still_not_slowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain.handle({"kind": "honeypot", "ip": "4.4.4.8", "method": "GET", "path": "/.env", "ts": 1.0, **BROWSER})
+        self.assertEqual(brain.door.lists, [])
+        self.assertEqual(brain.store.recent("4.4.4.8", 1)[0]["decision"], Decision.WATCH)
+
+    def test_repeat_block_survives_restart(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self.brain(tmp)
+            first.handle(self.sqli("7.7.7.1", "restart", now))
+            first.policy.proven[("7.7.7.2", "GET /old?", "x")] = now - 10 ** 6
+            first.store.save_proven(first.policy.proven_rows(now) + [["7.7.7.2", "GET /old?", "x", now - 10 ** 6], ["bad"], "junk"])
+            again = self.brain(tmp)
+            again.handle(self.sqli("7.7.7.1", "restart", now + 1))
+            rows = again.store.recent("7.7.7.1", 5)
+            restored = set(again.policy.proven)
+        self.assertEqual(again.runs, [])
+        self.assertEqual([r["decision"] for r in rows], [Decision.BLOCK])
+        self.assertIn("already worked", rows[0]["line"])
+        self.assertEqual(again.door.lists, [(Decision.BLOCK, "7.7.7.1")])
+        self.assertEqual({k[0] for k in restored}, {"7.7.7.1"})
+
+    def test_shield_refusals_count_as_blocked_traffic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp, verdicts={SQLI + "shield": Verdict.NOT_REPRODUCED})
+            brain._triage = lambda event, ip: triage("ignore", 0.2)
+            brain.handle(dict(self.sqli("8.8.1.1", "shield", 60.0, kind="shielded", status=403)))
+            brain.handle(dict(self.sqli("8.8.1.1", "shield", 61.0, kind="shielded", status=403)))
+            traffic = dict(brain.store.traffic)
+        self.assertEqual(traffic, {1: [0, 0, 2]})
+
+    def test_single_probe_is_never_slowed_but_a_sweep_is(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain._triage = lambda event, ip: triage("tarpit", 0.7)
+            probe = lambda path, ts: {"kind": "request", "ip": "2.2.2.2", "method": "GET", "path": path, "status": 200, "ua": "zgrab/0.x", "ts": ts}
+            brain.handle(probe("/wp-login.php", 1.0))
+            brain.handle(probe("/wp-login.php", 2.0))
+            self.assertEqual(brain.door.lists, [])
+            for i, path in enumerate(("/xmlrpc.php", "/.git/config", "/phpmyadmin/", "/cgi-bin/luci")):
+                brain.handle(probe(path, 3.0 + i))
+            listed = []
+            brain.set_list = lambda kind, ip, reason: listed.append((kind, reason)) or True
+            brain.handle(probe("/vendor/phpunit", 9.0))
+            decisions = [r["decision"] for r in brain.store.recent("2.2.2.2", 10)]
+        self.assertEqual(decisions, [Decision.IGNORE] * 4 + [Decision.TARPIT, Decision.TARPIT])
+        self.assertEqual(brain.door.lists, [(Decision.TARPIT, "2.2.2.2")])
+        self.assertEqual(listed, [(Decision.TARPIT, "probed 6 paths")])
+
+    def test_scanner_without_attack_syntax_is_watched_not_slowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = self.brain(tmp)
+            brain._triage = lambda event, ip: triage("tarpit", 0.8)
+            brain.handle({"kind": "request", "ip": "2.2.2.3", "method": "GET", "path": "/rest/products", "status": 200, "ua": "curl/8.4.0", "ts": 1.0})
+        self.assertEqual(brain.door.lists, [])
+        self.assertEqual(brain.store.recent("2.2.2.3", 1)[0]["decision"], Decision.WATCH)
+
+    def test_probe_threshold_comes_from_config(self):
+        cfg = Config({"PROBE_TARPIT_PATHS": "2"})
+        policy = DecisionPolicy(cfg.thresholds)
+        probe = lambda path: {"method": "GET", "path": path, "status": 200, "ua": "zgrab/0.x"}
+        first, second = (policy.screen(probe(p), "2.2.2.4", 0) for p in ("/a.php", "/b.php"))
+        self.assertEqual((first.probes, second.probes), (1, 2))
+        self.assertEqual(policy.choose(triage("ignore", 0.3), first.signals, first.probes), Decision.IGNORE)
+        self.assertEqual(policy.choose(triage("ignore", 0.3), second.signals, second.probes), Decision.TARPIT)
+        self.assertEqual(DecisionPolicy(Config({"PROBE_TARPIT_PATHS": "0"}).thresholds).choose(triage("tarpit", 0.9), second.signals, 50), Decision.IGNORE)
+
+    def test_jev_tarpit_option_is_not_for_a_single_probe(self):
+        self.assertIn("many different paths", jev.ACTIONS["tarpit"])
+        self.assertIn("single scanner probe", jev.ACTIONS["ignore"])
+
+    def test_bind_address_workers_and_limits_come_from_config(self):
+        cfg = Config({})
+        self.assertEqual((cfg.host, cfg.workers, cfg.probe_paths, cfg.foreign_block_after, cfg.foreign_seconds), ("0.0.0.0", 2, 5, 3, 600.0))
+        cfg = Config({"BOUNCER_HOST": "127.0.0.1", "AGENT_WORKERS": "0"})
+        self.assertEqual((cfg.host, cfg.workers), ("127.0.0.1", 1))
+
+    def test_workers_never_share_one_client(self):
+        import threading
+
+        box = FairInbox(per_key=10, total=100)
+        active, overlaps, seen = {}, [], []
+        lock = threading.Lock()
+
+        def work():
+            while True:
+                item = box.get()
+                try:
+                    if item is None:
+                        return
+                    with lock:
+                        if active.get(item[0]):
+                            overlaps.append(item)
+                        active[item[0]] = True
+                    time.sleep(0.005)
+                    with lock:
+                        active[item[0]] = False
+                        seen.append(item)
+                finally:
+                    box.done()
+
+        workers = [threading.Thread(target=work) for _ in range(3)]
+        for t in workers:
+            t.start()
+        for i in range(8):
+            for key in ("a", "b"):
+                box.put(key, (key, i))
+        self.assertTrue(box.wait_idle(5))
+        for i in range(3):
+            box.put(f"stop{i}", None)
+        for t in workers:
+            t.join(5)
+        self.assertEqual(overlaps, [])
+        self.assertEqual([i for k, i in seen if k == "a"], list(range(8)))
+        self.assertEqual([i for k, i in seen if k == "b"], list(range(8)))
+
+    def test_brain_runs_the_configured_number_of_workers(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            before = threading.active_count()
+            brain = Brain(Config({"AGENT_DATA_DIR": tmp, "AGENT_WORKERS": "3"}))
+            self.assertEqual(threading.active_count() - before, 3)
+            gate = threading.Event()
+            started = []
+            brain.handle = lambda event: started.append(event["ip"]) or gate.wait(5)
+            brain.inbox.put("1.1.1.1", {"ip": "1.1.1.1"})
+            brain.inbox.put("2.2.2.2", {"ip": "2.2.2.2"})
+            deadline = time.time() + 5
+            while time.time() < deadline and len(started) < 2:
+                time.sleep(0.01)
+            gate.set()
+            self.assertTrue(brain.inbox.wait_idle(5))
+        self.assertEqual(sorted(started), ["1.1.1.1", "2.2.2.2"])
 
 
 if __name__ == "__main__":

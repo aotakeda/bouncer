@@ -123,6 +123,8 @@ kbd{
 .app.side-hidden .nav .n{display:none}
 .app.side-hidden .nav .n.hot{display:block;position:absolute;top:5px;right:7px;width:6px;height:6px;margin:0;border-radius:50%;background:var(--red);font-size:0;box-shadow:0 0 0 2px var(--side)}
 .app.side-hidden .live{justify-content:center;padding:7px 0;font-size:0;gap:0}
+.app.side-hidden .signout{justify-content:center;padding:7px 0}
+.app.side-hidden .signout-t{display:none}
 }
 @media (prefers-reduced-motion:reduce){.app{transition:none}}
 
@@ -169,6 +171,12 @@ kbd{
 .live[aria-pressed="false"] .live-ic{color:var(--mute)}
 .live.off .live-ic{color:var(--orange)}
 .live-ago{margin-left:auto;color:var(--subtle);font-weight:450}
+.signout{display:flex;align-items:center;gap:8px;width:100%;padding:7px 8px;border-radius:6px;color:var(--mute);font-size:12px;font-weight:500;white-space:nowrap}
+.signout .ic{width:14px;height:14px}
+.cbox{width:min(420px,100%);padding:18px 18px 16px}
+.ctitle{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1.35;overflow-wrap:anywhere}
+.cbody{margin:6px 0 0;color:var(--mute);overflow-wrap:anywhere}
+.cacts{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 .live-badge{background:var(--accent-bg);color:var(--accent);padding:0 6px;border-radius:99px;font-size:11px;font-weight:600;line-height:1.6}
 
 .main{min-width:0;padding-bottom:max(64px,env(safe-area-inset-bottom,0px));transition:margin-right 280ms var(--ease-drawer)}
@@ -231,14 +239,15 @@ a.chip{transition:border-color 120ms ease,background-color 120ms ease}
 .ib{width:28px;height:28px;border-radius:6px;display:grid;place-items:center;color:var(--mute);flex-shrink:0;position:relative}
 .ib::before{content:"";position:absolute;inset:-4px}
 
-.btn,.chips .chip,.ib,.nav,.live,.pick,.mi,.kit,.search{transition:transform 140ms var(--ease-out),background-color 120ms ease,border-color 120ms ease,color 120ms ease,opacity 150ms ease,filter 150ms ease}
-.btn:active:not(:disabled),.chips .chip:active,.ib:active,.live:active,.pick:active{transform:scale(.97)}
+.btn,.chips .chip,.ib,.nav,.live,.signout,.pick,.mi,.kit,.search{transition:transform 140ms var(--ease-out),background-color 120ms ease,border-color 120ms ease,color 120ms ease,opacity 150ms ease,filter 150ms ease}
+.btn:active:not(:disabled),.chips .chip:active,.ib:active,.live:active,.signout:active,.pick:active{transform:scale(.97)}
 .srow,.erow{transition:background-color 100ms ease}
 .srow:active,.erow:active{background:var(--sel)}
 
 @media (hover:hover) and (pointer:fine){
   .search:hover{border-color:var(--line-2);color:var(--fg-2)}
   .nav:hover,.live:hover{background:var(--hover)}
+  .signout:hover{background:var(--hover);color:var(--fg)}
   .nav:hover{color:var(--fg)}
   .chips .chip:hover{color:var(--fg)}
   .btn:hover:not(:disabled){background:var(--hover);border-color:var(--line-2)}
@@ -294,12 +303,11 @@ a.chip{transition:border-color 120ms ease,background-color 120ms ease}
   min-height:44px;padding:6px 20px 6px 24px;border-bottom:1px solid var(--line);
 }
 .brow-body{flex:1;min-width:0;display:flex;align-items:center;gap:4px 10px;flex-wrap:wrap}
-.brow-ip{font-weight:500;color:var(--fg);min-width:15ch}
+.brow-ip,.brow-route{font-weight:500;color:var(--fg);flex:0 0 auto;width:calc(var(--brow-name,15) * 1ch);max-width:100%;overflow-wrap:anywhere}
 .brow-kind{font-weight:500;min-width:58px}
 .brow-kind.k-block{color:var(--red)}
 .brow-kind.k-tarpit{color:var(--orange)}
 .brow-kind.k-shield{color:var(--green)}
-.brow-route{font-weight:500;color:var(--fg);min-width:0;overflow-wrap:anywhere}
 .brow-meta{color:var(--mute);font-size:12px;min-width:0;overflow-wrap:anywhere}
 
 .totals{display:flex;gap:4px 14px;flex-wrap:wrap;font-size:12px;color:var(--mute)}
@@ -353,7 +361,7 @@ a.chip{transition:border-color 120ms ease,background-color 120ms ease}
 .eo{display:flex;align-items:center;gap:7px;color:var(--fg-2);white-space:nowrap;font-size:12px}
 .eip{text-align:right;color:var(--mute);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .odot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--subtle)}
-.o-blocked{background:var(--red)}.o-slowed{background:var(--orange)}.o-testing{background:var(--accent)}.o-error{background:var(--orange)}.o-owner{background:transparent;box-shadow:inset 0 0 0 1.5px var(--red)}.o-allowed{background:var(--line-2)}
+.o-blocked{background:var(--red)}.o-slowed{background:var(--orange)}.o-testing{background:var(--accent)}.o-error{background:var(--orange)}.o-owner{background:transparent;box-shadow:inset 0 0 0 1.5px var(--red)}.o-allowed{background:var(--line-2)}.o-shielded{background:var(--red);border-radius:1.5px}
 .erow.calm .ep{color:var(--mute)}
 .erow.calm .em,.erow.calm .eo,.erow.calm .eip{color:var(--subtle)}
 .list-foot{padding:10px 24px;color:var(--mute);font-size:12px;font-variant-numeric:tabular-nums}
@@ -410,7 +418,7 @@ a.chip{transition:border-color 120ms ease,background-color 120ms ease}
 .dtitle{margin:0;font-size:18px;line-height:1.35;font-weight:600;letter-spacing:-.014em;overflow-wrap:anywhere}
 .dtitle.mono{font-size:14px;font-weight:500;letter-spacing:0;line-height:1.5}
 .lede{margin:-12px 0 0;color:var(--fg-2);font-size:13.5px;line-height:1.55;max-width:65ch}
-.props{display:grid;grid-template-columns:96px minmax(0,1fr);row-gap:2px;margin:0}
+.props{display:grid;grid-template-columns:112px minmax(0,1fr);row-gap:2px;margin:0}
 .props dt{color:var(--mute);min-height:30px;display:flex;align-items:center}
 .props dd{margin:0;min-height:30px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
 .pv{display:inline-flex;align-items:center;gap:7px;color:var(--fg);font-weight:500;min-width:0;overflow-wrap:anywhere}
@@ -561,6 +569,10 @@ pre.diff .dl.meta .dcode{color:var(--mute)}
   .nav .n{margin-left:2px}
   .live{margin:0 0 0 auto;width:auto;padding:6px}
   #liveText{display:none}
+  .signout{width:auto;padding:6px;position:sticky;right:0;z-index:1;background:var(--side);box-shadow:-10px 0 10px -4px var(--side),16px 0 0 var(--side)}
+  .signout-t{display:none}
+  .kmenu.confirm{align-items:flex-end;padding:12px max(12px,env(safe-area-inset-right,0px)) max(12px,env(safe-area-inset-bottom,0px)) max(12px,env(safe-area-inset-left,0px))}
+  .cacts .btn{flex:1;height:40px}
   .sh{padding-left:16px;padding-right:16px}
   .sh-sub{display:none}
   .grp,.brow,.empty,.list-foot{padding-left:16px;padding-right:16px}
@@ -588,10 +600,11 @@ pre.diff .dl.meta .dcode{color:var(--mute)}
   .seg button{padding:6px 10px}
   .nav{padding:8px 10px}
   .ib{width:36px;height:36px}
+  .signout{min-width:36px;min-height:36px;justify-content:center}
   .mi,.kit{padding:10px}
 }
 @media (prefers-reduced-motion:reduce){
-  .btn:active:not(:disabled),.chips .chip:active,.ib:active,.live:active,.pick:active{transform:none}
+  .btn:active:not(:disabled),.chips .chip:active,.ib:active,.live:active,.signout:active,.pick:active{transform:none}
   .drawer,.drawer[data-state="closed"]{transform:none;transition:opacity 150ms ease}
   .drawer[data-state="closed"]{opacity:0}
   .scrim,.scrim[data-state="closed"]{transition:opacity 150ms ease}
@@ -627,6 +640,7 @@ pre.diff .dl.meta .dcode{color:var(--mute)}
     <button type="button" class="nav" data-jump="probes"><svg class="ic" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3M7 5.25v3.5M5.25 7h3.5"/></svg>Probed paths</button>
   </nav>
   <button type="button" class="live" id="live" aria-pressed="true" title="Pause or resume live updates"><span class="live-ic" id="liveIc" aria-hidden="true"></span><span id="liveText">Live</span><span class="live-ago" id="liveAgo"></span></button>
+  <button type="button" class="signout" id="signOut" aria-label="Sign out" title="Sign out"><svg class="ic" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 2.75H4A1.25 1.25 0 0 0 2.75 4v8A1.25 1.25 0 0 0 4 13.25h2.5M10.25 5 13.25 8l-3 3M13 8H6.5"/></svg><span class="signout-t">Sign out</span></button>
 </aside>
 
 <main class="main" id="main">
@@ -672,12 +686,21 @@ pre.diff .dl.meta .dcode{color:var(--mute)}
     <div class="klist" id="klist" role="listbox" aria-label="Commands"></div>
   </div>
 </div>
+<div class="kmenu confirm" id="confirm" hidden>
+  <div class="kbox cbox" role="alertdialog" aria-modal="true" aria-labelledby="cTitle" aria-describedby="cBody">
+    <h2 class="ctitle" id="cTitle"></h2>
+    <p class="cbody" id="cBody"></p>
+    <div class="cacts"><button type="button" class="btn" id="cNo">Cancel</button><button type="button" class="btn primary" id="cYes">Confirm</button></div>
+  </div>
+</div>
 <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const SEV=['critical','high','medium','low','info'];
+const JEV_NAME='Jev System One';
+const JEV_FULL='Jev System One by TypeSafe, the triage model';
 const SEV_LABEL={critical:'Critical',high:'High',medium:'Medium',low:'Low',info:'Info'};
 const STATUS_LABEL={open:'New',reviewing:'In progress',resolved:'Done'};
 const STATUS_ORDER=['open','reviewing','resolved'];
@@ -795,14 +818,18 @@ function bare(p){return String(p??'').split('?')[0]}
 const sevTag=s=>`<span class="sev sev-${esc(s)}">${SEV_ICON[s]||SEV_ICON.info}${esc(SEV_LABEL[s]||s)}</span>`;
 const statusTag=s=>`<span class="pill st-${esc(s)}">${esc(STATUS_LABEL[s]||s)}</span>`;
 
+const wasKind=(e,k)=>e.kind===k||(e.steps||[]).some(x=>x.kind===k);
+const wasShielded=e=>wasKind(e,'shielded');
 function outcomeOf(e){
   const d=e.decision;
   if(d==='block')return ['blocked','Blocked'];
   if(d==='tarpit')return ['slowed','Slowed'];
   if(d==='would_block')return ['owner','Would block (you)'];
   if(d==='would_tarpit')return ['owner','Would slow (you)'];
+  if(wasShielded(e))return ['blocked','Refused by shield','shielded'];
   if(d==='replay')return ['testing','Testing'];
   if(d==='error')return ['error','Error'];
+  if(wasKind(e,'tarpitted'))return ['slowed',e.verdict==='PROVEN'?'Slowed, proven':'Slowed'];
   return ['allowed','Allowed'];
 }
 
@@ -953,13 +980,15 @@ function renderBlocked(){
       ${isBlock?L.block:L.slow}
       <span class="brow-body">
         <span class="brow-ip mono">${esc(x.label)}</span>
-        ${x.yours?'<span class="chip">You</span>':''}
         <span class="brow-kind ${isBlock?'k-block':'k-tarpit'}">${isBlock?'Blocked':'Slowed'}</span>
+        ${x.yours?'<span class="chip">You</span>':''}
         <span class="brow-meta">${esc(meta)}</span>
       </span>
       <button type="button" class="btn" data-unblock="${esc(x.ip)}" data-label="${esc(x.label)}">Unblock</button>
     </div>`;
   }).join('')+shields.map(shieldRow).join('');
+  const nameWidth=Math.min(40,Math.max(15,...rows.map(x=>String(x.label||'').length),...shields.map(x=>String(x.route||'').length)));
+  $('blocked').style.setProperty('--brow-name',String(nameWidth));
   if(html!==lastBlockedHtml){$('blocked').innerHTML=html;lastBlockedHtml=html}
 }
 
@@ -1101,7 +1130,7 @@ function renderEvents(start){
   if(!rows.length){$('events').innerHTML=`<div class="empty">${ui.evt==='attacks'?'No attacks':`No ${ui.evt==='all'?'':EVT_LABELS[ui.evt].toLowerCase()+' '}requests`} in the last ${esc(ui.range)}.</div>`;return}
   const foot=matched.length>rows.length?`<div class="list-foot">Showing the latest ${fmtN(rows.length)} of ${fmtN(matched.length)} requests</div>`:'';
   $('events').innerHTML=rows.map(r=>{
-    const [oc,ol]=outcomeOf(r);
+    const [oc,ol,dot]=outcomeOf(r);
     const key=evtKey(r);
     const decoded=decodePath(r.path);
     const attack=isAttackSev(r.severity);
@@ -1112,7 +1141,7 @@ function renderEvents(start){
       <span class="tm" title="${esc(stamp(r.first))}">${esc(clock24(r.first))}</span>
       ${attack?sevMark(r.severity):'<span class="sevi"></span>'}
       <span class="ep mono" title="${esc((r.method?r.method+' ':'')+decoded)}"><span class="em">${esc(r.method||'')}</span>${hl(decoded)}</span>
-      <span class="eo"><i class="odot o-${oc}" aria-hidden="true"></i>${esc(ol)}</span>
+      <span class="eo"><i class="odot o-${dot||oc}" aria-hidden="true"></i>${esc(ol)}</span>
       <span class="eip mono" title="${esc(r.ip)}">${esc(r.ip)}</span>
     </div>`;
   }).join('')+foot;
@@ -1416,7 +1445,7 @@ function signalDrawer(s){
     const [,langLabel]=langFromFile(f.file);
     fixHtml=`${f.summary?`<section class="ds"><h4>What the patch changes</h4><p class="prose">${esc(f.summary)}</p></section>`:''}
       ${f.diff?`<section class="ds" id="dPatch"><div class="ds-h"><h4>Patch${f.file?` · <span class="mono">${esc(f.file)}</span>`:''}${langLabel?`<span class="lang-tag">${esc(langLabel)}</span>`:''}</h4>${copyBtn('sig-diff',extractChangedCode(f.diff),'Copy changes')}</div><pre class="diff" data-no-drag>${highlightDiff(f.diff,f.file)}</pre></section>`:''}
-      ${(f.variants||[]).length?`<section class="ds"><h4>Other ways in, tried before and after the patch</h4><div class="vt-wrap" data-no-drag><table class="vt"><thead><tr><th>Variant</th><th>Before</th><th>After</th></tr></thead><tbody>${f.variants.map(v=>`<tr><td>${esc(v.idea)}</td><td class="nowrap">${v.before==='PROVEN'?'<span class="pill oc-blocked">Works</span>':'<span class="mute">Not shown</span>'}</td><td class="nowrap">${variantCell(v.after)}</td></tr>`).join('')}</tbody></table></div></section>`:''}`;
+      ${(f.variants||[]).length?`<section class="ds"><h4>Other ways in, tried before and after the patch</h4><div class="vt-wrap" data-no-drag><table class="vt"><thead><tr><th>Variant</th><th>Before</th><th>After</th></tr></thead><tbody>${f.variants.map(v=>`<tr><td>${esc(v.idea)}</td><td class="nowrap">${v.before==='PROVEN'?'<span class="pill oc-blocked">Works</span>':'<span class="mute">Didn\'t work</span>'}</td><td class="nowrap">${v.before==='PROVEN'?variantCell(v.after):'<span class="mute">Didn\'t work before either</span>'}</td></tr>`).join('')}</tbody></table></div></section>`:''}`;
   }
   return drawerHead('Signals',ref,cta)+`<div class="db">
     <h1 class="dtitle" id="dTitle">${esc(s.title)}</h1>
@@ -1427,7 +1456,7 @@ function signalDrawer(s){
       <dt>Source</dt><dd><span class="pv mono">${esc(s.ip)}</span>${enforce}</dd>
       <dt>Fix</dt><dd>${fixVal}</dd>
       ${s.shield&&leftNow(s.shield)>0?`<dt>Shield</dt><dd><span class="chip">${L.guard}On · ${esc(fmtLeft(leftNow(s.shield)).replace(/ left$/,''))}</span><button type="button" class="btn subtle" data-unshield="${esc(s.shield.route)}">Remove shield</button></dd>`:''}
-      ${s.jev?`<dt>Classifier</dt><dd><span class="pv">${pct(s.jev.malicious)} attack</span><span class="pv-sub">· suggested ${esc(s.jev.action||'–')} · ${pct(s.jev.confidence)} confident</span></dd>`:''}
+      ${s.jev?`<dt title="${esc(JEV_FULL)}">${esc(JEV_NAME)}</dt><dd><span class="pv">${pct(s.jev.malicious)} attack</span><span class="pv-sub">· suggested ${esc(s.jev.action||'–')} · ${pct(s.jev.confidence)} confident</span></dd>`:''}
       <dt>Seen</dt><dd><span class="pv">${fmtN(s.count)} ${plural(s.count,'time','times')}</span><span class="pv-sub" title="${esc(stamp(s.first))} – ${esc(stamp(s.last))}">· last ${esc(ago(s.last))}</span></dd>
     </dl>
     ${dry}
@@ -1442,7 +1471,7 @@ function signalDrawer(s){
 
 function eventDrawer(r){
   copyStore.clear();
-  const [oc,ol]=outcomeOf(r);
+  const [oc,ol,dot]=outcomeOf(r);
   const sig=(S.signals||[]).find(s=>(s.rids||[]).includes(r.rid));
   const lines=(r.steps||[]).map(e=>e.line).filter(Boolean);
   const decoded=`${r.method||''} ${decodePath(r.path)}`.trim();
@@ -1451,11 +1480,11 @@ function eventDrawer(r){
     <h1 class="dtitle mono" id="dTitle">${esc(r.method||'')} ${esc(bare(decodePath(r.path)))}</h1>
     ${sig?`<button type="button" class="link-card" data-open="${esc(sig.id)}">${statusMark(sig.status)}<span class="link-card-k">Related signal · ${esc(sigRef(sig))}</span><span class="link-card-v">${esc(sig.title)}</span><span class="car">${L.chevR}</span></button>`:''}
     <dl class="props">
-      <dt>Outcome</dt><dd><span class="pv"><i class="odot o-${oc}" aria-hidden="true"></i>${esc(ol)}</span></dd>
+      <dt>Outcome</dt><dd><span class="pv"><i class="odot o-${dot||oc}" aria-hidden="true"></i>${esc(ol)}</span>${dot==='shielded'?'<span class="pv-sub">· the door answered 403, the route is shielded</span>':''}</dd>
       <dt>Severity</dt><dd><span class="pv">${sevIcon(r.severity||'info')}${esc(SEV_LABEL[r.severity||'info'])}</span></dd>
       <dt>Source</dt><dd><span class="pv mono">${esc(r.ip)}</span></dd>
       <dt>Time</dt><dd><span class="pv">${esc(stamp(r.first))}</span></dd>
-      <dt>Classifier</dt><dd>${r.malicious!=null?`<span class="pv">${pct(r.malicious)} attack</span><span class="pv-sub">· suggested ${esc(r.jev_action||'–')} · ${pct(r.confidence)} confident</span>`:'<span class="pv-sub">Not scored</span>'}</dd>
+      <dt title="${esc(JEV_FULL)}">${esc(JEV_NAME)}</dt><dd>${r.malicious!=null?`<span class="pv">${pct(r.malicious)} attack</span><span class="pv-sub">· suggested ${esc(r.jev_action||'–')} · ${pct(r.confidence)} confident</span>`:'<span class="pv-sub">Not scored</span>'}</dd>
       ${r.verdict?`<dt>Replay</dt><dd><span class="pv">${esc(r.verdict.replace(/_/g,' ').toLowerCase())}</span>${r.why?`<span class="pv-sub">· ${esc(r.why)}</span>`:''}</dd>`:''}
     </dl>
     ${lines.length?`<section class="ds"><h4>Bouncer's notes</h4>${lines.map(l=>`<p class="prose">${esc(l)}</p>`).join('')}</section>`:''}
@@ -1774,7 +1803,37 @@ async function setSignalStatus(id,nextStatus,showUndo){
   }
 }
 
+const C={resolve:null,focus:null};
+const confirmOpen=()=>!$('confirm').hidden;
+function askConfirm(title,body,ok){
+  if(C.resolve)closeConfirm(false);
+  closePalette(false);
+  closeMenu(false);
+  C.focus=document.activeElement;
+  $('cTitle').textContent=title;
+  $('cBody').textContent=body;
+  $('cYes').textContent=ok;
+  $('confirm').hidden=false;
+  $('cNo').focus();
+  return new Promise(res=>{C.resolve=res});
+}
+function closeConfirm(answer){
+  if(!C.resolve)return;
+  $('confirm').hidden=true;
+  const res=C.resolve;C.resolve=null;
+  if(C.focus&&document.contains(C.focus))C.focus.focus({preventScroll:true});
+  res(answer);
+}
+$('cYes').addEventListener('click',ev=>{ev.stopPropagation();closeConfirm(true)});
+$('cNo').addEventListener('click',ev=>{ev.stopPropagation();closeConfirm(false)});
+$('confirm').addEventListener('mousedown',ev=>{if(ev.target===$('confirm'))closeConfirm(false)});
+$('confirm').addEventListener('keydown',ev=>{
+  if(ev.key==='Escape'){ev.preventDefault();ev.stopPropagation();closeConfirm(false)}
+  else if(ev.key==='Tab'){ev.preventDefault();ev.stopPropagation();(document.activeElement===$('cNo')?$('cYes'):$('cNo')).focus()}
+});
+
 async function unblock(ip,label,btn){
+  if(!await askConfirm(`Unblock ${label}?`,`${label} can reach the shop again right away. Any slowdown and record of taking the bait are cleared too.`,'Unblock'))return;
   const orig=btn?btn.textContent:'';
   if(btn){btn.disabled=true;btn.textContent='Unblocking…'}
   try{
@@ -1791,6 +1850,7 @@ async function unblock(ip,label,btn){
 }
 
 async function unshield(route,btn){
+  if(!await askConfirm(`Remove the shield from ${route}?`,'Attack-shaped requests to this route will reach the shop again. Remove it only after the fix is merged.','Remove shield'))return;
   const orig=btn?btn.textContent:'';
   if(btn){btn.disabled=true;btn.textContent='Removing…'}
   try{
@@ -1947,6 +2007,7 @@ document.addEventListener('click',ev=>{
   if(t.dataset.jump)return jumpTo(t.dataset.jump);
   if(t.id==='kOpen')return openPalette();
   if(t.id==='live')return toggleLive();
+  if(t.id==='signOut')return signOut();
   if(t.dataset.copyId){
     ev.stopPropagation();
     const text=copyStore.get(t.dataset.copyId);
@@ -1986,6 +2047,7 @@ function stepSignal(d){
   if(row)row.scrollIntoView({block:'nearest'});
 }
 document.addEventListener('keydown',ev=>{
+  if(confirmOpen())return;
   const mod=ev.metaKey||ev.ctrlKey;
   if(mod&&!ev.shiftKey&&!ev.altKey&&ev.key.toLowerCase()==='k'){ev.preventDefault();return paletteOpen()?closePalette(true):openPalette()}
   if(mod&&!ev.shiftKey&&!ev.altKey&&ev.key.toLowerCase()==='b'&&!paletteOpen()&&!typing(ev.target)){ev.preventDefault();return toggleSide()}

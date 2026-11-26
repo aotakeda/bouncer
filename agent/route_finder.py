@@ -11,6 +11,7 @@ WILDCARD_VERBS = ("all", "use")
 
 
 def route_regex(path: str, prefix: bool) -> re.Pattern:
+    path = path.rstrip("/") or "/"
     out = ""
     for part in re.split(r"(:\w+|\*)", path):
         if part == "*":
@@ -19,7 +20,7 @@ def route_regex(path: str, prefix: bool) -> re.Pattern:
             out += "[^/]+"
         else:
             out += re.escape(part)
-    return re.compile("^" + out + ("(/.*)?$" if prefix else "/?$"))
+    return re.compile("^" + out + ("(/.*)?$" if prefix else "/?$"), re.IGNORECASE)
 
 
 def route_module(name: str) -> str:

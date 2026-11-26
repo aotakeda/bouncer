@@ -365,19 +365,65 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual([r["decision"] for r in rows], ["replay", "block", "block"])
         self.assertIn("already worked", rows[-1]["line"])
 
-    def test_cross_site_bait_does_not_slow_or_block_a_browser(self):
+    def test_lone_cross_site_header_does_not_dodge_the_bait(self):
         site = {"Sec-Fetch-Site": "cross-site"}
         self.assertEqual(call(self.door + "/.env", "8.8.4.5", extra=site)[0], 200)
         call(self.door + "/rest/user/login", "8.8.4.5", "POST", {"email": "a@b.c", "password": "CANARY-honey-77"}, extra=site)
+        self.assertEqual(self.wait_refused("8.8.4.5"), 403)
+        deadline = time.time() + 20
         rows = []
-        deadline = time.time() + 10
         while time.time() < deadline and len(rows) < 2:
-            time.sleep(0.2)
             rows = [r for r in self.decisions(0) if r["ip"] == "8.8.4.5"]
-        self.assertEqual([r["decision"] for r in rows], ["watch", "watch"])
+            time.sleep(0.1)
+        self.assertEqual([r["decision"] for r in rows], ["tarpit", "block"])
+
+    def wait_refused(self, ip: str, timeout: float = 40) -> int:
+        deadline = time.time() + timeout
+        status = call(self.door + "/", ip)[0]
+        while time.time() < deadline and status != 403:
+            time.sleep(0.2)
+            status = call(self.door + "/", ip)[0]
+        return status
+
+    def dashboard_cookie(self) -> str:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        login_req = urllib.request.Request(f"http://127.0.0.1:{self.p['agent']}/login", data=b"passphrase=let+me+in", method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.build_opener(NoRedirect).open(login_req)
+        return ctx.exception.headers.get("Set-Cookie", "").split(";", 1)[0]
+
+    def search_attack(self, ip: str, suffix: str):
+        q = urllib.request.quote(f"zz')) UNION SELECT id,email,password FROM Users-- {suffix}")
+        return call(self.door + f"/rest/products/search?q={q}", ip, ua="sqlmap/1.8")
+
+    def test_attack_after_taking_the_bait_is_proven_and_blocked(self):
+        self.assertIn("CANARY-honey-77", call(self.door + "/.env", "6.7.7.7")[1])
         started = time.time()
-        self.assertEqual(call(self.door + "/", "8.8.4.5")[0], 200)
-        self.assertLess(time.time() - started, 0.15)
+        status, body = self.search_attack("6.7.7.7", "slowed")
+        self.assertGreaterEqual(time.time() - started, 0.2)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.wait_refused("6.7.7.7"), 403)
+        rows = [r for r in self.decisions(0) if r["ip"] == "6.7.7.7"]
+        self.assertEqual([r["decision"] for r in rows], ["tarpit", "replay", "block"])
+        self.assertEqual((rows[-1]["kind"], rows[-1]["replay_verdict"]), ("tarpitted", "PROVEN"))
+
+    def test_changed_suffix_replays_again_after_dashboard_unblock(self):
+        ip = "6.7.8.8"
+        self.search_attack(ip, "demo1")
+        self.assertEqual(self.wait_refused(ip), 403)
+        cookie = self.dashboard_cookie()
+        unblock = urllib.request.Request(f"http://127.0.0.1:{self.p['agent']}/api/unblock", data=json.dumps({"ip": ip}).encode(), method="POST", headers={"Cookie": cookie, "Content-Type": "application/json"})
+        with urllib.request.urlopen(unblock) as r:
+            self.assertTrue(json.loads(r.read())["ok"])
+        self.assertEqual(call(self.door + "/", ip)[0], 200)
+        self.search_attack(ip, "demo2")
+        self.assertEqual(self.wait_refused(ip), 403)
+        rows = [r for r in self.decisions(0) if r["ip"] == ip]
+        self.assertEqual([r["decision"] for r in rows], ["replay", "block", "replay", "block"])
+        self.assertEqual([r["replay_verdict"] for r in rows if r["decision"] == "block"], ["PROVEN", "PROVEN"])
 
     def test_runner_refusal_does_not_parse_body_as_next_request(self):
         smuggled = b"GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer runner-secret\r\n\r\n"
@@ -458,10 +504,14 @@ class Dashboard(unittest.TestCase):
         return self.send("/api/unblock", "POST", json.dumps({"ip": ip}).encode(), {"Cookie": cookie, "Content-Type": "application/json", "Sprite-Client-Ip": client})
 
     def test_sessions_are_random_and_logout_ends_them(self):
-        status, headers, _ = self.login()
+        status, headers, _ = self.send("/login", "POST", urllib.parse.urlencode({"passphrase": "let me in"}).encode(), {"Content-Type": "application/x-www-form-urlencoded", "Sprite-Client-Ip": "203.0.113.5", "Host": "dash.example"})
         self.assertEqual(status, 303)
         for flag in ("HttpOnly", "Secure", "SameSite=Lax", "Max-Age=604800"):
             self.assertIn(flag, headers["Set-Cookie"])
+        status, headers, _ = self.login()
+        self.assertEqual(status, 303)
+        self.assertNotIn("Secure", headers["Set-Cookie"])
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
         first, second = self.cookie(), self.cookie()
         self.assertNotEqual(first, second)
         self.assertGreater(len(first), len("bouncer=") + 30)
@@ -478,7 +528,8 @@ class Dashboard(unittest.TestCase):
     def test_sessions_expire(self):
         cookie = self.cookie()
         token = cookie.split("=", 1)[1]
-        self.handler.session_store.tokens[token] = time.time() - 1
+        store = self.handler.session_store
+        store.tokens[store.digest(token)] = time.time() - 1
         self.assertEqual(self.send("/api/state", headers={"Cookie": cookie})[0], 401)
 
     def test_failed_logins_are_throttled_per_ip(self):
